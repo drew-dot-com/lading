@@ -131,7 +131,7 @@ const fmtQuote = (q: WalrusQuote | FilecoinQuote | NameQuote) => {
   const head = q.deliverable ? 'deliverable' : 'NOT deliverable';
   const tail = q.reason ? `: ${q.reason}` : '';
   if (q.op === 'walrus') return `${head}, downstream ${q.downstream.amountUsdc} USDC, float ${q.float.balance} USDC on Base${tail}`;
-  if (q.op === 'filecoin') return `${head}, add-piece fee ${q.downstream.addPieceFeeUsdfc} USDFC for ${q.copies} copies, float ${q.float.available} USDFC, runway ${q.float.runwayDays}d${tail}`;
+  if (q.op === 'filecoin') return `${head}, add-piece fee ${q.downstream.addPieceFeeUsdfc} USDFC for ${q.copies} copies, float ${q.float.available} USDFC, runway ${/^\d+$/.test(q.float.runwayDays) ? `${q.float.runwayDays}d` : q.float.runwayDays}${tail}`;
   return `${head}, ${q.name}, float ${(Number(q.float.lamports) / 1e9).toFixed(4)} SOL${tail}`;
 };
 
