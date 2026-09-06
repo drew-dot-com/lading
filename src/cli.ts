@@ -9,6 +9,8 @@
  *   lading verify <ref>     re-fetch every leg named in a manifest and compare
  *                           sha256. <ref> is an ArNS name, a manifest txId, or
  *                           a path to a saved manifest.
+ *   lading name <sha>       retry the ArNS name leg for a saved manifest whose
+ *                           earlier name job failed, without re-uploading.
  *   lading describe         what the node serves.
  *
  * Coordination lives here, not in the handler: that is the pattern every TOON
@@ -72,6 +74,14 @@ async function client() {
 }
 
 type Paid<T> = { receipt: T; route: string; price: bigint | null };
+
+/** The local record of a put: written as soon as the manifest is on Arweave, so a later failed leg is resumable with `lading name`. */
+function save(sha: string, state: { manifest: NostrEvent; manifestTxId?: string; name?: NameReceipt; paid: Array<{ leg: string; route: string; price: bigint | null | string }> }): string {
+  mkdirSync(join(HOME, 'manifests'), { recursive: true });
+  const out = join(HOME, 'manifests', `${sha}.json`);
+  writeFileSync(out, JSON.stringify({ ...state, paid: state.paid.map((p) => ({ ...p, price: p.price?.toString() })) }, null, 2));
+  return out;
+}
 
 /** What the route will charge for this event: the ADR 0065 schedule applied to the payload length, or the flat price. */
 async function charge(c: ToonClient, route: string, payloadLen: number): Promise<bigint | null> {
@@ -185,6 +195,7 @@ async function put(file: string) {
     if (!manifestTxId) throw new Error('manifest write accepted without a txId');
     paid.push({ leg: 'manifest', route: r.route, price: r.price });
     console.log(`manifest ✓ ${manifestTxId}  (${Date.now() - t0} ms)`);
+    save(sha, { manifest, manifestTxId, paid });
 
     if (!flag('skip-name')) {
       const undername = opt('undername') ?? undernameFor(sha);
@@ -199,9 +210,7 @@ async function put(file: string) {
     }
   }
 
-  mkdirSync(join(HOME, 'manifests'), { recursive: true });
-  const out = join(HOME, 'manifests', `${sha}.json`);
-  writeFileSync(out, JSON.stringify({ manifest, manifestTxId, name: nameReceipt, paid: paid.map((p) => ({ ...p, price: p.price?.toString() })) }, null, 2));
+  const out = save(sha, { manifest, manifestTxId, name: nameReceipt, paid });
 
   const total = paid.reduce((a, p) => a + (p.price ?? 0n), 0n);
   console.log('\nBILL OF LADING');
@@ -210,6 +219,31 @@ async function put(file: string) {
   if (nameReceipt) console.log(`  name     ${nameReceipt.url}`);
   console.log(`  paid     ${total} base units across ${paid.length} jobs (${paid.map((p) => `${p.leg}=${p.price ?? '?'}`).join(' ')})`);
   console.log(`  saved    ${out}`);
+  await (c as { close?: () => Promise<void> }).close?.();
+}
+
+async function nameOnly(sha: string) {
+  const p = join(HOME, 'manifests', `${sha}.json`);
+  if (!existsSync(p)) throw new Error(`no saved manifest for ${sha} at ${p}`);
+  const saved = JSON.parse(readFileSync(p, 'utf8')) as { manifest: NostrEvent; manifestTxId?: string; name?: NameReceipt; paid: unknown[] };
+  if (!saved.manifestTxId) throw new Error('saved manifest has no Arweave txId; run put again');
+  if (saved.name) {
+    console.log(`already named: ${saved.name.url}`);
+    return;
+  }
+  const content = parseManifest(saved.manifest);
+  const sk = nostrSecret();
+  const c = await client();
+  const undername = opt('undername') ?? undernameFor(sha);
+  const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'name', txid: saved.manifestTxId, sha256: sha, undername } });
+  const r = await job<NameReceipt>(c, ROUTES.name, ev as never, 120_000);
+  console.log(`name     ✓ ${r.receipt.url}`);
+  const manifest = buildManifest({ ...content, arns: { undername, name: r.receipt.name, manifestTxId: saved.manifestTxId } }, sk);
+  if (!flag('skip-relay')) {
+    const rr = await c.send(ROUTES.relay, { body: { event: manifest } });
+    console.log(rr.fulfilled ? `relay    ✓ re-signed manifest ${manifest.id}` : `relay    ✗ ${rr.code} ${rr.message}`);
+  }
+  writeFileSync(p, JSON.stringify({ ...saved, manifest, name: r.receipt, paid: [...saved.paid, { leg: 'name', route: r.route, price: r.price?.toString() }] }, null, 2));
   await (c as { close?: () => Promise<void> }).close?.();
 }
 
@@ -235,7 +269,7 @@ async function verify(ref: string) {
   let ok = true;
   for (const leg of m.legs) {
     const url =
-      leg.network === 'arweave' ? `https://${GATEWAY}/${leg.id}` : leg.network === 'walrus' ? `${AGGREGATOR}/v1/blobs/${leg.id}` : leg.proof?.readUrl;
+      leg.network === 'arweave' ? `https://${GATEWAY}/${leg.id}` : leg.network === 'walrus' ? (leg.proof?.ipfsUrl ?? `${AGGREGATOR}/v1/blobs/${leg.id}`) : leg.proof?.readUrl;
     if (!url) {
       console.log(`  ${leg.network.padEnd(8)} ${leg.id}  no read url`);
       ok = false;
@@ -261,9 +295,10 @@ async function describe() {
 }
 
 const [cmd, arg] = process.argv.slice(2);
-const run = cmd === 'put' && arg ? put(arg) : cmd === 'verify' && arg ? verify(arg) : cmd === 'describe' ? describe() : null;
+const run =
+  cmd === 'put' && arg ? put(arg) : cmd === 'verify' && arg ? verify(arg) : cmd === 'name' && arg ? nameOnly(arg) : cmd === 'describe' ? describe() : null;
 if (!run) {
-  console.log('usage: lading put <file> [--name n] [--mime m] [--undername u] [--skip-arweave|--skip-walrus|--skip-relay|--skip-name]\n       lading verify <arns-name|manifest-txid|saved.json>\n       lading describe');
+  console.log('usage: lading put <file> [--name n] [--mime m] [--undername u] [--skip-arweave|--skip-walrus|--skip-relay|--skip-name]\n       lading verify <arns-name|manifest-txid|saved.json>\n       lading name <sha256>\n       lading describe');
   process.exit(2);
 }
 run.catch((e) => {

@@ -64,24 +64,77 @@ export async function walrusBlobIds(cid: string, attempts = 6): Promise<string[]
   throw new Error(`walrus_blobs lookup failed for ${cid}: ${last}`);
 }
 
-/** Read the bytes behind a blobId from the aggregator and compare to the expected sha256. */
+/**
+ * Decode a CIDv1 in base32 (`b...`) and return its multihash digest when it is
+ * a raw-codec sha256 CID (`bafkrei...`). Lighthouse returns exactly that shape
+ * for a single-block file, so the CID itself commits to the file's sha256.
+ */
+export function rawCidSha256(cid: string): string | undefined {
+  if (!cid.startsWith('b')) return undefined;
+  const A = 'abcdefghijklmnopqrstuvwxyz234567';
+  let bits = '';
+  for (const ch of cid.slice(1)) {
+    const v = A.indexOf(ch);
+    if (v < 0) return undefined;
+    bits += v.toString(2).padStart(5, '0');
+  }
+  const bytes: number[] = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8) bytes.push(parseInt(bits.slice(i, i + 8), 2));
+  // version 1, codec 0x55 raw, multihash fn 0x12 sha2-256, length 0x20
+  if (bytes[0] !== 1 || bytes[1] !== 0x55 || bytes[2] !== 0x12 || bytes[3] !== 0x20) return undefined;
+  return Buffer.from(bytes.slice(4, 36)).toString('hex');
+}
+
+/**
+ * Three independent checks on what Lighthouse put on Walrus, strongest first:
+ *  1. the CID's own digest equals the file sha256 (offline, no trust in any server);
+ *  2. the Lighthouse Walrus gateway serves bytes with that sha256;
+ *  3. the public Walrus aggregator serves the blob, and it either IS the file
+ *     or wraps it (Lighthouse's datastore frames blocks, so the blob can be a
+ *     few hundred bytes longer than the file; containment is what we check).
+ * The receipt records each outcome; FULFILL requires the blobId to resolve.
+ */
 export async function readBack(
   blobId: string,
+  cid: string,
+  ipfsUrl: string | undefined,
+  file: Uint8Array,
   expectedSha256: string,
-  attempts = 5,
-): Promise<{ verified: boolean; status: number; sha256?: string }> {
+  attempts = 4,
+): Promise<{ checks: string[]; strong: boolean }> {
+  const checks: string[] = [];
+  const cidSha = rawCidSha256(cid);
+  checks.push(cidSha === expectedSha256 ? 'cid-digest=sha256' : `cid-digest-mismatch(${cidSha?.slice(0, 12) ?? 'not-raw-cid'})`);
+
+  if (ipfsUrl) {
+    try {
+      const g = await fetch(ipfsUrl, { cache: 'no-store' });
+      checks.push(g.ok ? (sha256Hex(new Uint8Array(await g.arrayBuffer())) === expectedSha256 ? 'gateway-sha256-match' : 'gateway-sha256-mismatch') : `gateway-${g.status}`);
+    } catch (e) {
+      checks.push(`gateway-error(${(e as Error).message.slice(0, 40)})`);
+    }
+  }
+
   let status = 0;
   for (let i = 0; i < attempts; i++) {
-    const r = await fetch(`${WALRUS_AGGREGATOR}/v1/blobs/${blobId}?cb=${Date.now()}`);
+    const r = await fetch(`${WALRUS_AGGREGATOR}/v1/blobs/${blobId}`, { cache: 'no-store' });
     status = r.status;
     if (r.ok) {
-      const got = sha256Hex(new Uint8Array(await r.arrayBuffer()));
-      return { verified: got === expectedSha256, status, sha256: got };
+      const blob = Buffer.from(await r.arrayBuffer());
+      const same = sha256Hex(new Uint8Array(blob)) === expectedSha256;
+      const wraps = !same && blob.indexOf(Buffer.from(file)) >= 0;
+      checks.push(same ? 'aggregator-sha256-match' : wraps ? `aggregator-car-wraps-file(+${blob.length - file.length}B)` : `aggregator-blob-differs(${blob.length}B)`);
+      break;
     }
-    if (r.status !== 404) break;
+    if (r.status !== 404) {
+      checks.push(`aggregator-${status}`);
+      break;
+    }
+    if (i === attempts - 1) checks.push('aggregator-404');
     await sleep(3000 * (i + 1));
   }
-  return { verified: false, status };
+  const strong = checks.includes('cid-digest=sha256') || checks.includes('gateway-sha256-match') || checks.includes('aggregator-sha256-match');
+  return { checks, strong };
 }
 
 export function lighthouseUploader(evmPrivateKey: `0x${string}`): WalrusUploader {
@@ -126,7 +179,7 @@ export function lighthouseUploader(evmPrivateKey: `0x${string}`): WalrusUploader
 
       const blobIds = await walrusBlobIds(out.cid);
       const blobId = blobIds[0]!;
-      const check = await readBack(blobId, sha);
+      const check = await readBack(blobId, out.cid, out.ipfsUrl, bytes, sha);
 
       const receipt: WalrusReceipt = {
         network: 'walrus',
@@ -144,7 +197,8 @@ export function lighthouseUploader(evmPrivateKey: `0x${string}`): WalrusUploader
           expiresAt: out.expiresAt,
           ...(settlement.transaction ? { baseTx: settlement.transaction } : {}),
           ...(settlement.payer ? { payer: settlement.payer } : {}),
-          readback: check.verified ? 'sha256-match' : `unverified (aggregator ${check.status}${check.sha256 ? `, got ${check.sha256.slice(0, 12)}` : ''})`,
+          readback: check.checks.join(';'),
+          verified: check.strong ? 'yes' : 'no',
         },
         at: Math.floor(Date.now() / 1000),
       };

@@ -36,3 +36,9 @@ test('undernames derive from the sha and pass the ArNS charset', () => {
   assert.ok(UNDERNAME_RE.test(u));
   assert.ok(!UNDERNAME_RE.test('Bad_Name'));
 });
+
+test('a raw sha256 CID commits to the file hash', async () => {
+  const { rawCidSha256 } = await import('./walrus.js');
+  assert.equal(rawCidSha256('bafkreiemnnugc2h54sd62itmqjbzkshjmhb72gezmmee4bbr6rnrmwhcam'), '8c6b686168fde487ed226c82439548e961c3fd189963084e0431f45b1658e203');
+  assert.equal(rawCidSha256('QmNotBase32'), undefined);
+});
