@@ -1,8 +1,10 @@
 /**
  * The name door: point an ArNS undername on the broker's ANT at a manifest
- * txId. Owner-only on the ANT, so the broker holds the ANT owner's Solana key.
- * This is the one leg that spends the broker's own chain funds per job (one
- * Solana transaction), which is why it is its own priced door.
+ * txId. The signer must be the ANT's owner or one of its controllers; the
+ * deployed shape is a dedicated controller key generated on the node, so the
+ * owner key never leaves the operator's machine. This is the one leg that
+ * spends the broker's own chain funds per job (one Solana transaction), which
+ * is why it is its own priced door.
  */
 import { ANT } from '@ar.io/sdk';
 import { createSolanaRpc, createSolanaRpcSubscriptions, createKeyPairSignerFromBytes } from '@solana/kit';
@@ -34,11 +36,17 @@ export async function solanaNamer(opts: {
   const signer = await createKeyPairSignerFromBytes(opts.secretKey);
   const ttl = opts.ttlSeconds ?? 900;
 
-  const ro = await ANT.init({ processId: opts.antId, rpc } as never);
-  const owner = String(await (ro as { getOwner(): Promise<unknown> }).getOwner());
-  if (owner !== String(signer.address)) {
-    throw new Error(`ANT ${opts.antId} is owned by ${owner}, not this signer ${signer.address}`);
+  const ro = (await ANT.init({ processId: opts.antId, rpc } as never)) as {
+    getOwner(): Promise<unknown>;
+    getControllers(): Promise<unknown[]>;
+  };
+  const owner = String(await ro.getOwner());
+  const controllers = (await ro.getControllers().catch(() => [])).map(String);
+  const me = String(signer.address);
+  if (owner !== me && !controllers.includes(me)) {
+    throw new Error(`signer ${me} is neither owner (${owner}) nor a controller of ANT ${opts.antId}`);
   }
+  console.log(`name door: ANT ${opts.antId} signer ${me} (${owner === me ? 'owner' : 'controller'})`);
 
   return {
     antId: opts.antId,
