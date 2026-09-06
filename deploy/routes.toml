@@ -1,0 +1,20 @@
+# Add to the edge connector's config. One door per price: the connector refuses
+# one handler_url at two prices, and a reject is still charged, so each door
+# only sells what it can deliver.
+
+# Walrus leg. Flat: Lighthouse bills on the erasure-coded size, so every upload
+# up to the 2 MiB packet cap costs about $0.032 to $0.036 downstream. 40,000
+# base units = $0.04 USDC, a thin margin over that floor.
+[[routes]]
+prefix = "g.drew.lading.walrus"
+handler_url = "http://lading:3600/walrus"
+price = 40000
+
+# Name leg. One Solana transaction on the broker's ANT per job. 5,000 = $0.005.
+[[routes]]
+prefix = "g.drew.lading.name"
+handler_url = "http://lading:3600/name"
+price = 5000
+
+# The Arweave leg and the manifest write ride the existing g.drew.ario route
+# (schedule {base 1000, per_kib 30}); the relay copy rides g.drew.relay (1000).

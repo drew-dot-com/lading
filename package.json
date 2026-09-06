@@ -1,0 +1,31 @@
+{
+  "name": "lading",
+  "version": "0.1.0",
+  "description": "Pay-on-receipt archive broker for agents on TOON. One channel, several storage networks, money moves only when the network's receipt comes back, and a signed bill of lading named on ArNS.",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=22" },
+  "bin": { "lading": "dist/cli.js" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "dev": "tsx src/server.ts",
+    "cli": "tsx src/cli.ts",
+    "test": "node --test --import tsx src/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@ar.io/sdk": "^3.13.0",
+    "@solana/kit": "^2.1.0",
+    "@toon-protocol/client": "^2.1.1",
+    "nostr-tools": "^2.10.4",
+    "viem": "^2.21.0",
+    "@x402/evm": "^2.3.0",
+    "@x402/fetch": "^2.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

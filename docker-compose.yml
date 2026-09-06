@@ -1,0 +1,23 @@
+# Lading joins the node's existing network so the edge reaches it as
+# http://lading:3600. Nothing is published on the host. Same shape as anonfetch
+# and gas-station: its own compose project, zero changes to the node stack.
+services:
+  lading:
+    build: .
+    container_name: lading
+    restart: unless-stopped
+    expose: ['3600']
+    environment:
+      PORT: '3600'
+      MAX_BODY_BYTES: '3145728'
+      LADING_EVM_PRIVATE_KEY: ${LADING_EVM_PRIVATE_KEY}        # Base key holding USDC; pays Lighthouse per upload
+      LADING_ANT_ID: ${LADING_ANT_ID}                          # ANT the undernames live on
+      LADING_ARNS_BASE_NAME: ${LADING_ARNS_BASE_NAME}          # e.g. boughtviatoonnode
+      LADING_ARNS_GATEWAY: ${LADING_ARNS_GATEWAY:-permagate.io}
+      LADING_SOLANA_KEYPAIR: ${LADING_SOLANA_KEYPAIR}          # JSON array; the ANT owner's key
+      SOLANA_RPC: ${SOLANA_RPC:-https://api.mainnet-beta.solana.com}
+      LADING_NODE_SECRET: ${LADING_NODE_SECRET:-}
+    networks: [relay_deploy_net]
+networks:
+  relay_deploy_net:
+    external: true
