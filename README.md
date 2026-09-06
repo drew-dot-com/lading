@@ -15,8 +15,18 @@ next. Runs against Drew's mainnet node today.
 
 Every storage micropayment product on the market (Lighthouse, Turbo, Pinata
 over x402) charges before delivery. Only Filecoin settles on proof, and only
-inside Filecoin. An ILP packet fulfils on a receipt or the money never moves,
-so a TOON node can sell pay-on-receipt across networks without a new primitive.
+inside Filecoin. Lading sells the receipt: a leg answers with the network's
+own identifier and proof, or it answers with a refusal and buys nothing
+downstream.
+
+What "pay on receipt" means here, precisely. The TOON connector charges the
+route price for every packet it delivers to the app, whatever the app answers
+(the execution condition was retired in connector issue 1269, so an app
+cannot withhold a FULFILL; a refusal is an answer). So a failed leg costs the
+payer the route price and nothing else: the broker never buys storage it
+could not deliver, and the payer never holds a receipt for bytes that are not
+there. The downstream purchase is the part that is conditional, and it is the
+part that costs real money.
 
 The buyer's pain Lading removes is one prepaid balance per provider: Turbo
 Credits, a Lighthouse deposit, WAL plus SUI, a Storj minimum. One channel
@@ -37,8 +47,11 @@ lading put report.pdf
 | 5. manifest to Arweave | `g.drew.ario` | the org store, on the txId | schedule |
 | 6. ArNS name | `g.drew.lading.name` (kind 5320) | Lading, on the ANT record write | 5,000 |
 
-A leg that fails is rejected before FULFILL, so it is not charged. Steps are
-skippable (`--skip-walrus`, `--skip-name`, `--skip-relay`, `--skip-arweave`).
+A leg that fails answers `accept: false`, buys nothing downstream, and costs
+the route price. Steps are skippable (`--skip-walrus`, `--skip-name`,
+`--skip-relay`, `--skip-arweave`). The local record is written as soon as the
+manifest is on Arweave, so a failed name leg is resumable with
+`lading name <sha256>` without re-uploading anything.
 
 `lading verify <arns-name | manifest-txid | saved.json>` re-fetches every leg
 from its network and compares sha256. `lading describe` prints route prices.
@@ -56,6 +69,13 @@ src/manifest.ts  build and verify the kind 30320 bill of lading
 src/cli.ts       the paying client that composes the legs
 deploy/routes.toml   the two [[routes]] rows for the edge connector
 ```
+
+Walrus verification, three independent checks recorded in the receipt: the
+CID Lighthouse returns is a raw sha256 CID whose digest must equal the file's
+sha256 (offline, trusts nobody); the Lighthouse Walrus gateway must serve
+bytes with that sha256; and the public Walrus aggregator must serve the blob,
+which is a CARv1 archive wrapping the raw block, so the check is containment
+of the file bytes. `lading verify` re-runs the gateway check.
 
 The handler holds no payment logic. The connector verifies the claim and
 charges the route before a request lands here; the handler reads the
