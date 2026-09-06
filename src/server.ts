@@ -254,7 +254,7 @@ function filecoinQuoteDoor(uploader: FilecoinUploader, info: () => Promise<Await
         executeDoor: '/filecoin',
         at: Math.floor(Date.now() / 1000),
       };
-      console.log(`filecoin quote ${size}B deliverable=${d.deliverable} fee=${q.addPieceFeeUsdfc} available=${q.availableUsdfc} runway=${runwayText(q.runwayDays)}d payer=${meta.payer ?? '-'} ${Date.now() - t0}ms${d.reason ? `: ${d.reason}` : ''}`);
+      console.log(`filecoin quote ${size}B deliverable=${d.deliverable} fee=${q.addPieceFeeUsdfc} available=${q.availableUsdfc} runway=${runwayText(q.runwayDays)} payer=${meta.payer ?? '-'} ${Date.now() - t0}ms${d.reason ? `: ${d.reason}` : ''}`);
       return acceptReceipt(res, quote, meta);
     } catch (e) {
       const msg = (e as Error).message;
