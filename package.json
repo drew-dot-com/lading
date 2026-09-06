@@ -15,7 +15,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@ar.io/sdk": "^3.13.0",
+    "@ar.io/sdk": "^4.1.4",
     "@solana/kit": "^2.1.0",
     "@toon-protocol/client": "^2.1.1",
     "nostr-tools": "^2.10.4",
