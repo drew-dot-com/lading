@@ -1,6 +1,6 @@
 {
   "name": "lading",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pay-on-receipt archive broker for agents on TOON. One channel, several storage networks, money moves only when the network's receipt comes back, and a signed bill of lading named on ArNS.",
   "type": "module",
   "license": "MIT",

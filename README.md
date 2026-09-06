@@ -8,8 +8,9 @@ archived on several storage networks, paying per object per network, with the
 money moving only when the network's receipt comes back. Every copy is then
 listed in a signed manifest that lives on Arweave under an ArNS name.
 
-Status: v0.1.0, Arweave and Walrus legs, ArNS naming, relay copy. Filecoin is
-next. Runs against Drew's mainnet node today.
+Status: v0.2.0, Arweave and Walrus legs, ArNS naming, relay copy, and a quote
+door in front of each broker leg. Filecoin is next. Runs against Drew's
+mainnet node today.
 
 ## Why this exists
 
@@ -28,6 +29,14 @@ could not deliver, and the payer never holds a receipt for bytes that are not
 there. The downstream purchase is the part that is conditional, and it is the
 part that costs real money.
 
+To keep the route price from being the cost of finding out, each broker leg
+has a quote door at 1,000 units that answers "would this go through right
+now": the Walrus quote reads the Lighthouse price for the size and the Base
+key's USDC float, the name quote reads the name key's lamports and its ANT
+authority. `lading put` asks first and only pays a leg its quote said is
+deliverable (`--no-quote` skips the question). A quote-shaped event sent to an
+execute door is refused before anything downstream runs.
+
 The buyer's pain Lading removes is one prepaid balance per provider: Turbo
 Credits, a Lighthouse deposit, WAL plus SUI, a Storj minimum. One channel
 deposit, then off-chain claims per job.
@@ -41,11 +50,13 @@ lading put report.pdf
 | step | route | who fulfils, on what | price |
 | --- | --- | --- | --- |
 | 1. Arweave leg | `g.drew.ario` (kind 5094) | the org store, on the Arweave txId | `{base 1000, per_kib 30}` |
-| 2. Walrus leg | `g.drew.lading.walrus` (kind 5320) | Lading, on the Walrus blobId after an aggregator read-back | 40,000 flat |
-| 3. bill of lading | signed locally by the payer's Nostr key | kind 30320, `d` = sha256 | free |
-| 4. relay copy | `g.drew.relay` | the node relay | 1,000 |
-| 5. manifest to Arweave | `g.drew.ario` | the org store, on the txId | schedule |
-| 6. ArNS name | `g.drew.lading.name` (kind 5320) | Lading, on the ANT record write | 5,000 |
+| 2. Walrus quote | `g.drew.lading.walrus.quote` (kind 5320, `phase=quote`) | Lading: deliverable, downstream USDC price, float | 1,000 |
+| 3. Walrus leg | `g.drew.lading.walrus` (kind 5320) | Lading, on the Walrus blobId after an aggregator read-back | 40,000 flat |
+| 4. bill of lading | signed locally by the payer's Nostr key | kind 30320, `d` = sha256 | free |
+| 5. relay copy | `g.drew.relay` | the node relay | 1,000 |
+| 6. manifest to Arweave | `g.drew.ario` | the org store, on the txId | schedule |
+| 7. name quote | `g.drew.lading.name.quote` (kind 5320, `phase=quote`) | Lading: deliverable, undername, lamports float | 1,000 |
+| 8. ArNS name | `g.drew.lading.name` (kind 5320) | Lading, on the ANT record write | 5,000 |
 
 A leg that fails answers `accept: false`, buys nothing downstream, and costs
 the route price. Steps are skippable (`--skip-walrus`, `--skip-name`,
@@ -53,8 +64,10 @@ the route price. Steps are skippable (`--skip-walrus`, `--skip-name`,
 manifest is on Arweave, so a failed name leg is resumable with
 `lading name <sha256>` without re-uploading anything.
 
-`lading verify <arns-name | manifest-txid | saved.json>` re-fetches every leg
-from its network and compares sha256. `lading describe` prints route prices.
+`lading quote <file>` prints the whole bill before paying it (route prices from
+the edge plus both quotes; costs the two quotes). `lading verify <arns-name |
+manifest-txid | saved.json>` re-fetches every leg from its network and
+compares sha256. `lading describe` prints route prices.
 
 The manifest is a Nostr event, so a relay query for kind 30320 by `#d` finds
 every attestation for a given object hash across payers.

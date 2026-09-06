@@ -149,7 +149,9 @@ export function lighthouseUploader(evmPrivateKey: `0x${string}`): WalrusUploader
       if (!r.ok) throw new Error(`price quote failed: ${r.status} ${await r.text()}`);
       const raw = (await r.json()) as Record<string, unknown>;
       // Live shape (2026-09-06): { totalPrice: "$0.032500", billableMiB, encodedSizeBytes, storagePeriodDays, network, payTo }
-      return { amountUsdc: String(raw.totalPrice ?? JSON.stringify(raw)), raw };
+      const total = String(raw.totalPrice ?? '').replace(/^\$/, '');
+      if (!/^\d+(\.\d+)?$/.test(total)) throw new Error(`price quote has no totalPrice: ${JSON.stringify(raw)}`);
+      return { amountUsdc: total, raw };
     },
 
     async upload(bytes, fileName) {

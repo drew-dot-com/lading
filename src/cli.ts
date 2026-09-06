@@ -11,6 +11,9 @@
  *                           a path to a saved manifest.
  *   lading name <sha>       retry the ArNS name leg for a saved manifest whose
  *                           earlier name job failed, without re-uploading.
+ *   lading quote <file>     the full bill before paying it: every route's price
+ *                           plus each leg's quote (deliverable right now, and
+ *                           the downstream cost the broker will carry).
  *   lading describe         what the node serves.
  *
  * Coordination lives here, not in the handler: that is the pattern every TOON
@@ -24,6 +27,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { ToonClient, buildJobEvent, sendJob, chargeFor } from '@toon-protocol/client';
 import { getPublicKey, type Event as NostrEvent } from 'nostr-tools/pure';
 import { LEG_KIND, type LegReceipt, type NameReceipt, type WalrusReceipt } from './kinds.js';
+import type { NameQuote, WalrusQuote } from './quote.js';
 import { buildManifest, parseManifest, type ManifestContent } from './manifest.js';
 import { undernameFor } from './arns.js';
 
@@ -32,7 +36,9 @@ const EDGE = env('TOON_EDGE', 'https://connector.167-233-221-236.sslip.io');
 const ROUTES = {
   ario: env('LADING_ROUTE_ARIO', 'g.drew.ario'),
   walrus: env('LADING_ROUTE_WALRUS', 'g.drew.lading.walrus'),
+  walrusQuote: env('LADING_ROUTE_WALRUS_QUOTE', 'g.drew.lading.walrus.quote'),
   name: env('LADING_ROUTE_NAME', 'g.drew.lading.name'),
+  nameQuote: env('LADING_ROUTE_NAME_QUOTE', 'g.drew.lading.name.quote'),
   relay: env('LADING_ROUTE_RELAY', 'g.drew.relay'),
 };
 const GATEWAY = env('LADING_ARNS_GATEWAY', 'permagate.io');
@@ -101,6 +107,23 @@ async function job<T>(c: ToonClient, route: string, event: NostrEvent, timeoutMs
   return { receipt: answer.receipt, route, price };
 }
 
+/** Ask the walrus quote door whether an object of this size would go through right now. 1,000 units, against 40,000 for the leg. */
+async function quoteWalrus(c: ToonClient, size: number, name: string): Promise<Paid<WalrusQuote>> {
+  const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'walrus', phase: 'quote', size: String(size), name } });
+  return job<WalrusQuote>(c, ROUTES.walrusQuote, ev as never, 60_000);
+}
+
+/** Ask the name quote door whether the broker can write this undername right now. 1,000 units, against 5,000 for the leg. */
+async function quoteName(c: ToonClient, undername: string, txid?: string): Promise<Paid<NameQuote>> {
+  const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'name', phase: 'quote', undername, ...(txid ? { txid } : {}) } });
+  return job<NameQuote>(c, ROUTES.nameQuote, ev as never, 60_000);
+}
+
+const fmtQuote = (q: WalrusQuote | NameQuote) =>
+  q.op === 'walrus'
+    ? `${q.deliverable ? 'deliverable' : 'NOT deliverable'}, downstream ${q.downstream.amountUsdc} USDC, float ${q.float.balance} USDC on Base${q.reason ? `: ${q.reason}` : ''}`
+    : `${q.deliverable ? 'deliverable' : 'NOT deliverable'}, ${q.name}, float ${(Number(q.float.lamports) / 1e9).toFixed(4)} SOL${q.reason ? `: ${q.reason}` : ''}`;
+
 async function put(file: string) {
   const bytes = new Uint8Array(readFileSync(file));
   const sha = sha256(bytes);
@@ -143,7 +166,14 @@ async function put(file: string) {
   }
 
   // Leg 2: Walrus, through Lading's door. Lading FULFILLs on the blobId.
+  // Quoted first: a leg the broker cannot deliver still costs its route price.
   if (!flag('skip-walrus')) {
+    if (!flag('no-quote')) {
+      const q = await quoteWalrus(c, bytes.length, name);
+      paid.push({ leg: 'walrus-quote', route: q.route, price: q.price });
+      console.log(`walrus   quote ${fmtQuote(q.receipt)}  (${Date.now() - t0} ms)`);
+      if (!q.receipt.deliverable) throw new Error(`walrus leg would not go through; nothing paid for it. Re-run with --skip-walrus to archive without it. (${q.receipt.reason})`);
+    }
     const ev = buildJobEvent({
       kind: LEG_KIND,
       params: { op: 'walrus', name },
@@ -197,8 +227,18 @@ async function put(file: string) {
     console.log(`manifest ✓ ${manifestTxId}  (${Date.now() - t0} ms)`);
     save(sha, { manifest, manifestTxId, paid });
 
-    if (!flag('skip-name')) {
-      const undername = opt('undername') ?? undernameFor(sha);
+    let nameOk = !flag('skip-name');
+    const undername = opt('undername') ?? undernameFor(sha);
+    if (nameOk && !flag('no-quote')) {
+      const q = await quoteName(c, undername, manifestTxId);
+      paid.push({ leg: 'name-quote', route: q.route, price: q.price });
+      console.log(`name     quote ${fmtQuote(q.receipt)}  (${Date.now() - t0} ms)`);
+      if (!q.receipt.deliverable) {
+        nameOk = false;
+        console.log(`name     SKIPPED, nothing paid for it; retry later with: lading name ${sha}`);
+      }
+    }
+    if (nameOk) {
       const ev2 = buildJobEvent({ kind: LEG_KIND, params: { op: 'name', txid: manifestTxId, sha256: sha, undername } });
       const r2 = await job<NameReceipt>(c, ROUTES.name, ev2 as never, 120_000);
       nameReceipt = r2.receipt;
@@ -235,6 +275,11 @@ async function nameOnly(sha: string) {
   const sk = nostrSecret();
   const c = await client();
   const undername = opt('undername') ?? undernameFor(sha);
+  if (!flag('no-quote')) {
+    const q = await quoteName(c, undername, saved.manifestTxId);
+    console.log(`name     quote ${fmtQuote(q.receipt)}`);
+    if (!q.receipt.deliverable) throw new Error(`name leg would not go through; nothing paid for it. (${q.receipt.reason})`);
+  }
   const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'name', txid: saved.manifestTxId, sha256: sha, undername } });
   const r = await job<NameReceipt>(c, ROUTES.name, ev as never, 120_000);
   console.log(`name     ✓ ${r.receipt.url}`);
@@ -289,16 +334,43 @@ async function describe() {
   const c = await client();
   for (const [k, route] of Object.entries(ROUTES)) {
     const p = await c.price(route).catch(() => null);
-    console.log(`${k.padEnd(7)} ${route.padEnd(24)} ${p === null ? 'not priced' : `${p} base units`}`);
+    console.log(`${k.padEnd(12)} ${route.padEnd(30)} ${p === null ? 'not priced' : `${p} base units`}`);
   }
+  await (c as { close?: () => Promise<void> }).close?.();
+}
+
+/** The whole bill before paying it: route prices from the edge, deliverability from the two quote doors. Costs two quotes. */
+async function quote(file: string) {
+  const bytes = new Uint8Array(readFileSync(file));
+  const sha = sha256(bytes);
+  const name = opt('name') ?? basename(file);
+  const undername = opt('undername') ?? undernameFor(sha);
+  const c = await client();
+  const eventBytes = (params: Record<string, string>, blob?: Uint8Array) =>
+    Buffer.byteLength(JSON.stringify({ event: buildJobEvent({ kind: LEG_KIND, params, tags: blob ? [['i', Buffer.from(blob).toString('base64'), 'blob']] : [] }) }));
+  const manifestGuess = 1200 + 2 * 300; // a manifest with two legs, before signing
+  const rows: Array<[string, string, bigint | null, string]> = [];
+  rows.push(['arweave', ROUTES.ario, await charge(c, ROUTES.ario, eventBytes({}, bytes)), 'schedule on the payload']);
+  const wq = await quoteWalrus(c, bytes.length, name);
+  rows.push(['walrus-quote', wq.route, wq.price, fmtQuote(wq.receipt)]);
+  rows.push(['walrus', ROUTES.walrus, wq.receipt.deliverable ? await charge(c, ROUTES.walrus, 0) : 0n, wq.receipt.deliverable ? 'flat' : 'would not be paid']);
+  rows.push(['relay', ROUTES.relay, await charge(c, ROUTES.relay, manifestGuess), 'manifest copy']);
+  rows.push(['manifest', ROUTES.ario, await charge(c, ROUTES.ario, manifestGuess), 'manifest on Arweave, estimate']);
+  const nq = await quoteName(c, undername);
+  rows.push(['name-quote', nq.route, nq.price, fmtQuote(nq.receipt)]);
+  rows.push(['name', ROUTES.name, nq.receipt.deliverable ? await charge(c, ROUTES.name, 0) : 0n, nq.receipt.deliverable ? 'flat' : 'would be skipped']);
+  console.log(`\n${file}: ${bytes.length} bytes, sha256 ${sha}`);
+  for (const [leg, route, price, note] of rows) console.log(`  ${leg.padEnd(13)} ${route.padEnd(30)} ${String(price ?? '?').padStart(8)}  ${note}`);
+  const total = rows.reduce((a, r) => a + (r[2] ?? 0n), 0n);
+  console.log(`  ${'total'.padEnd(13)} ${''.padEnd(30)} ${total.toString().padStart(8)}  base units (${(Number(total) / 1e6).toFixed(4)} USDC), quotes paid now: ${(wq.price ?? 0n) + (nq.price ?? 0n)}`);
   await (c as { close?: () => Promise<void> }).close?.();
 }
 
 const [cmd, arg] = process.argv.slice(2);
 const run =
-  cmd === 'put' && arg ? put(arg) : cmd === 'verify' && arg ? verify(arg) : cmd === 'name' && arg ? nameOnly(arg) : cmd === 'describe' ? describe() : null;
+  cmd === 'put' && arg ? put(arg) : cmd === 'quote' && arg ? quote(arg) : cmd === 'verify' && arg ? verify(arg) : cmd === 'name' && arg ? nameOnly(arg) : cmd === 'describe' ? describe() : null;
 if (!run) {
-  console.log('usage: lading put <file> [--name n] [--mime m] [--undername u] [--skip-arweave|--skip-walrus|--skip-relay|--skip-name]\n       lading verify <arns-name|manifest-txid|saved.json>\n       lading name <sha256>\n       lading describe');
+  console.log('usage: lading put <file> [--name n] [--mime m] [--undername u] [--no-quote] [--skip-arweave|--skip-walrus|--skip-relay|--skip-name]\n       lading quote <file>\n       lading verify <arns-name|manifest-txid|saved.json>\n       lading name <sha256> [--no-quote]\n       lading describe');
   process.exit(2);
 }
 run.catch((e) => {

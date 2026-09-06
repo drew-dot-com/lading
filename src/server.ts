@@ -1,8 +1,10 @@
 /**
  * Lading's handler: the doors a TOON connector terminates routes at.
  *
- *   POST /walrus   kind:5320, `['i', base64, 'blob']`  → WalrusReceipt
- *   POST /name     kind:5320, params op=name, txid, undername → NameReceipt
+ *   POST /walrus        kind:5320, `['i', base64, 'blob']`  → WalrusReceipt
+ *   POST /name          kind:5320, params op=name, txid, undername → NameReceipt
+ *   POST /walrus/quote  kind:5320, params op=walrus, phase=quote, size → WalrusQuote
+ *   POST /name/quote    kind:5320, params op=name, phase=quote, undername, txid → NameQuote
  *   GET  /describe what this node serves, derived from what booted
  *   GET  /health
  *
@@ -11,8 +13,10 @@
  * no payment logic. It reads the ADR 0040 headers for the log line only.
  *
  * FULFILL (`accept: true`) is sent only once the downstream network handed
- * back its receipt; anything short of that is `accept: false` and the packet
- * is rejected, so no money moves for a failed upload. That is the whole point.
+ * back its receipt; anything short of that is `accept: false`, so nothing is
+ * bought downstream for a failed leg. The connector still charges the route
+ * price for the delivered packet, which is why each leg has a quote door: a
+ * cheap answer to "would this go through right now" before the real price.
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { readFileSync } from 'node:fs';
@@ -20,11 +24,23 @@ import { getPublicKey, verifyEvent, type Event as NostrEvent } from 'nostr-tools
 import { LEG_KIND, MANIFEST_KIND } from './kinds.js';
 import { lighthouseUploader, sha256Hex, LIGHTHOUSE_X402, WALRUS_AGGREGATOR, type WalrusUploader } from './walrus.js';
 import { solanaNamer, undernameFor, UNDERNAME_RE, type Namer } from './arns.js';
+import { cached, decideName, decideWalrus, type NameQuote, type WalrusQuote } from './quote.js';
+import { createPublicClient, http as viemHttp, erc20Abi, formatUnits } from 'viem';
+import { base } from 'viem/chains';
+import { privateKeyToAccount } from 'viem/accounts';
+import { createSolanaRpc, address as solAddress } from '@solana/kit';
 
 const PORT = Number(process.env.PORT ?? 3600);
 const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES ?? 3 * 1024 * 1024);
 const DEV_MODE = process.env.DEV_MODE === '1';
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
+/** Lamports the name key must hold before a name job is quoted deliverable: record rent (~2.81M) plus fee, with a margin for a second job in flight. */
+const NAME_NEED_LAMPORTS = BigInt(process.env.LADING_NAME_NEED_LAMPORTS ?? 6_000_000);
+/** The Base key must hold this many times the downstream price before a walrus job is quoted deliverable. */
+const WALRUS_RESERVE_MULTIPLE = Number(process.env.LADING_WALRUS_RESERVE_MULTIPLE ?? 2);
+const BASE_USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' as const;
+const BASE_RPC = process.env.BASE_RPC ?? 'https://mainnet.base.org';
+const FLOAT_CACHE_MS = 30_000;
 
 const paramOf = (event: NostrEvent, key: string) =>
   event.tags.find((t) => t[0] === 'param' && t[1] === key)?.[2];
@@ -58,7 +74,7 @@ async function readJson(req: IncomingMessage): Promise<unknown> {
 }
 
 /** Everything a door needs before it runs: a verified event of the right kind, and the payment headers for the log. */
-async function openJob(req: IncomingMessage, res: ServerResponse, op: string) {
+async function openJob(req: IncomingMessage, res: ServerResponse, op: string, phase: 'execute' | 'quote' = 'execute') {
   const meta = {
     payer: req.headers['x-toon-payer'],
     amount: req.headers['x-toon-amount'],
@@ -87,6 +103,13 @@ async function openJob(req: IncomingMessage, res: ServerResponse, op: string) {
   const declared = paramOf(event, 'op');
   if (declared !== undefined && declared !== op) {
     refuse(res, 422, 'F00', `op=${declared} sent to the ${op} door`);
+    return null;
+  }
+  // A quote-shaped event never runs a leg: the execute door refuses it before
+  // touching any downstream network, so a mis-routed quote costs the route
+  // price and nothing else.
+  if (phase === 'execute' && paramOf(event, 'phase') === 'quote') {
+    refuse(res, 422, 'F00', `phase=quote sent to the ${op} execute door; pay the ${op} quote route instead`);
     return null;
   }
   return { event, meta };
@@ -119,6 +142,90 @@ function walrusDoor(uploader: WalrusUploader) {
       const msg = (e as Error).message;
       console.log(`walrus REJECT ${bytes.length}B payer=${meta.payer ?? '-'} ${Date.now() - t0}ms: ${msg}`);
       return refuse(res, 502, 'T00', `walrus leg failed, nothing charged downstream: ${msg}`);
+    }
+  };
+}
+
+/** The Base key's USDC balance, cached: one read per FLOAT_CACHE_MS however many quotes arrive. */
+function walrusFloat(evmKey: `0x${string}`) {
+  const account = privateKeyToAccount(evmKey);
+  const client = createPublicClient({ chain: base, transport: viemHttp(BASE_RPC) });
+  const read = cached(FLOAT_CACHE_MS, async () => {
+    const raw = await client.readContract({ address: BASE_USDC, abi: erc20Abi, functionName: 'balanceOf', args: [account.address] });
+    return formatUnits(raw, 6);
+  });
+  return { address: account.address, read };
+}
+
+function walrusQuoteDoor(uploader: WalrusUploader, float: ReturnType<typeof walrusFloat>) {
+  return async (req: IncomingMessage, res: ServerResponse) => {
+    const job = await openJob(req, res, 'walrus', 'quote');
+    if (!job) return;
+    const { event, meta } = job;
+    const b64 = inputOf(event, 'blob');
+    const sizeParam = paramOf(event, 'size');
+    const size = b64 ? Buffer.from(b64, 'base64').length : Number(sizeParam);
+    if (!Number.isInteger(size) || size < 0) return refuse(res, 422, 'F00', 'param size (bytes) or a blob input is required');
+    const t0 = Date.now();
+    try {
+      const [price, balance] = await Promise.all([uploader.quote(Math.max(size, 1)), float.read()]);
+      const d = decideWalrus({ size, maxBytes: MAX_BODY_BYTES, priceUsdc: price.amountUsdc, balanceUsdc: balance, reserveMultiple: WALRUS_RESERVE_MULTIPLE });
+      const quote: WalrusQuote = {
+        op: 'walrus',
+        deliverable: d.deliverable,
+        ...(d.reason ? { reason: d.reason } : {}),
+        size,
+        maxBytes: MAX_BODY_BYTES,
+        downstream: { provider: 'lighthouse-x402', amountUsdc: price.amountUsdc, retention: 'P365D' },
+        float: { chain: 'base', asset: 'USDC', balance, reserve: d.reserveUsdc },
+        executeDoor: '/walrus',
+        at: Math.floor(Date.now() / 1000),
+      };
+      console.log(`walrus quote ${size}B deliverable=${d.deliverable} downstream=${price.amountUsdc} float=${balance} payer=${meta.payer ?? '-'} ${Date.now() - t0}ms${d.reason ? `: ${d.reason}` : ''}`);
+      return acceptReceipt(res, quote, meta);
+    } catch (e) {
+      const msg = (e as Error).message;
+      console.log(`walrus quote REJECT ${size}B ${Date.now() - t0}ms: ${msg}`);
+      return refuse(res, 502, 'T00', `walrus quote failed: ${msg}`);
+    }
+  };
+}
+
+function nameQuoteDoor(namer: Namer, lamports: () => Promise<bigint>) {
+  return async (req: IncomingMessage, res: ServerResponse) => {
+    const job = await openJob(req, res, 'name', 'quote');
+    if (!job) return;
+    const { event, meta } = job;
+    const txid = paramOf(event, 'txid');
+    const sha = paramOf(event, 'sha256');
+    const undername = paramOf(event, 'undername') ?? (sha && /^[0-9a-f]{64}$/.test(sha) ? undernameFor(sha) : '');
+    const t0 = Date.now();
+    try {
+      const [have, authorized] = await Promise.all([lamports(), namer.authorized()]);
+      const d = decideName({
+        undernameOk: UNDERNAME_RE.test(undername) && undername !== '@',
+        txidOk: txid === undefined || /^[A-Za-z0-9_-]{43}$/.test(txid),
+        authorized,
+        lamports: have,
+        needLamports: NAME_NEED_LAMPORTS,
+      });
+      const quote: NameQuote = {
+        op: 'name',
+        deliverable: d.deliverable,
+        ...(d.reason ? { reason: d.reason } : {}),
+        undername,
+        name: `${undername}_${namer.baseName}`,
+        antId: namer.antId,
+        float: { chain: 'solana', asset: 'SOL', lamports: have.toString(), needLamports: NAME_NEED_LAMPORTS.toString() },
+        executeDoor: '/name',
+        at: Math.floor(Date.now() / 1000),
+      };
+      console.log(`name quote ${undername || '?'} deliverable=${d.deliverable} float=${have} payer=${meta.payer ?? '-'} ${Date.now() - t0}ms${d.reason ? `: ${d.reason}` : ''}`);
+      return acceptReceipt(res, quote, meta);
+    } catch (e) {
+      const msg = (e as Error).message;
+      console.log(`name quote REJECT ${undername || '?'} ${Date.now() - t0}ms: ${msg}`);
+      return refuse(res, 502, 'T00', `name quote failed: ${msg}`);
     }
   };
 }
@@ -160,7 +267,16 @@ async function main() {
 
   const evmKey = process.env.LADING_EVM_PRIVATE_KEY as `0x${string}` | undefined;
   if (evmKey) {
-    doors['/walrus'] = walrusDoor(lighthouseUploader(evmKey));
+    const uploader = lighthouseUploader(evmKey);
+    const float = walrusFloat(evmKey);
+    doors['/walrus'] = walrusDoor(uploader);
+    doors['/walrus/quote'] = walrusQuoteDoor(uploader, float);
+    describeDoors.walrusQuote = {
+      path: '/walrus/quote',
+      answers: 'WalrusQuote: deliverable, downstream USDC price, float',
+      input: 'params op=walrus, phase=quote, size (bytes); or the blob itself',
+      floatAddress: float.address,
+    };
     describeDoors.walrus = {
       path: '/walrus',
       network: 'walrus',
@@ -186,7 +302,18 @@ async function main() {
       secretKey: solanaSecret,
       rpcUrl: process.env.SOLANA_RPC ?? 'https://api.mainnet-beta.solana.com',
     });
+    const rpcUrl = process.env.SOLANA_RPC ?? 'https://api.mainnet-beta.solana.com';
+    const rpc = createSolanaRpc(rpcUrl);
+    const lamports = cached(FLOAT_CACHE_MS, async () => BigInt((await rpc.getBalance(solAddress(namer.signerAddress)).send()).value));
     doors['/name'] = nameDoor(namer);
+    doors['/name/quote'] = nameQuoteDoor(namer, lamports);
+    describeDoors.nameQuote = {
+      path: '/name/quote',
+      answers: 'NameQuote: deliverable, undername, float in lamports',
+      input: 'params op=name, phase=quote, and undername or sha256; optional txid',
+      floatAddress: namer.signerAddress,
+      needLamports: NAME_NEED_LAMPORTS.toString(),
+    };
     describeDoors.name = {
       path: '/name',
       antId,
@@ -210,6 +337,7 @@ async function main() {
       inputEncoding: 'i-tags and param-tags',
       resultDelivery: 'ilp-fulfill-body',
       refusals: 'reject-before-receipt',
+      quotes: 'a quote door per leg answers deliverability before the leg is paid',
       handlerPaths: Object.fromEntries(Object.entries(describeDoors).map(([k, v]) => [k, v.path])),
     },
     handlerKinds: Object.keys(doors).length ? [LEG_KIND] : [],

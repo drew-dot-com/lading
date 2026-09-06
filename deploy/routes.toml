@@ -18,3 +18,17 @@ price = 5000
 
 # The Arweave leg and the manifest write ride the existing g.drew.ario route
 # (schedule {base 1000, per_kib 30}); the relay copy rides g.drew.relay (1000).
+
+# Quote doors, 1,000 each: "would this leg go through right now". The walrus
+# quote reads the Lighthouse price for the size and the Base key's USDC; the
+# name quote reads the name key's lamports and its ANT authority. A caller
+# risks 1,000 here instead of 40,000 or 5,000 on a leg that would fail.
+[[routes]]
+prefix = "g.drew.lading.walrus.quote"
+handler_url = "http://lading:3600/walrus/quote"
+price = 1000
+
+[[routes]]
+prefix = "g.drew.lading.name.quote"
+handler_url = "http://lading:3600/name/quote"
+price = 1000

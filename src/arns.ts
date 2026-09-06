@@ -14,6 +14,10 @@ export interface Namer {
   antId: string;
   baseName: string;
   gateway: string;
+  /** The Solana address that signs record writes, and pays their rent. */
+  signerAddress: string;
+  /** Re-checks, on chain, that the signer is still the ANT's owner or a controller. */
+  authorized(): Promise<boolean>;
   setUndername(undername: string, txId: string): Promise<NameReceipt>;
 }
 
@@ -40,18 +44,22 @@ export async function solanaNamer(opts: {
     getOwner(): Promise<unknown>;
     getControllers(): Promise<unknown[]>;
   };
-  const owner = String(await ro.getOwner());
-  const controllers = (await ro.getControllers().catch(() => [])).map(String);
   const me = String(signer.address);
-  if (owner !== me && !controllers.includes(me)) {
-    throw new Error(`signer ${me} is neither owner (${owner}) nor a controller of ANT ${opts.antId}`);
-  }
-  console.log(`name door: ANT ${opts.antId} signer ${me} (${owner === me ? 'owner' : 'controller'})`);
+  const authority = async () => {
+    const owner = String(await ro.getOwner());
+    const controllers = (await ro.getControllers().catch(() => [])).map(String);
+    return owner === me ? 'owner' : controllers.includes(me) ? 'controller' : undefined;
+  };
+  const role = await authority();
+  if (!role) throw new Error(`signer ${me} is neither owner nor a controller of ANT ${opts.antId}`);
+  console.log(`name door: ANT ${opts.antId} signer ${me} (${role})`);
 
   return {
     antId: opts.antId,
     baseName: opts.baseName,
     gateway: opts.gateway,
+    signerAddress: me,
+    authorized: async () => (await authority().catch(() => undefined)) !== undefined,
     async setUndername(undername, txId) {
       if (!UNDERNAME_RE.test(undername)) throw new Error(`bad undername ${undername}`);
       const ant = (await ANT.init({ processId: opts.antId, signer, rpc, rpcSubscriptions } as never)) as {
