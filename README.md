@@ -8,17 +8,20 @@ archived on several storage networks, paying per object per network, with the
 money moving only when the network's receipt comes back. Every copy is then
 listed in a signed manifest that lives on Arweave under an ArNS name.
 
-Status: v0.2.0, Arweave and Walrus legs, ArNS naming, relay copy, and a quote
-door in front of each broker leg. Filecoin is next. Runs against Drew's
-mainnet node today.
+Status: v0.3.0, Arweave, Walrus and Filecoin legs, ArNS naming, relay copy,
+and a quote door in front of each broker leg. Runs against Drew's mainnet
+node today; the Filecoin door goes live the day its Filecoin Pay account is
+funded (see Run it).
 
 ## Why this exists
 
 Every storage micropayment product on the market (Lighthouse, Turbo, Pinata
 over x402) charges before delivery. Only Filecoin settles on proof, and only
-inside Filecoin. Lading sells the receipt: a leg answers with the network's
-own identifier and proof, or it answers with a refusal and buys nothing
-downstream.
+inside Filecoin (the Filecoin leg here rides exactly that: Filecoin Onchain
+Cloud pays a provider per epoch only while its Proof of Data Possession keeps
+landing). Lading sells the receipt across networks: a leg answers with the
+network's own identifier and proof, or it answers with a refusal and buys
+nothing downstream.
 
 What "pay on receipt" means here, precisely. The TOON connector charges the
 route price for every packet it delivers to the app, whatever the app answers
@@ -32,8 +35,9 @@ part that costs real money.
 To keep the route price from being the cost of finding out, each broker leg
 has a quote door at 1,000 units that answers "would this go through right
 now": the Walrus quote reads the Lighthouse price for the size and the Base
-key's USDC float, the name quote reads the name key's lamports and its ANT
-authority. `lading put` asks first and only pays a leg its quote said is
+key's USDC float, the Filecoin quote reads the broker's Filecoin Pay account
+(deposit still needed, runway in days), the name quote reads the name key's
+lamports and its ANT authority. `lading put` asks first and only pays a leg its quote said is
 deliverable (`--no-quote` skips the question). A quote-shaped event sent to an
 execute door is refused before anything downstream runs.
 
@@ -52,20 +56,24 @@ lading put report.pdf
 | 1. Arweave leg | `g.drew.ario` (kind 5094) | the org store, on the Arweave txId | `{base 1000, per_kib 30}` |
 | 2. Walrus quote | `g.drew.lading.walrus.quote` (kind 5320, `phase=quote`) | Lading: deliverable, downstream USDC price, float | 1,000 |
 | 3. Walrus leg | `g.drew.lading.walrus` (kind 5320) | Lading, on the Walrus blobId after an aggregator read-back | 40,000 flat |
-| 4. bill of lading | signed locally by the payer's Nostr key | kind 30320, `d` = sha256 | free |
-| 5. relay copy | `g.drew.relay` | the node relay | 1,000 |
-| 6. manifest to Arweave | `g.drew.ario` | the org store, on the txId | schedule |
-| 7. name quote | `g.drew.lading.name.quote` (kind 5320, `phase=quote`) | Lading: deliverable, undername, lamports float | 1,000 |
-| 8. ArNS name | `g.drew.lading.name` (kind 5320) | Lading, on the ANT record write | 5,000 |
+| 4. Filecoin quote | `g.drew.lading.filecoin.quote` (kind 5320, `phase=quote`) | Lading: deliverable, add-piece fee, USDFC float, runway | 1,000 |
+| 5. Filecoin leg | `g.drew.lading.filecoin` (kind 5320) | Lading, on the PieceCID once the provider committed it on chain and served it back | 30,000 flat |
+| 6. bill of lading | signed locally by the payer's Nostr key | kind 30320, `d` = sha256 | free |
+| 7. relay copy | `g.drew.relay` | the node relay | 1,000 |
+| 8. manifest to Arweave | `g.drew.ario` | the org store, on the txId | schedule |
+| 9. name quote | `g.drew.lading.name.quote` (kind 5320, `phase=quote`) | Lading: deliverable, undername, lamports float | 1,000 |
+| 10. ArNS name | `g.drew.lading.name` (kind 5320) | Lading, on the ANT record write | 5,000 |
 
 A leg that fails answers `accept: false`, buys nothing downstream, and costs
-the route price. Steps are skippable (`--skip-walrus`, `--skip-name`,
-`--skip-relay`, `--skip-arweave`). The local record is written as soon as the
+the route price. Steps are skippable (`--skip-walrus`, `--skip-filecoin`,
+`--skip-name`, `--skip-relay`, `--skip-arweave`). A Filecoin quote that says
+not deliverable skips that leg and carries on; the manifest then simply lists
+fewer legs. The local record is written as soon as the
 manifest is on Arweave, so a failed name leg is resumable with
 `lading name <sha256>` without re-uploading anything.
 
 `lading quote <file>` prints the whole bill before paying it (route prices from
-the edge plus both quotes; costs the two quotes). `lading verify <arns-name |
+the edge plus the three quotes; costs the three quotes). `lading verify <arns-name |
 manifest-txid | saved.json>` re-fetches every leg from its network and
 compares sha256. `lading describe` prints route prices.
 
@@ -75,12 +83,15 @@ every attestation for a given object hash across payers.
 ## What is where
 
 ```
-src/server.ts    the handler: POST /walrus, POST /name, GET /describe, GET /health
+src/server.ts    the handler: POST /walrus, /filecoin, /name and their /quote doors, GET /describe, GET /health
 src/walrus.ts    Lighthouse x402 upload (USDC on Base), blobId lookup, aggregator read-back
-src/arns.ts      ANT undername write, owner-only
+src/filecoin.ts  Filecoin Onchain Cloud upload (Synapse SDK, USDFC in Filecoin Pay), provider read-back
+src/filecoin-fund.ts  operator tool: deposit USDFC and approve warm storage, once
+src/quote.ts     the pure deliverability decisions behind the quote doors
+src/arns.ts      ANT undername write, owner or controller
 src/manifest.ts  build and verify the kind 30320 bill of lading
 src/cli.ts       the paying client that composes the legs
-deploy/routes.toml   the two [[routes]] rows for the edge connector
+deploy/routes.toml   the [[routes]] rows for the edge connector
 ```
 
 Walrus verification, three independent checks recorded in the receipt: the
@@ -89,6 +100,15 @@ sha256 (offline, trusts nobody); the Lighthouse Walrus gateway must serve
 bytes with that sha256; and the public Walrus aggregator must serve the blob,
 which is a CARv1 archive wrapping the raw block, so the check is containment
 of the file bytes. `lading verify` re-runs the gateway check.
+
+Filecoin verification: the receipt carries the PieceCID, the on-chain data
+set and piece ids, the provider id and the provider's `/piece/<PieceCID>`
+URL, plus the add-pieces transaction hash when the SDK reports one. The door
+reads the bytes back from that URL and compares sha256 before it FULFILLs;
+`lading verify` repeats the read. Anyone can check the data set on chain
+(Filecoin Warm Storage, chain 314) and its PDP proofs. A receipt records
+`complete: no` when the second copy did not land; the primary copy is what
+the FULFILL stands on.
 
 The handler holds no payment logic. The connector verifies the claim and
 charges the route before a request lands here; the handler reads the
@@ -105,6 +125,26 @@ Retention is 365 days; renewal is bound to the paying wallet, which is the
 broker's Base key. A native Walrus leg (own publisher, SUI plus WAL) would
 return the Sui blob object and certified epoch directly and is the v2 path.
 
+Filecoin Onchain Cloud is pay-per-epoch out of a USDFC deposit in Filecoin
+Pay, with one data set per copy per provider (two copies by default). The
+provider takes a one-time fee per add-pieces call (about $0.011 per copy),
+and each data set costs $0.12 per month for proving plus $2.50 per TiB per
+month for bytes, shared by every object in it. Creating the data sets locks
+about 0.62 USDFC each (a refundable lifecycle reserve plus the first month's
+proving), so the first upload on a fresh account needs a deposit of about
+1.24 USDFC; after that a piece costs cents. Live numbers from the door on
+2026-09-06: add-piece fees 0.094 USDFC for two copies, rate 0.24 USDFC per
+month, deposit needed 1.24 USDFC on an empty account. 30,000 base units on
+the route covers the per-object fee with a margin; the recurring cost is the
+broker's to keep paying, which is what the quote's runway floor guards (a
+provider may drop a data set whose payer runs dry). Retention in the receipt
+is therefore `per-epoch` with the runway in days at the time of the write.
+
+Why not Lighthouse for Filecoin: its hosted x402 endpoint is the Walrus one
+(`x402.lighthouse.storage` and `x402-walrus.lighthouse.storage` answer the
+same PAYMENT-REQUIRED and the same Walrus gateway URL), and its IPFS plus
+Filecoin path is a prepaid API key whose deal shows up hours to a day later.
+
 ## Run it
 
 ```bash
@@ -117,6 +157,20 @@ Handler, on the node (joins the node's existing network, see `docker-compose.yml
 cp .env.example .env   # fill LADING_EVM_PRIVATE_KEY (Base, holds USDC), LADING_ANT_ID, LADING_ARNS_BASE_NAME, LADING_SOLANA_KEYPAIR
 docker compose up -d --build
 ```
+
+Filecoin door, once per account. Any secp256k1 key works (the Base key's hex
+is fine; the address is the same on Filecoin). Put a little FIL on it for one
+transaction and some USDFC (bridge with Squid Router, or mint against FIL at
+app.usdfc.net), then:
+
+```bash
+LADING_FILECOIN_PRIVATE_KEY=0x... npm run fund:filecoin           # prints balances and the deposit the SDK asks for
+LADING_FILECOIN_PRIVATE_KEY=0x... npm run fund:filecoin -- --yes  # sends the one deposit-plus-approval transaction
+```
+
+Set `LADING_FILECOIN_PRIVATE_KEY` in `.env` and rebuild; the door is off while
+it is unset. `LADING_FILECOIN_COPIES` (2) and `LADING_FILECOIN_MIN_RUNWAY_DAYS`
+(7) tune it; `LADING_FILECOIN_CHAIN=calibration` points it at the testnet.
 
 Then append `deploy/routes.toml` to the edge connector config and restart it.
 
@@ -133,6 +187,8 @@ watermark, keep it), `LADING_NOSTR_KEY` (payer identity, else generated into
 ## Constraints
 
 - Objects stay under the 2 MiB packet cap; chunking is a later feature.
-- Arweave and Walrus data are public. Encrypt client-side if it matters.
+- Arweave, Walrus and Filecoin data are public. Encrypt client-side if it matters.
+- Filecoin pieces start at 127 bytes; smaller objects skip that leg.
+- The Filecoin leg stays stored only while the broker's Filecoin Pay runway lasts; the quote door refuses below the runway floor.
 - AR.IO's sub-100 KiB free tier is a trial allowance; price every write as paid.
 - No em dashes.

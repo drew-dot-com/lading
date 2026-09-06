@@ -2,9 +2,9 @@
 /**
  * The Lading client: the party that pays, and the one that composes legs.
  *
- *   lading put <file>       archive: arweave leg → walrus leg → sign the bill of
- *                           lading → publish to relay → write it to Arweave →
- *                           name it on ArNS. Each leg is one paid job; a leg
+ *   lading put <file>       archive: arweave leg → walrus leg → filecoin leg →
+ *                           sign the bill of lading → publish to relay → write
+ *                           it to Arweave → name it on ArNS. Each leg is one paid job; a leg
  *                           that fails leaves nothing charged for it.
  *   lading verify <ref>     re-fetch every leg named in a manifest and compare
  *                           sha256. <ref> is an ArNS name, a manifest txId, or
@@ -26,8 +26,8 @@ import { basename, join } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import { ToonClient, buildJobEvent, sendJob, chargeFor } from '@toon-protocol/client';
 import { getPublicKey, type Event as NostrEvent } from 'nostr-tools/pure';
-import { LEG_KIND, type LegReceipt, type NameReceipt, type WalrusReceipt } from './kinds.js';
-import type { NameQuote, WalrusQuote } from './quote.js';
+import { LEG_KIND, type FilecoinReceipt, type LegReceipt, type NameReceipt, type WalrusReceipt } from './kinds.js';
+import type { FilecoinQuote, NameQuote, WalrusQuote } from './quote.js';
 import { buildManifest, parseManifest, type ManifestContent } from './manifest.js';
 import { undernameFor } from './arns.js';
 
@@ -37,6 +37,8 @@ const ROUTES = {
   ario: env('LADING_ROUTE_ARIO', 'g.drew.ario'),
   walrus: env('LADING_ROUTE_WALRUS', 'g.drew.lading.walrus'),
   walrusQuote: env('LADING_ROUTE_WALRUS_QUOTE', 'g.drew.lading.walrus.quote'),
+  filecoin: env('LADING_ROUTE_FILECOIN', 'g.drew.lading.filecoin'),
+  filecoinQuote: env('LADING_ROUTE_FILECOIN_QUOTE', 'g.drew.lading.filecoin.quote'),
   name: env('LADING_ROUTE_NAME', 'g.drew.lading.name'),
   nameQuote: env('LADING_ROUTE_NAME_QUOTE', 'g.drew.lading.name.quote'),
   relay: env('LADING_ROUTE_RELAY', 'g.drew.relay'),
@@ -113,16 +115,25 @@ async function quoteWalrus(c: ToonClient, size: number, name: string): Promise<P
   return job<WalrusQuote>(c, ROUTES.walrusQuote, ev as never, 60_000);
 }
 
+/** Ask the filecoin quote door whether the broker's Filecoin Pay account can carry one more piece right now. 1,000 units, against 30,000 for the leg. */
+async function quoteFilecoin(c: ToonClient, size: number, name: string): Promise<Paid<FilecoinQuote>> {
+  const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'filecoin', phase: 'quote', size: String(size), name } });
+  return job<FilecoinQuote>(c, ROUTES.filecoinQuote, ev as never, 60_000);
+}
+
 /** Ask the name quote door whether the broker can write this undername right now. 1,000 units, against 5,000 for the leg. */
 async function quoteName(c: ToonClient, undername: string, txid?: string): Promise<Paid<NameQuote>> {
   const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'name', phase: 'quote', undername, ...(txid ? { txid } : {}) } });
   return job<NameQuote>(c, ROUTES.nameQuote, ev as never, 60_000);
 }
 
-const fmtQuote = (q: WalrusQuote | NameQuote) =>
-  q.op === 'walrus'
-    ? `${q.deliverable ? 'deliverable' : 'NOT deliverable'}, downstream ${q.downstream.amountUsdc} USDC, float ${q.float.balance} USDC on Base${q.reason ? `: ${q.reason}` : ''}`
-    : `${q.deliverable ? 'deliverable' : 'NOT deliverable'}, ${q.name}, float ${(Number(q.float.lamports) / 1e9).toFixed(4)} SOL${q.reason ? `: ${q.reason}` : ''}`;
+const fmtQuote = (q: WalrusQuote | FilecoinQuote | NameQuote) => {
+  const head = q.deliverable ? 'deliverable' : 'NOT deliverable';
+  const tail = q.reason ? `: ${q.reason}` : '';
+  if (q.op === 'walrus') return `${head}, downstream ${q.downstream.amountUsdc} USDC, float ${q.float.balance} USDC on Base${tail}`;
+  if (q.op === 'filecoin') return `${head}, add-piece fee ${q.downstream.addPieceFeeUsdfc} USDFC for ${q.copies} copies, float ${q.float.available} USDFC, runway ${q.float.runwayDays}d${tail}`;
+  return `${head}, ${q.name}, float ${(Number(q.float.lamports) / 1e9).toFixed(4)} SOL${tail}`;
+};
 
 async function put(file: string) {
   const bytes = new Uint8Array(readFileSync(file));
@@ -184,6 +195,33 @@ async function put(file: string) {
     legs.push({ ...r.receipt, paid: r.price?.toString() });
     paid.push({ leg: 'walrus', route: r.route, price: r.price });
     console.log(`walrus   ✓ ${r.receipt.id}  readback=${r.receipt.proof.readback}  (${Date.now() - t0} ms)`);
+  }
+
+  // Leg 2b: Filecoin Onchain Cloud, through Lading's door. Lading FULFILLs on
+  // the PieceCID once the provider has committed the piece and served it back.
+  if (!flag('skip-filecoin')) {
+    let go = true;
+    if (!flag('no-quote')) {
+      const q = await quoteFilecoin(c, bytes.length, name);
+      paid.push({ leg: 'filecoin-quote', route: q.route, price: q.price });
+      console.log(`filecoin quote ${fmtQuote(q.receipt)}  (${Date.now() - t0} ms)`);
+      if (!q.receipt.deliverable) {
+        go = false;
+        console.log(`filecoin SKIPPED, nothing paid for it: ${q.receipt.reason}`);
+      }
+    }
+    if (go) {
+      const ev = buildJobEvent({
+        kind: LEG_KIND,
+        params: { op: 'filecoin', name },
+        tags: [['i', Buffer.from(bytes).toString('base64'), 'blob']],
+      });
+      const r = await job<FilecoinReceipt>(c, ROUTES.filecoin, ev as never, 300_000);
+      if (r.receipt.sha256 !== sha) throw new Error(`filecoin receipt is for sha ${r.receipt.sha256}, not ${sha}`);
+      legs.push({ ...r.receipt, paid: r.price?.toString() });
+      paid.push({ leg: 'filecoin', route: r.route, price: r.price });
+      console.log(`filecoin ✓ ${r.receipt.id}  dataSet=${r.receipt.proof.dataSetId} copies=${r.receipt.proof.copies} readback=${r.receipt.proof.readback}  (${Date.now() - t0} ms)`);
+    }
   }
 
   if (legs.length === 0) throw new Error('every leg was skipped; nothing to attest');
@@ -314,7 +352,11 @@ async function verify(ref: string) {
   let ok = true;
   for (const leg of m.legs) {
     const url =
-      leg.network === 'arweave' ? `https://${GATEWAY}/${leg.id}` : leg.network === 'walrus' ? (leg.proof?.ipfsUrl ?? `${AGGREGATOR}/v1/blobs/${leg.id}`) : leg.proof?.readUrl;
+      leg.network === 'arweave'
+        ? `https://${GATEWAY}/${leg.id}`
+        : leg.network === 'walrus'
+          ? (leg.proof?.ipfsUrl ?? `${AGGREGATOR}/v1/blobs/${leg.id}`)
+          : leg.proof?.readUrl;
     if (!url) {
       console.log(`  ${leg.network.padEnd(8)} ${leg.id}  no read url`);
       ok = false;
@@ -339,7 +381,7 @@ async function describe() {
   await (c as { close?: () => Promise<void> }).close?.();
 }
 
-/** The whole bill before paying it: route prices from the edge, deliverability from the two quote doors. Costs two quotes. */
+/** The whole bill before paying it: route prices from the edge, deliverability from the three quote doors. Costs three quotes. */
 async function quote(file: string) {
   const bytes = new Uint8Array(readFileSync(file));
   const sha = sha256(bytes);
@@ -348,12 +390,15 @@ async function quote(file: string) {
   const c = await client();
   const eventBytes = (params: Record<string, string>, blob?: Uint8Array) =>
     Buffer.byteLength(JSON.stringify({ event: buildJobEvent({ kind: LEG_KIND, params, tags: blob ? [['i', Buffer.from(blob).toString('base64'), 'blob']] : [] }) }));
-  const manifestGuess = 1200 + 2 * 300; // a manifest with two legs, before signing
+  const manifestGuess = 1200 + 3 * 400; // a manifest with three legs, before signing
   const rows: Array<[string, string, bigint | null, string]> = [];
   rows.push(['arweave', ROUTES.ario, await charge(c, ROUTES.ario, eventBytes({}, bytes)), 'schedule on the payload']);
   const wq = await quoteWalrus(c, bytes.length, name);
   rows.push(['walrus-quote', wq.route, wq.price, fmtQuote(wq.receipt)]);
   rows.push(['walrus', ROUTES.walrus, wq.receipt.deliverable ? await charge(c, ROUTES.walrus, 0) : 0n, wq.receipt.deliverable ? 'flat' : 'would not be paid']);
+  const fq = await quoteFilecoin(c, bytes.length, name);
+  rows.push(['filecoin-quote', fq.route, fq.price, fmtQuote(fq.receipt)]);
+  rows.push(['filecoin', ROUTES.filecoin, fq.receipt.deliverable ? await charge(c, ROUTES.filecoin, 0) : 0n, fq.receipt.deliverable ? 'flat' : 'would be skipped']);
   rows.push(['relay', ROUTES.relay, await charge(c, ROUTES.relay, manifestGuess), 'manifest copy']);
   rows.push(['manifest', ROUTES.ario, await charge(c, ROUTES.ario, manifestGuess), 'manifest on Arweave, estimate']);
   const nq = await quoteName(c, undername);
@@ -362,7 +407,7 @@ async function quote(file: string) {
   console.log(`\n${file}: ${bytes.length} bytes, sha256 ${sha}`);
   for (const [leg, route, price, note] of rows) console.log(`  ${leg.padEnd(13)} ${route.padEnd(30)} ${String(price ?? '?').padStart(8)}  ${note}`);
   const total = rows.reduce((a, r) => a + (r[2] ?? 0n), 0n);
-  console.log(`  ${'total'.padEnd(13)} ${''.padEnd(30)} ${total.toString().padStart(8)}  base units (${(Number(total) / 1e6).toFixed(4)} USDC), quotes paid now: ${(wq.price ?? 0n) + (nq.price ?? 0n)}`);
+  console.log(`  ${'total'.padEnd(13)} ${''.padEnd(30)} ${total.toString().padStart(8)}  base units (${(Number(total) / 1e6).toFixed(4)} USDC), quotes paid now: ${(wq.price ?? 0n) + (fq.price ?? 0n) + (nq.price ?? 0n)}`);
   await (c as { close?: () => Promise<void> }).close?.();
 }
 
@@ -370,7 +415,7 @@ const [cmd, arg] = process.argv.slice(2);
 const run =
   cmd === 'put' && arg ? put(arg) : cmd === 'quote' && arg ? quote(arg) : cmd === 'verify' && arg ? verify(arg) : cmd === 'name' && arg ? nameOnly(arg) : cmd === 'describe' ? describe() : null;
 if (!run) {
-  console.log('usage: lading put <file> [--name n] [--mime m] [--undername u] [--no-quote] [--skip-arweave|--skip-walrus|--skip-relay|--skip-name]\n       lading quote <file>\n       lading verify <arns-name|manifest-txid|saved.json>\n       lading name <sha256> [--no-quote]\n       lading describe');
+  console.log('usage: lading put <file> [--name n] [--mime m] [--undername u] [--no-quote] [--skip-arweave|--skip-walrus|--skip-filecoin|--skip-relay|--skip-name]\n       lading quote <file>\n       lading verify <arns-name|manifest-txid|saved.json>\n       lading name <sha256> [--no-quote]\n       lading describe');
   process.exit(2);
 }
 run.catch((e) => {

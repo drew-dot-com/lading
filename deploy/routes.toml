@@ -10,6 +10,15 @@ prefix = "g.drew.lading.walrus"
 handler_url = "http://lading:3600/walrus"
 price = 40000
 
+# Filecoin leg. Filecoin Onchain Cloud: the provider takes a one-time add-piece
+# fee of about $0.011 per copy (two copies by default), and the broker's data
+# set carries a shared $0.12/month proving fee plus $2.50/TiB/month per copy.
+# 30,000 base units = $0.03, a thin margin over the per-object cost.
+[[routes]]
+prefix = "g.drew.lading.filecoin"
+handler_url = "http://lading:3600/filecoin"
+price = 30000
+
 # Name leg. One Solana transaction on the broker's ANT per job. 5,000 = $0.005.
 [[routes]]
 prefix = "g.drew.lading.name"
@@ -21,11 +30,18 @@ price = 5000
 
 # Quote doors, 1,000 each: "would this leg go through right now". The walrus
 # quote reads the Lighthouse price for the size and the Base key's USDC; the
-# name quote reads the name key's lamports and its ANT authority. A caller
-# risks 1,000 here instead of 40,000 or 5,000 on a leg that would fail.
+# filecoin quote reads the broker's Filecoin Pay account (deposit needed,
+# runway in days); the name quote reads the name key's lamports and its ANT
+# authority. A caller risks 1,000 here instead of 40,000, 30,000 or 5,000 on
+# a leg that would fail.
 [[routes]]
 prefix = "g.drew.lading.walrus.quote"
 handler_url = "http://lading:3600/walrus/quote"
+price = 1000
+
+[[routes]]
+prefix = "g.drew.lading.filecoin.quote"
+handler_url = "http://lading:3600/filecoin/quote"
 price = 1000
 
 [[routes]]

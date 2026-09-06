@@ -1,10 +1,12 @@
 /**
  * Lading's handler: the doors a TOON connector terminates routes at.
  *
- *   POST /walrus        kind:5320, `['i', base64, 'blob']`  → WalrusReceipt
- *   POST /name          kind:5320, params op=name, txid, undername → NameReceipt
- *   POST /walrus/quote  kind:5320, params op=walrus, phase=quote, size → WalrusQuote
- *   POST /name/quote    kind:5320, params op=name, phase=quote, undername, txid → NameQuote
+ *   POST /walrus         kind:5320, `['i', base64, 'blob']`  → WalrusReceipt
+ *   POST /filecoin       kind:5320, `['i', base64, 'blob']`  → FilecoinReceipt
+ *   POST /name           kind:5320, params op=name, txid, undername → NameReceipt
+ *   POST /walrus/quote   kind:5320, params op=walrus, phase=quote, size → WalrusQuote
+ *   POST /filecoin/quote kind:5320, params op=filecoin, phase=quote, size → FilecoinQuote
+ *   POST /name/quote     kind:5320, params op=name, phase=quote, undername, txid → NameQuote
  *   GET  /describe what this node serves, derived from what booted
  *   GET  /health
  *
@@ -24,7 +26,8 @@ import { getPublicKey, verifyEvent, type Event as NostrEvent } from 'nostr-tools
 import { LEG_KIND, MANIFEST_KIND } from './kinds.js';
 import { lighthouseUploader, sha256Hex, LIGHTHOUSE_X402, WALRUS_AGGREGATOR, type WalrusUploader } from './walrus.js';
 import { solanaNamer, undernameFor, UNDERNAME_RE, type Namer } from './arns.js';
-import { cached, decideName, decideWalrus, type NameQuote, type WalrusQuote } from './quote.js';
+import { cached, decideFilecoin, decideName, decideWalrus, type FilecoinQuote, type NameQuote, type WalrusQuote } from './quote.js';
+import { filecoinChain, synapseUploader, runwayText, FILECOIN_MIN_BYTES, type FilecoinUploader } from './filecoin.js';
 import { createPublicClient, http as viemHttp, erc20Abi, formatUnits } from 'viem';
 import { base } from 'viem/chains';
 import { privateKeyToAccount } from 'viem/accounts';
@@ -33,11 +36,13 @@ import { createSolanaRpc, address as solAddress } from '@solana/kit';
 const PORT = Number(process.env.PORT ?? 3600);
 const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES ?? 3 * 1024 * 1024);
 const DEV_MODE = process.env.DEV_MODE === '1';
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 /** Lamports the name key must hold before a name job is quoted deliverable: record rent (~2.81M) plus fee, with a margin for a second job in flight. */
 const NAME_NEED_LAMPORTS = BigInt(process.env.LADING_NAME_NEED_LAMPORTS ?? 6_000_000);
 /** The Base key must hold this many times the downstream price before a walrus job is quoted deliverable. */
 const WALRUS_RESERVE_MULTIPLE = Number(process.env.LADING_WALRUS_RESERVE_MULTIPLE ?? 2);
+/** Days of Filecoin Pay runway the broker must hold before a filecoin job is quoted deliverable. */
+const FILECOIN_MIN_RUNWAY_DAYS = BigInt(process.env.LADING_FILECOIN_MIN_RUNWAY_DAYS ?? 7);
 const BASE_USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' as const;
 const BASE_RPC = process.env.BASE_RPC ?? 'https://mainnet.base.org';
 const FLOAT_CACHE_MS = 30_000;
@@ -191,6 +196,74 @@ function walrusQuoteDoor(uploader: WalrusUploader, float: ReturnType<typeof walr
   };
 }
 
+function filecoinDoor(uploader: FilecoinUploader) {
+  return async (req: IncomingMessage, res: ServerResponse) => {
+    const job = await openJob(req, res, 'filecoin');
+    if (!job) return;
+    const { event, meta } = job;
+    const b64 = inputOf(event, 'blob');
+    if (!b64) return refuse(res, 422, 'F00', "Missing input: ['i', <base64>, 'blob']");
+    let bytes: Uint8Array;
+    try {
+      bytes = new Uint8Array(Buffer.from(b64, 'base64'));
+    } catch {
+      return refuse(res, 422, 'F00', 'blob input is not base64');
+    }
+    if (bytes.length === 0) return refuse(res, 422, 'F00', 'blob is empty');
+    if (bytes.length < FILECOIN_MIN_BYTES) return refuse(res, 422, 'F00', `blob is ${bytes.length} bytes, under the ${FILECOIN_MIN_BYTES}-byte Filecoin piece minimum`);
+    const fileName = paramOf(event, 'name') ?? `${sha256Hex(bytes).slice(0, 12)}.bin`;
+    const t0 = Date.now();
+    try {
+      const receipt = await uploader.upload(bytes, fileName);
+      console.log(
+        `filecoin ok ${bytes.length}B sha=${receipt.sha256.slice(0, 12)} piece=${receipt.id} dataSet=${receipt.proof.dataSetId} copies=${receipt.proof.copies} readback=${receipt.proof.readback ?? '?'} ` +
+          `payer=${meta.payer ?? '-'} amount=${meta.amount ?? '-'} chain=${meta.chain ?? '-'} ${Date.now() - t0}ms`,
+      );
+      return acceptReceipt(res, receipt, meta);
+    } catch (e) {
+      const msg = (e as Error).message;
+      console.log(`filecoin REJECT ${bytes.length}B payer=${meta.payer ?? '-'} ${Date.now() - t0}ms: ${msg}`);
+      return refuse(res, 502, 'T00', `filecoin leg failed, nothing charged downstream: ${msg}`);
+    }
+  };
+}
+
+function filecoinQuoteDoor(uploader: FilecoinUploader, info: () => Promise<Awaited<ReturnType<FilecoinUploader['quote']>>>) {
+  return async (req: IncomingMessage, res: ServerResponse) => {
+    const job = await openJob(req, res, 'filecoin', 'quote');
+    if (!job) return;
+    const { event, meta } = job;
+    const b64 = inputOf(event, 'blob');
+    const sizeParam = paramOf(event, 'size');
+    const size = b64 ? Buffer.from(b64, 'base64').length : Number(sizeParam);
+    if (!Number.isInteger(size) || size < 0) return refuse(res, 422, 'F00', 'param size (bytes) or a blob input is required');
+    const t0 = Date.now();
+    try {
+      const q = await info();
+      const d = decideFilecoin({ size, minBytes: FILECOIN_MIN_BYTES, maxBytes: MAX_BODY_BYTES, ready: q.ready, depositNeededUsdfc: q.depositNeededUsdfc, runwayDays: q.runwayDays, minRunwayDays: FILECOIN_MIN_RUNWAY_DAYS });
+      const quote: FilecoinQuote = {
+        op: 'filecoin',
+        deliverable: d.deliverable,
+        ...(d.reason ? { reason: d.reason } : {}),
+        size,
+        minBytes: FILECOIN_MIN_BYTES,
+        maxBytes: MAX_BODY_BYTES,
+        copies: uploader.copies,
+        downstream: { provider: 'filecoin-onchain-cloud', chain: `filecoin:${uploader.chain.id}`, addPieceFeeUsdfc: q.addPieceFeeUsdfc, ratePerMonthUsdfc: q.ratePerMonthUsdfc, retention: 'per-epoch' },
+        float: { chain: `filecoin:${uploader.chain.id}`, asset: 'USDFC', available: q.availableUsdfc, depositNeeded: q.depositNeededUsdfc, runwayDays: runwayText(q.runwayDays), fil: q.filBalance },
+        executeDoor: '/filecoin',
+        at: Math.floor(Date.now() / 1000),
+      };
+      console.log(`filecoin quote ${size}B deliverable=${d.deliverable} fee=${q.addPieceFeeUsdfc} available=${q.availableUsdfc} runway=${runwayText(q.runwayDays)}d payer=${meta.payer ?? '-'} ${Date.now() - t0}ms${d.reason ? `: ${d.reason}` : ''}`);
+      return acceptReceipt(res, quote, meta);
+    } catch (e) {
+      const msg = (e as Error).message;
+      console.log(`filecoin quote REJECT ${size}B ${Date.now() - t0}ms: ${msg}`);
+      return refuse(res, 502, 'T00', `filecoin quote failed: ${msg}`);
+    }
+  };
+}
+
 function nameQuoteDoor(namer: Namer, lamports: () => Promise<bigint>) {
   return async (req: IncomingMessage, res: ServerResponse) => {
     const job = await openJob(req, res, 'name', 'quote');
@@ -289,6 +362,37 @@ async function main() {
     };
   } else {
     console.log('LADING_EVM_PRIVATE_KEY unset: the walrus door is OFF');
+  }
+
+  const filecoinKey = process.env.LADING_FILECOIN_PRIVATE_KEY as `0x${string}` | undefined;
+  if (filecoinKey) {
+    const chain = filecoinChain(process.env.LADING_FILECOIN_CHAIN);
+    const copies = Number(process.env.LADING_FILECOIN_COPIES ?? 2);
+    const uploader = synapseUploader({ privateKey: filecoinKey, chain, copies, source: 'lading', maxBytes: MAX_BODY_BYTES });
+    // One conservative answer (priced at the packet cap) per FLOAT_CACHE_MS, however many quotes arrive.
+    const info = cached(FLOAT_CACHE_MS, () => uploader.quote(MAX_BODY_BYTES));
+    doors['/filecoin'] = filecoinDoor(uploader);
+    doors['/filecoin/quote'] = filecoinQuoteDoor(uploader, info);
+    describeDoors.filecoinQuote = {
+      path: '/filecoin/quote',
+      answers: 'FilecoinQuote: deliverable, add-piece fee, USDFC float and runway',
+      input: 'params op=filecoin, phase=quote, size (bytes); or the blob itself',
+      floatAddress: uploader.address,
+      minRunwayDays: FILECOIN_MIN_RUNWAY_DAYS.toString(),
+    };
+    describeDoors.filecoin = {
+      path: '/filecoin',
+      network: 'filecoin',
+      provider: 'filecoin-onchain-cloud',
+      chain: `filecoin:${chain.id}`,
+      copies,
+      retention: 'per-epoch',
+      minBytes: FILECOIN_MIN_BYTES,
+      maxBytes: MAX_BODY_BYTES,
+      input: "['i', base64, 'blob'], optional param name",
+    };
+  } else {
+    console.log('LADING_FILECOIN_PRIVATE_KEY unset: the filecoin door is OFF');
   }
 
   const antId = process.env.LADING_ANT_ID;

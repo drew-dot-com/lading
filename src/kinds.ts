@@ -1,5 +1,5 @@
 /**
- * Lading's NIP-90 kinds. 5094–5098 are the org's block (store, arns, gas),
+ * Lading's NIP-90 kinds. 5094 to 5098 are the org's block (store, arns, gas),
  * 5301 is anonfetch; Lading takes 5320 for a leg job and 30320 for the
  * bill of lading, a parameterized replaceable event keyed by the object's
  * sha256 so one object has one current manifest per signer.
@@ -15,11 +15,11 @@ export interface LegReceipt {
   /** sha256 of the object, hex, computed by whoever wrote the receipt. */
   sha256: string;
   size: number;
-  /** 'permanent' or an ISO-8601 duration / epoch count the network committed to. */
+  /** 'permanent', an ISO-8601 duration the network committed to, or 'per-epoch' (paid while the broker's runway lasts). */
   retention: string;
   /** Anything a third party can check: a Sui object id, a deal id, a gateway URL. */
   proof?: Record<string, string | number | undefined>;
-  /** Who executed the leg: 'toon-store', 'lighthouse-x402', 'walrus-native'. */
+  /** Who executed the leg: 'toon-store', 'lighthouse-x402', 'filecoin-onchain-cloud', 'walrus-native'. */
   provider: string;
   /** Base units the payer sent on the TOON route for this leg, when known. */
   paid?: string;
@@ -30,6 +30,24 @@ export interface LegReceipt {
 export interface WalrusReceipt extends LegReceipt {
   network: 'walrus';
   proof: { blobId: string; readUrl: string; readback?: string; cid?: string; baseTx?: string; [k: string]: string | number | undefined };
+}
+
+/** What the Filecoin door answers with. `id` is the PieceCID; the proof names the on-chain data set and piece. */
+export interface FilecoinReceipt extends LegReceipt {
+  network: 'filecoin';
+  retention: 'per-epoch';
+  proof: {
+    pieceCid: string;
+    readUrl: string;
+    chain: string;
+    dataSetId: string;
+    pieceId: string;
+    providerId: string;
+    readback?: string;
+    txHash?: string;
+    runwayDays?: string;
+    [k: string]: string | number | undefined;
+  };
 }
 
 /** What the name door answers with. */

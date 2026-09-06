@@ -23,6 +23,20 @@ export interface WalrusQuote {
   at: number;
 }
 
+export interface FilecoinQuote {
+  op: 'filecoin';
+  deliverable: boolean;
+  reason?: string;
+  size: number;
+  minBytes: number;
+  maxBytes: number;
+  copies: number;
+  downstream: { provider: 'filecoin-onchain-cloud'; chain: string; addPieceFeeUsdfc: string; ratePerMonthUsdfc: string; retention: 'per-epoch' };
+  float: { chain: string; asset: 'USDFC'; available: string; depositNeeded: string; runwayDays: string; fil: string };
+  executeDoor: '/filecoin';
+  at: number;
+}
+
 export interface NameQuote {
   op: 'name';
   deliverable: boolean;
@@ -66,6 +80,35 @@ export function decideWalrus(input: {
     };
   }
   return { deliverable: true, reserveUsdc };
+}
+
+/**
+ * A Filecoin leg goes through when the object fits the piece bounds, the
+ * broker's Filecoin Pay account needs no new deposit for it (`ready` from the
+ * SDK's own cost preview, which already includes the lifecycle reserve and the
+ * add-piece fees), and the account's runway clears a floor: a provider may
+ * drop a data set whose payer runs dry, so a receipt is only worth selling
+ * while the broker can keep paying for it.
+ */
+export function decideFilecoin(input: {
+  size: number;
+  minBytes: number;
+  maxBytes: number;
+  ready: boolean;
+  depositNeededUsdfc: string;
+  runwayDays: bigint;
+  minRunwayDays: bigint;
+}): { deliverable: boolean; reason?: string } {
+  if (input.size <= 0) return { deliverable: false, reason: 'object is empty' };
+  if (input.size < input.minBytes) return { deliverable: false, reason: `object is ${input.size} bytes, under the ${input.minBytes}-byte Filecoin piece minimum` };
+  if (input.size > input.maxBytes) return { deliverable: false, reason: `object is ${input.size} bytes, over the ${input.maxBytes}-byte cap` };
+  if (!input.ready) {
+    return { deliverable: false, reason: `filecoin float needs a ${input.depositNeededUsdfc} USDFC deposit before this piece can be paid for` };
+  }
+  if (input.runwayDays < input.minRunwayDays) {
+    return { deliverable: false, reason: `filecoin runway is ${input.runwayDays} days, under the ${input.minRunwayDays}-day floor` };
+  }
+  return { deliverable: true };
 }
 
 /**

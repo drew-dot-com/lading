@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cached, decideName, decideWalrus } from './quote.js';
+import { cached, decideFilecoin, decideName, decideWalrus } from './quote.js';
 
 test('walrus quote: deliverable only with the reserve on the Base key', () => {
   const base = { size: 5535, maxBytes: 3 * 1024 * 1024, priceUsdc: '0.032500' };
@@ -38,4 +38,15 @@ test('cached: one load per ttl, shared while in flight', async () => {
   assert.equal(await read(), 1);
   await new Promise((r) => setTimeout(r, 60));
   assert.equal(await read(), 2);
+});
+
+test('filecoin quote: piece bounds, then a funded account, then runway', () => {
+  const ok = { size: 5535, minBytes: 127, maxBytes: 3 * 1024 * 1024, ready: true, depositNeededUsdfc: '0', runwayDays: 40n, minRunwayDays: 7n };
+  assert.equal(decideFilecoin(ok).deliverable, true);
+  assert.equal(decideFilecoin({ ...ok, size: 0 }).deliverable, false);
+  assert.match(decideFilecoin({ ...ok, size: 64 }).reason ?? '', /under the 127-byte/);
+  assert.match(decideFilecoin({ ...ok, size: ok.maxBytes + 1 }).reason ?? '', /over the/);
+  assert.match(decideFilecoin({ ...ok, ready: false, depositNeededUsdfc: '1.234' }).reason ?? '', /1.234 USDFC deposit/);
+  assert.match(decideFilecoin({ ...ok, runwayDays: 3n }).reason ?? '', /3 days, under the 7-day/);
+  assert.equal(decideFilecoin({ ...ok, runwayDays: 7n }).deliverable, true);
 });

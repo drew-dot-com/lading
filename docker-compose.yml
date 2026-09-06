@@ -11,6 +11,10 @@ services:
       PORT: '3600'
       MAX_BODY_BYTES: '3145728'
       LADING_EVM_PRIVATE_KEY: ${LADING_EVM_PRIVATE_KEY}        # Base key holding USDC; pays Lighthouse per upload
+      LADING_FILECOIN_PRIVATE_KEY: ${LADING_FILECOIN_PRIVATE_KEY:-}   # Filecoin key with USDFC deposited in Filecoin Pay (npm run fund:filecoin); door OFF when unset
+      LADING_FILECOIN_CHAIN: ${LADING_FILECOIN_CHAIN:-mainnet}
+      LADING_FILECOIN_COPIES: ${LADING_FILECOIN_COPIES:-2}
+      LADING_FILECOIN_MIN_RUNWAY_DAYS: ${LADING_FILECOIN_MIN_RUNWAY_DAYS:-7}
       LADING_ANT_ID: ${LADING_ANT_ID}                          # ANT the undernames live on
       LADING_ARNS_BASE_NAME: ${LADING_ARNS_BASE_NAME}          # e.g. boughtviatoonnode
       LADING_ARNS_GATEWAY: ${LADING_ARNS_GATEWAY:-permagate.io}
