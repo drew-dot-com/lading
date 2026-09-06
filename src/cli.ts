@@ -19,7 +19,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
-import { ToonClient, buildJobEvent, sendJob } from '@toon-protocol/client';
+import { ToonClient, buildJobEvent, sendJob, chargeFor } from '@toon-protocol/client';
 import { getPublicKey, type Event as NostrEvent } from 'nostr-tools/pure';
 import { LEG_KIND, type LegReceipt, type NameReceipt, type WalrusReceipt } from './kinds.js';
 import { buildManifest, parseManifest, type ManifestContent } from './manifest.js';
@@ -73,8 +73,19 @@ async function client() {
 
 type Paid<T> = { receipt: T; route: string; price: bigint | null };
 
+/** What the route will charge for this event: the ADR 0065 schedule applied to the payload length, or the flat price. */
+async function charge(c: ToonClient, route: string, payloadLen: number): Promise<bigint | null> {
+  const terms = await c.routePrice(route).catch(() => null);
+  if (!terms) return null;
+  try {
+    return chargeFor(terms as never, payloadLen) as bigint;
+  } catch {
+    return c.price(route).catch(() => null);
+  }
+}
+
 async function job<T>(c: ToonClient, route: string, event: NostrEvent, timeoutMs = 180_000): Promise<Paid<T>> {
-  const price = await c.price(route).catch(() => null);
+  const price = await charge(c, route, Buffer.byteLength(JSON.stringify({ event })));
   const answer = await sendJob<T>({ client: c as never, destination: route, timeoutMs }, event as never);
   if (!answer.accepted) throw new Error(`${route}: ${answer.code} ${answer.message}`);
   return { receipt: answer.receipt, route, price };
@@ -149,8 +160,8 @@ async function put(file: string) {
 
   // Leg 3: publish to the relay (a plain paid write of the signed event).
   if (!flag('skip-relay')) {
-    const price = await c.price(ROUTES.relay).catch(() => null);
     const r = await c.send(ROUTES.relay, { body: { event: manifest } });
+    const price = r.fulfilled ? (r.claim?.amount ?? null) : null;
     if (!r.fulfilled) throw new Error(`relay: ${r.code} ${r.message}`);
     paid.push({ leg: 'relay', route: ROUTES.relay, price });
     console.log(`relay    ✓ event ${manifest.id}  (${Date.now() - t0} ms)`);
