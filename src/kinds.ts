@@ -21,9 +21,26 @@ export interface LegReceipt {
   proof?: Record<string, string | number | undefined>;
   /** Who executed the leg: 'toon-store', 'lighthouse-x402', 'filecoin-onchain-cloud', 'walrus-native'. */
   provider: string;
-  /** Base units the payer sent on the TOON route for this leg, when known. */
+  /** Base units the payer sent on the TOON route for this leg, when known. Summed over parts for a chunked leg. */
   paid?: string;
   at: number;
+  /**
+   * Present when the object travelled as parts (see parts.ts). Then `id` is
+   * part 0's id, `sha256` and `size` are the whole object's, and a reader
+   * fetches every part, checks each part's sha256, and concatenates in index
+   * order to get the object back.
+   */
+  parts?: PartReceipt[];
+}
+
+/** One part of a chunked leg: the network's own id for that slice and the slice's sha256. */
+export interface PartReceipt {
+  index: number;
+  id: string;
+  sha256: string;
+  size: number;
+  proof?: Record<string, string | number | undefined>;
+  paid?: string;
 }
 
 /** What the Walrus door answers with. */

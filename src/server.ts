@@ -36,7 +36,7 @@ import { createSolanaRpc, address as solAddress } from '@solana/kit';
 const PORT = Number(process.env.PORT ?? 3600);
 const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES ?? 3 * 1024 * 1024);
 const DEV_MODE = process.env.DEV_MODE === '1';
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 /** Lamports the name key must hold before a name job is quoted deliverable: record rent (~2.81M) plus fee, with a margin for a second job in flight. */
 const NAME_NEED_LAMPORTS = BigInt(process.env.LADING_NAME_NEED_LAMPORTS ?? 6_000_000);
 /** The Base key must hold this many times the downstream price before a walrus job is quoted deliverable. */

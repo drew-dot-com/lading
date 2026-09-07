@@ -25,7 +25,7 @@ export function buildManifest(
     ['d', content.sha256],
     ['x', content.sha256],
     ['size', String(content.size)],
-    ...content.legs.map((l) => ['leg', l.network, l.id, l.retention]),
+    ...content.legs.map((l) => (l.parts ? ['leg', l.network, l.id, l.retention, String(l.parts.length)] : ['leg', l.network, l.id, l.retention])),
   ];
   if (content.mime) tags.push(['m', content.mime]);
   if (content.arns) tags.push(['arns', content.arns.name]);

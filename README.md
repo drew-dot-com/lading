@@ -9,8 +9,9 @@ archived on several storage networks, paying per object per network, and
 each leg hands back the network's own identifier and proof. Every copy is
 then listed in a signed manifest that lives on Arweave under an ArNS name.
 
-Status: v0.3.0, Arweave, Walrus and Filecoin legs, ArNS naming, relay copy,
-and a quote door in front of each broker leg. Runs against Drew's mainnet
+Status: v0.4.0, Arweave, Walrus and Filecoin legs, ArNS naming, relay copy,
+a quote door in front of each broker leg, and objects over one packet
+travelling as parts. Runs against Drew's mainnet
 node today; the Filecoin door goes live the day its Filecoin Pay account is
 funded (see Run it).
 
@@ -79,6 +80,36 @@ compares sha256. `lading describe` prints route prices.
 
 The manifest is a Nostr event, so a relay query for kind 30320 by `#d` finds
 every attestation for a given object hash across payers.
+
+## Large objects: parts
+
+The connector caps one ILP packet at 2 MiB, and a blob rides inside the
+packet base64-encoded, so one job carries about 1.5 MiB of raw object. An
+object over that travels as parts (`src/parts.ts`): the client slices it
+(1 MiB per part by default, `--part-bytes n` or `LADING_PART_BYTES` to
+change; a tail under 127 bytes folds into the previous part), and each part
+is its own paid job on each network, at the route's ordinary price. Nothing
+reassembles server-side: the store, the Walrus door and the Filecoin door
+each see an ordinary object, and the payer's loss bound stays one part.
+
+The manifest records a chunked leg with `parts`: each part's index, the
+network's own id for that slice, and the slice's sha256; the leg's `id` is
+part 0's, and the leg tag carries the part count
+(`['leg', 'walrus', <id0>, 'P365D', '3']`). `lading verify` fetches every
+part, checks each slice's hash, concatenates in index order, and checks the
+whole object's sha256.
+
+Each quote door is asked once per leg for the largest part, and the client
+then checks the quoted float covers every part still to buy (N times the
+downstream price for Walrus, N times the add-piece fee for Filecoin) before
+paying the first one. Parts already bought are saved under
+`~/.lading/progress/<sha256>.json` after every job, so a put that dies
+half-way resumes where it stopped instead of paying twice; the file is
+removed once the manifest is on Arweave.
+
+A chunked put that has to open a channel locks `LADING_CHANNEL_DEPOSIT`
+base units (default 2,000,000, 2 USDC) rather than the client's 100,000
+default, since one such put runs to several hundred thousand units.
 
 ## What is where
 
