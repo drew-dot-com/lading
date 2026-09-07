@@ -1,0 +1,37 @@
+# Tiny CI: does it typecheck, do the tests pass, does the image build. Nothing
+# here touches a network, a key, or a wallet; the mainnet proofs stay manual and
+# are recorded in node-artifacts.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t lading:ci .
+      - name: the built image boots with every door off
+        run: |
+          docker run -d --name lading -p 3600:3600 -e PORT=3600 lading:ci
+          for i in $(seq 1 20); do curl -sf http://127.0.0.1:3600/health && break; sleep 1; done
+          curl -sf http://127.0.0.1:3600/health | grep -q '"ok":true'
+          curl -sf http://127.0.0.1:3600/describe | grep -q '"app":"lading"'
+          docker logs lading

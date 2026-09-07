@@ -1,5 +1,7 @@
 # Lading
 
+[![ci](https://github.com/drew-dot-com/lading/actions/workflows/ci.yml/badge.svg)](https://github.com/drew-dot-com/lading/actions/workflows/ci.yml)
+
 Archive broker for agents, on TOON. Every leg answers with a storage
 network's own receipt or with a refusal that bought nothing.
 
