@@ -1,12 +1,13 @@
 # Lading
 
-Pay-on-receipt archive broker for agents, on TOON.
+Archive broker for agents, on TOON. Every leg answers with a storage
+network's own receipt or with a refusal that bought nothing.
 
-A bill of lading is the receipt a bank pays against. Lading does that for
+A bill of lading is the document a bank pays against. Lading does that for
 bytes: an agent opens one payment channel with a TOON node and gets an object
-archived on several storage networks, paying per object per network, with the
-money moving only when the network's receipt comes back. Every copy is then
-listed in a signed manifest that lives on Arweave under an ArNS name.
+archived on several storage networks, paying per object per network, and
+each leg hands back the network's own identifier and proof. Every copy is
+then listed in a signed manifest that lives on Arweave under an ArNS name.
 
 Status: v0.3.0, Arweave, Walrus and Filecoin legs, ArNS naming, relay copy,
 and a quote door in front of each broker leg. Runs against Drew's mainnet
@@ -23,16 +24,15 @@ landing). Lading sells the receipt across networks: a leg answers with the
 network's own identifier and proof, or it answers with a refusal and buys
 nothing downstream.
 
-What "pay on receipt" means here, precisely. The TOON connector charges the
-route price for every packet it delivers to the app, whatever the app answers
-(the execution condition was retired in connector issue 1269, so an app
-cannot withhold a FULFILL; a refusal is an answer). So a failed leg costs the
-payer the route price and nothing else: the broker never buys storage it
-could not deliver, and the payer never holds a receipt for bytes that are not
-there. The downstream purchase is the part that is conditional, and it is the
-part that costs real money.
+How payment works, precisely. On TOON you pay for an answer: the payment
+rides inside the packet and is redeemable the moment the connector delivers
+it, whatever the app answers (a refusal is an answer). Lading does not change
+that. A failed leg costs the payer the route price and nothing else: the
+broker never buys storage it could not deliver, and the payer never holds a
+receipt for bytes that are not there. The downstream purchase is the part
+that is conditional, and it is the part that costs real money.
 
-To keep the route price from being the cost of finding out, each broker leg
+To keep the loss bound small, each broker leg
 has a quote door at 1,000 units that answers "would this go through right
 now": the Walrus quote reads the Lighthouse price for the size and the Base
 key's USDC float, the Filecoin quote reads the broker's Filecoin Pay account
