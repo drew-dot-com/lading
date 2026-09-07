@@ -22,14 +22,20 @@
   "dependencies": {
     "@ar.io/sdk": "^4.1.4",
     "@filoz/synapse-sdk": "^2.0.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@solana/kit": "^2.1.0",
     "@toon-protocol/client": "^2.1.1",
+    "@x402/core": "^2.25.0",
     "@x402/evm": "^2.3.0",
+    "@x402/express": "^2.25.0",
     "@x402/fetch": "^2.3.0",
+    "express": "^5.2.1",
     "nostr-tools": "^2.10.4",
-    "viem": "^2.21.0"
+    "viem": "^2.21.0",
+    "zod": "^4.5.4"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"
