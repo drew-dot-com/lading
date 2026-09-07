@@ -35,3 +35,10 @@ jobs:
           curl -sf http://127.0.0.1:3600/health | grep -q '"ok":true'
           curl -sf http://127.0.0.1:3600/describe | grep -q '"app":"lading"'
           docker logs lading
+      - name: the same image boots the gate, free mode, no payer
+        run: |
+          docker run -d --name lading-gate -p 3601:3601 -e PORT=3601 -e GATE_FREE=1 lading:ci node dist/gate.js
+          for i in $(seq 1 20); do curl -sf http://127.0.0.1:3601/health && break; sleep 1; done
+          curl -sf http://127.0.0.1:3601/health | grep -q '"ok":true'
+          curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:3601/v1/put -H 'content-length: 0' | grep -q 400
+          docker logs lading-gate

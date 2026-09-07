@@ -14,6 +14,12 @@ export interface ManifestContent {
   legs: LegReceipt[];
   /** Set once the manifest itself is on Arweave and named. */
   arns?: { undername: string; name: string; manifestTxId: string };
+  /**
+   * Present when the put came through a door other than the payer's own CLI:
+   * the gate signs with its key and records who paid it at the boundary (an
+   * x402 payer address on Base). Absent for a direct put.
+   */
+  via?: { door: string; payer?: string; network?: string };
   created: number;
 }
 

@@ -24,8 +24,40 @@ services:
       LADING_DATA_DIR: /data                                   # the walrus ledger: every Lighthouse record this broker paid for, and when it runs out
     volumes: [lading_data:/data]
     networks: [relay_deploy_net]
+
+  # The x402 gate: Lading hosted, for callers that do not speak ILP (Claude
+  # through the MCP shim). Same image, other entrypoint. Reaches the edge over
+  # its public URL like any payer, pays with its OWN Solana key (kept apart from
+  # the ANT owner and the Walrus float), and takes USDC on Base at the door.
+  # Published through Caddy as lading.<ip>.sslip.io -> lading-gate:3601
+  # (see deploy/Caddyfile.lading); nothing on the host.
+  lading-gate:
+    build: .
+    container_name: lading-gate
+    restart: unless-stopped
+    command: ["node", "dist/gate.js"]
+    expose: ['3601']
+    environment:
+      PORT: '3601'
+      MAX_BODY_BYTES: '3145728'
+      LADING_GATE_URL: ${LADING_GATE_URL:-https://lading.167-233-221-236.sslip.io}
+      LADING_GATE_PAYTO: ${LADING_GATE_PAYTO}                  # Base address the x402 revenue lands on (the Walrus float key's address refills the float)
+      LADING_GATE_MARGIN: ${LADING_GATE_MARGIN:-1.2}
+      LADING_GATE_FLOOR_USDC: ${LADING_GATE_FLOOR_USDC:-0.05}
+      X402_FACILITATOR: ${X402_FACILITATOR:-https://facilitator.payai.network}
+      GATE_FREE: ${GATE_FREE:-0}
+      TOON_EDGE: ${TOON_EDGE:-https://connector.167-233-221-236.sslip.io}
+      SOLANA_KEYPAIR_JSON: ${LADING_GATE_SOLANA_KEYPAIR}       # JSON array; the gate's TOON payer (fund ~5 USDC + 0.05 SOL; the channel opens itself)
+      SOLANA_RPC: ${SOLANA_RPC:-https://api.mainnet-beta.solana.com}
+      LADING_CHANNEL_DEPOSIT: ${LADING_GATE_CHANNEL_DEPOSIT:-2000000}
+      LADING_NOSTR_KEY: ${LADING_GATE_NOSTR_KEY:-}             # hex; unset = generated once under /data/gate
+      LADING_HOME: /data/gate                                  # channel store, saved manifests, progress files, nostr key
+      LADING_ARNS_GATEWAY: ${LADING_ARNS_GATEWAY:-permagate.io}
+    volumes: [lading_gate_data:/data]
+    networks: [relay_deploy_net]
 volumes:
   lading_data:
+  lading_gate_data:
 networks:
   relay_deploy_net:
     external: true

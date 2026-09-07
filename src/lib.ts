@@ -1,0 +1,950 @@
+/**
+ * The Lading client as a library: the party that pays, and the one that
+ * composes legs. `cli.ts` is a thin layer over this; `gate.ts` runs the same
+ * code on the node behind an x402 door. Nothing here reads `process.argv`, and
+ * every line that used to be printed goes through `opts.log`, so a caller
+ * decides where progress lines land (a terminal, a request log, nowhere).
+ *
+ * Coordination lives here, not in the handler: that is the pattern every TOON
+ * app follows (a handler is a leaf), and it keeps the broker unable to spend
+ * on the payer's behalf beyond the one leg it was paid for.
+ */
+import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, readdirSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { createHash, randomBytes } from 'node:crypto';
+import { ToonClient, buildJobEvent, sendJob, chargeFor } from '@toon-protocol/client';
+import { getPublicKey, type Event as NostrEvent } from 'nostr-tools/pure';
+import { LEG_KIND, type FilecoinReceipt, type LegReceipt, type NameReceipt, type PartReceipt, type WalrusReceipt, type WalrusRenewReceipt } from './kinds.js';
+import { assembleParts, DEFAULT_PART_BYTES, partName, planParts, splitParts, type Part } from './parts.js';
+import type { FilecoinQuote, NameQuote, WalrusQuote, WalrusRenewQuote } from './quote.js';
+import { dueWithin, fmtDate, walrusRecords, type RenewalRow, type SavedPut, type SavedRenewal } from './renewals.js';
+import { daysLeft } from './ledger.js';
+import { buildManifest, parseManifest, type ManifestContent } from './manifest.js';
+import { undernameFor } from './arns.js';
+
+export interface Routes {
+  ario: string;
+  walrus: string;
+  walrusQuote: string;
+  walrusRenew: string;
+  walrusRenewQuote: string;
+  filecoin: string;
+  filecoinQuote: string;
+  name: string;
+  nameQuote: string;
+  relay: string;
+}
+
+export interface LadingOptions {
+  /** The edge connector the payer opens its channel with. */
+  edge: string;
+  routes: Routes;
+  /** AR.IO gateway used to read Arweave and resolve ArNS. */
+  gateway: string;
+  lighthouseX402: string;
+  walrusAggregator: string;
+  /** Where saved manifests, progress files and (by default) the payer's Nostr key live. */
+  home: string;
+  /** Path to a Solana keypair JSON array: the TOON payer. Ignored when `solanaSecret` is set. */
+  solanaKeypair: string;
+  /** The payer's 64-byte secret directly (SOLANA_KEYPAIR_JSON in the environment), for a container that mounts no file. */
+  solanaSecret?: Uint8Array;
+  solanaRpc: string;
+  channelStore: string;
+  /** Collateral locked when a channel has to be opened, base units. */
+  channelDeposit: bigint;
+  /** Hex Nostr secret; when absent one is read from, or written to, `<home>/nostr.key`. */
+  nostrKey?: string;
+  /** Progress lines. */
+  log: (line: string) => void;
+}
+
+const env = (k: string, d: string) => process.env[k] ?? d;
+
+/** The options the CLI has always used: defaults, overridable one env var at a time. */
+export function optionsFromEnv(overrides: Partial<LadingOptions> = {}): LadingOptions {
+  const home = overrides.home ?? env('LADING_HOME', join(homedir(), '.lading'));
+  return {
+    edge: env('TOON_EDGE', 'https://connector.167-233-221-236.sslip.io'),
+    routes: {
+      ario: env('LADING_ROUTE_ARIO', 'g.drew.ario'),
+      walrus: env('LADING_ROUTE_WALRUS', 'g.drew.lading.walrus'),
+      walrusQuote: env('LADING_ROUTE_WALRUS_QUOTE', 'g.drew.lading.walrus.quote'),
+      walrusRenew: env('LADING_ROUTE_WALRUS_RENEW', 'g.drew.lading.walrus.renew'),
+      walrusRenewQuote: env('LADING_ROUTE_WALRUS_RENEW_QUOTE', 'g.drew.lading.walrus.renew.quote'),
+      filecoin: env('LADING_ROUTE_FILECOIN', 'g.drew.lading.filecoin'),
+      filecoinQuote: env('LADING_ROUTE_FILECOIN_QUOTE', 'g.drew.lading.filecoin.quote'),
+      name: env('LADING_ROUTE_NAME', 'g.drew.lading.name'),
+      nameQuote: env('LADING_ROUTE_NAME_QUOTE', 'g.drew.lading.name.quote'),
+      relay: env('LADING_ROUTE_RELAY', 'g.drew.relay'),
+    },
+    gateway: env('LADING_ARNS_GATEWAY', 'permagate.io'),
+    lighthouseX402: env('LIGHTHOUSE_X402_URL', 'https://x402-walrus.lighthouse.storage'),
+    walrusAggregator: env('WALRUS_AGGREGATOR_URL', 'https://aggregator.walrus-mainnet.walrus.space'),
+    home,
+    solanaKeypair: env('SOLANA_KEYPAIR', join(homedir(), '.config/solana/id.json')),
+    solanaSecret: process.env.SOLANA_KEYPAIR_JSON ? Uint8Array.from(JSON.parse(process.env.SOLANA_KEYPAIR_JSON) as number[]) : undefined,
+    solanaRpc: env('SOLANA_RPC', 'https://api.mainnet-beta.solana.com'),
+    channelStore: env('LADING_CHANNEL_STORE', join(home, 'channel-store.json')),
+    channelDeposit: BigInt(env('LADING_CHANNEL_DEPOSIT', '2000000')),
+    nostrKey: process.env.LADING_NOSTR_KEY,
+    log: (line) => console.log(line),
+    ...overrides,
+  };
+}
+
+export const sha256 = (b: Uint8Array) => createHash('sha256').update(b).digest('hex');
+
+/** USDC/USDFC decimal strings compared in micro-units, as quote.ts does. */
+export const micro = (v: string): bigint => {
+  const [i, f = ''] = v.split('.');
+  return BigInt(i || '0') * 1_000_000n + BigInt((f + '000000').slice(0, 6));
+};
+const timesMicro = (v: string, n: number) => (Number(micro(v) * BigInt(n)) / 1e6).toFixed(6);
+
+export type Paid<T> = { receipt: T; route: string; price: bigint | null };
+export type Network = 'arweave' | 'walrus' | 'filecoin';
+export interface PaidRow {
+  leg: string;
+  route: string;
+  price: bigint | null;
+}
+
+/** Parts bought so far for one object, so a put that dies mid-way resumes where it stopped instead of paying twice. */
+interface Progress {
+  legs: Partial<Record<Network, LegReceipt>>;
+  parts: Partial<Record<Network, PartReceipt[]>>;
+  paid: Array<{ leg: string; route: string; price: string | null }>;
+}
+
+/** One part's outcome on one network, in the shape every door's receipt reduces to. */
+interface PartOutcome {
+  id: string;
+  /** The sha256 the door reported, when it reports one; checked against the part. */
+  sha256?: string;
+  proof?: Record<string, string | number | undefined>;
+  retention: string;
+  provider: string;
+  route: string;
+  price: bigint | null;
+}
+
+export interface PutOptions {
+  /** File name recorded with each leg; parts are named `<name>.partN`. */
+  name: string;
+  mime?: string;
+  undername?: string;
+  partBytes?: number;
+  /** Quote each broker leg before paying it (default true). */
+  quote?: boolean;
+  skip?: Partial<Record<'arweave' | 'walrus' | 'filecoin' | 'relay' | 'name', boolean>>;
+  /** Recorded on the manifest when the put came through a door other than the CLI. */
+  via?: ManifestContent['via'];
+}
+
+export interface PutResult {
+  sha256: string;
+  size: number;
+  parts: number;
+  payerPubkey: string;
+  legs: LegReceipt[];
+  manifest: NostrEvent;
+  manifestTxId?: string;
+  name?: NameReceipt;
+  paid: PaidRow[];
+  /** Base units across every job, unknown prices counted as 0. */
+  total: bigint;
+  savedPath: string;
+  manifestUrl?: string;
+}
+
+export interface QuoteRow {
+  leg: string;
+  route: string;
+  price: bigint | null;
+  note: string;
+}
+export interface QuoteResult {
+  sha256: string;
+  size: number;
+  parts: number;
+  largestPart: number;
+  rows: QuoteRow[];
+  total: bigint;
+  /** What the three quote doors cost to ask. */
+  quotesPaid: bigint;
+}
+
+/** The bill without asking any door: route prices only, every leg assumed deliverable. Free. */
+export interface Estimate {
+  size: number;
+  parts: number;
+  rows: QuoteRow[];
+  total: bigint;
+  /** Routes the edge would not price; the total is a floor when this is non-empty. */
+  unpriced: string[];
+}
+
+export interface VerifyLegRow {
+  label: string;
+  id: string;
+  ok: boolean;
+  detail: string;
+}
+export interface VerifyResult {
+  pubkey: string;
+  sha256: string;
+  size: number;
+  legs: number;
+  rows: VerifyLegRow[];
+  ok: boolean;
+  manifest: ManifestContent;
+}
+
+export interface RenewResult {
+  rows: Array<{ label: string; lighthouseId: string; blobId?: string; previousExpiresAt?: number; expiresAt?: number; baseTx?: string; skipped?: string; recorded: boolean }>;
+  bought: number;
+  targets: number;
+  total: bigint;
+}
+
+export class Lading {
+  readonly opts: LadingOptions;
+  private c?: Promise<ToonClient>;
+  private terms = new Map<string, { at: number; terms: unknown | null }>();
+
+  constructor(opts: LadingOptions) {
+    this.opts = opts;
+  }
+
+  private log(line: string) {
+    this.opts.log(line);
+  }
+
+  private nostrSecret(): Uint8Array {
+    if (this.opts.nostrKey) return Uint8Array.from(Buffer.from(this.opts.nostrKey, 'hex'));
+    mkdirSync(this.opts.home, { recursive: true });
+    const p = join(this.opts.home, 'nostr.key');
+    if (!existsSync(p)) {
+      writeFileSync(p, randomBytes(32).toString('hex') + '\n', { mode: 0o600 });
+      this.log(`new payer identity written to ${p}`);
+    }
+    return Uint8Array.from(Buffer.from(readFileSync(p, 'utf8').trim(), 'hex'));
+  }
+
+  /** The payer's Nostr pubkey, the key every manifest is signed with. */
+  payerPubkey(): string {
+    return getPublicKey(this.nostrSecret());
+  }
+
+  /** One ToonClient per Lading, opened on first use. */
+  client(): Promise<ToonClient> {
+    if (!this.c) {
+      mkdirSync(this.opts.home, { recursive: true });
+      this.c = ToonClient.create({
+        connector: this.opts.edge,
+        solanaSecretKey: this.opts.solanaSecret ?? Uint8Array.from(JSON.parse(readFileSync(this.opts.solanaKeypair, 'utf8')) as number[]),
+        evmPrivateKey: ('0x' + randomBytes(32).toString('hex')) as `0x${string}`,
+        chain: 'solana',
+        rpcUrl: this.opts.solanaRpc,
+        transport: 'http',
+        channelStore: this.opts.channelStore,
+        autoOpenChannel: true,
+        // Collateral locked when a channel has to be opened (base units). The
+        // client's own default is 100,000, one small put; a chunked put runs to
+        // several hundred thousand, so start with 2 USDC. Unspent deposit comes
+        // back when the channel settles.
+        deposit: this.opts.channelDeposit,
+      } as never) as Promise<ToonClient>;
+    }
+    return this.c;
+  }
+
+  async close() {
+    if (!this.c) return;
+    const c = await this.c;
+    await (c as { close?: () => Promise<void> }).close?.();
+    this.c = undefined;
+  }
+
+  // ---- files under home ----
+
+  private manifestPath = (sha: string) => join(this.opts.home, 'manifests', `${sha}.json`);
+  private progressPath = (sha: string) => join(this.opts.home, 'progress', `${sha}.json`);
+
+  /** The local record of a put: written as soon as the manifest is on Arweave, so a later failed leg is resumable with `lading name`. */
+  private save(sha: string, state: { manifest: NostrEvent; manifestTxId?: string; name?: NameReceipt; paid: Array<{ leg: string; route: string; price: bigint | null | string }> }): string {
+    mkdirSync(join(this.opts.home, 'manifests'), { recursive: true });
+    const out = this.manifestPath(sha);
+    writeFileSync(out, JSON.stringify({ ...state, paid: state.paid.map((p) => ({ ...p, price: p.price?.toString() })) }, null, 2));
+    return out;
+  }
+
+  private loadProgress(sha: string): Progress {
+    const p = this.progressPath(sha);
+    if (!existsSync(p)) return { legs: {}, parts: {}, paid: [] };
+    return JSON.parse(readFileSync(p, 'utf8')) as Progress;
+  }
+  private saveProgress(sha: string, prog: Progress) {
+    mkdirSync(join(this.opts.home, 'progress'), { recursive: true });
+    writeFileSync(this.progressPath(sha), JSON.stringify(prog, null, 2));
+  }
+  private clearProgress(sha: string) {
+    if (existsSync(this.progressPath(sha))) rmSync(this.progressPath(sha));
+  }
+
+  /** Every saved put, oldest first. */
+  savedPuts(): Array<{ path: string; sha: string; saved: SavedPut }> {
+    const dir = join(this.opts.home, 'manifests');
+    if (!existsSync(dir)) return [];
+    return readdirSync(dir)
+      .filter((f) => /^[0-9a-f]{64}\.json$/.test(f))
+      .map((f) => ({ path: join(dir, f), sha: f.slice(0, 64), saved: JSON.parse(readFileSync(join(dir, f), 'utf8')) as SavedPut }))
+      .sort((a, b) => a.saved.manifest.created_at - b.saved.manifest.created_at);
+  }
+
+  // ---- pricing ----
+
+  /** The route's terms from the edge, cached for a minute: a schedule, a flat price, or null when unpriced. */
+  private async routeTerms(route: string): Promise<unknown | null> {
+    const hit = this.terms.get(route);
+    if (hit && Date.now() - hit.at < 60_000) return hit.terms;
+    const c = await this.client();
+    const terms = await c.routePrice(route).catch(() => null);
+    this.terms.set(route, { at: Date.now(), terms });
+    return terms;
+  }
+
+  /** What the route will charge for this event: the ADR 0065 schedule applied to the payload length, or the flat price. */
+  async charge(route: string, payloadLen: number): Promise<bigint | null> {
+    const terms = await this.routeTerms(route);
+    if (!terms) return null;
+    try {
+      return chargeFor(terms as never, payloadLen) as bigint;
+    } catch {
+      const c = await this.client();
+      return c.price(route).catch(() => null);
+    }
+  }
+
+  private async job<T>(route: string, event: NostrEvent, timeoutMs = 180_000): Promise<Paid<T>> {
+    const c = await this.client();
+    const price = await this.charge(route, Buffer.byteLength(JSON.stringify({ event })));
+    const answer = await sendJob<T>({ client: c as never, destination: route, timeoutMs }, event as never);
+    if (!answer.accepted) throw new Error(`${route}: ${answer.code} ${answer.message}`);
+    return { receipt: answer.receipt, route, price };
+  }
+
+  /** Ask the walrus quote door whether an object of this size would go through right now. 1,000 units, against 40,000 for the leg. */
+  quoteWalrus(size: number, name: string): Promise<Paid<WalrusQuote>> {
+    const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'walrus', phase: 'quote', size: String(size), name } });
+    return this.job<WalrusQuote>(this.opts.routes.walrusQuote, ev as never, 60_000);
+  }
+
+  /** Ask the filecoin quote door whether the broker's Filecoin Pay account can carry one more piece right now. 1,000 units, against 30,000 for the leg. */
+  quoteFilecoin(size: number, name: string): Promise<Paid<FilecoinQuote>> {
+    const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'filecoin', phase: 'quote', size: String(size), name } });
+    return this.job<FilecoinQuote>(this.opts.routes.filecoinQuote, ev as never, 60_000);
+  }
+
+  /** Ask the name quote door whether the broker can write this undername right now. 1,000 units, against 5,000 for the leg. */
+  quoteName(undername: string, txid?: string): Promise<Paid<NameQuote>> {
+    const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'name', phase: 'quote', undername, ...(txid ? { txid } : {}) } });
+    return this.job<NameQuote>(this.opts.routes.nameQuote, ev as never, 60_000);
+  }
+
+  /** Ask the renew quote door what one more year on a Lighthouse record costs and when it currently runs out. 1,000 units, against 40,000 for the renewal. */
+  quoteWalrusRenew(lighthouseId: string): Promise<Paid<WalrusRenewQuote>> {
+    const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'walrus-renew', phase: 'quote', lighthouseId } });
+    return this.job<WalrusRenewQuote>(this.opts.routes.walrusRenewQuote, ev as never, 60_000);
+  }
+
+  /** Bytes on the wire for a leg event carrying a blob of `blobLen` bytes (base64 grows it by a third). */
+  private eventBytes(params: Record<string, string>, blobLen?: number) {
+    return Buffer.byteLength(JSON.stringify({ event: buildJobEvent({ kind: LEG_KIND, params, tags: blobLen ? [['i', 'A'.repeat(Math.ceil(blobLen / 3) * 4), 'blob']] : [] }) }));
+  }
+
+  /** A manifest with three legs, plus part receipts, before signing. */
+  private manifestGuess = (n: number) => 1200 + 3 * 400 + (n > 1 ? 3 * n * 400 : 0);
+
+  /**
+   * The bill from route prices alone, every leg assumed deliverable and every
+   * quote door asked once. Costs nothing: the edge's price endpoint is free.
+   * This is what the gate charges against, so it is deliberately the ceiling
+   * (a leg that is skipped at run time only makes the real bill smaller).
+   */
+  async estimate(size: number, partBytes = DEFAULT_PART_BYTES): Promise<Estimate> {
+    const R = this.opts.routes;
+    const parts = planParts(size, partBytes);
+    const n = parts.length;
+    const unpriced: string[] = [];
+    const perPart = async (route: string) => {
+      let sum = 0n;
+      for (const p of parts) {
+        const one = await this.charge(route, this.eventBytes({}, p.size));
+        if (one === null) return null;
+        sum += one;
+      }
+      return sum;
+    };
+    const flat = async (route: string) => {
+      const one = await this.charge(route, 0);
+      return one === null ? null : one * BigInt(n);
+    };
+    const quote = async (route: string) => this.charge(route, 0);
+    const partsNote = n > 1 ? ` × ${n} parts` : '';
+    const rows: QuoteRow[] = [
+      { leg: 'arweave', route: R.ario, price: await perPart(R.ario), note: `schedule on the payload${partsNote}` },
+      { leg: 'walrus-quote', route: R.walrusQuote, price: await quote(R.walrusQuote), note: 'quote door' },
+      { leg: 'walrus', route: R.walrus, price: await flat(R.walrus), note: `flat${partsNote}` },
+      { leg: 'filecoin-quote', route: R.filecoinQuote, price: await quote(R.filecoinQuote), note: 'quote door' },
+      { leg: 'filecoin', route: R.filecoin, price: await flat(R.filecoin), note: `flat${partsNote}` },
+      { leg: 'relay', route: R.relay, price: await this.charge(R.relay, this.manifestGuess(n)), note: 'manifest copy' },
+      { leg: 'manifest', route: R.ario, price: await this.charge(R.ario, this.manifestGuess(n)), note: 'manifest on Arweave, estimate' },
+      { leg: 'name-quote', route: R.nameQuote, price: await quote(R.nameQuote), note: 'quote door' },
+      { leg: 'name', route: R.name, price: await this.charge(R.name, 0), note: 'flat' },
+    ];
+    for (const r of rows) if (r.price === null) unpriced.push(r.route);
+    const total = rows.reduce((a, r) => a + (r.price ?? 0n), 0n);
+    return { size, parts: n, rows, total, unpriced: [...new Set(unpriced)] };
+  }
+
+  // ---- legs ----
+
+  /**
+   * Run one network's leg over every part: reuse parts already bought, pay for
+   * the rest one job at a time, save after each. A single part gives the same
+   * leg shape as before chunking existed; several give a leg with `parts`.
+   */
+  private async runLeg(o: {
+    network: Network;
+    sha: string;
+    size: number;
+    parts: Part[];
+    prog: Progress;
+    paid: PaidRow[];
+    t0: number;
+    baseName: string;
+    send: (part: Part, name: string) => Promise<PartOutcome>;
+    line: (o: PartOutcome) => string;
+  }): Promise<LegReceipt> {
+    const { network, parts, prog } = o;
+    const done = prog.legs[network];
+    if (done) {
+      this.log(`${network.padEnd(8)} ✓ ${done.id}${done.parts ? ` (${done.parts.length} parts)` : ''}  resumed, already bought`);
+      return done;
+    }
+    const have = (prog.parts[network] ??= []);
+    const outcomes: Array<{ part: Part; outcome: PartOutcome }> = [];
+    let retention = '';
+    let provider = '';
+    let total = 0n;
+    let known = true;
+    for (const part of parts) {
+      const tag = parts.length === 1 ? network.padEnd(8) : `${network}#${part.index + 1}/${parts.length}`.padEnd(8);
+      const prior = have.find((r) => r.index === part.index);
+      if (prior) {
+        if (prior.sha256 !== part.sha256) throw new Error(`${network} part ${part.index} was bought for a different slice (${prior.sha256.slice(0, 12)}); pass --part-bytes as before, or delete ${this.progressPath(o.sha)}`);
+        const { retention: pr, provider: pp, ...pproof } = prior.proof ?? {};
+        retention ||= String(pr ?? '');
+        provider ||= String(pp ?? '');
+        if (prior.paid) total += BigInt(prior.paid);
+        else known = false;
+        this.log(`${tag} ✓ ${prior.id}  resumed, already bought`);
+        outcomes.push({ part, outcome: { id: prior.id, sha256: prior.sha256, proof: pproof, retention: String(pr ?? ''), provider: String(pp ?? ''), route: '', price: prior.paid ? BigInt(prior.paid) : null } });
+        continue;
+      }
+      const out = await o.send(part, partName(o.baseName, part.index, parts.length));
+      if (out.sha256 !== undefined && out.sha256 !== part.sha256) throw new Error(`${network} receipt is for sha ${out.sha256}, not ${part.sha256}`);
+      retention = out.retention;
+      provider = out.provider;
+      if (out.price === null) known = false;
+      else total += out.price;
+      const legLabel = parts.length === 1 ? network : `${network}#${part.index + 1}`;
+      o.paid.push({ leg: legLabel, route: out.route, price: out.price });
+      prog.paid.push({ leg: legLabel, route: out.route, price: out.price?.toString() ?? null });
+      have.push({ index: part.index, id: out.id, sha256: part.sha256, size: part.size, proof: { ...out.proof, retention: out.retention, provider: out.provider }, ...(out.price !== null ? { paid: out.price.toString() } : {}) });
+      this.saveProgress(o.sha, prog);
+      outcomes.push({ part, outcome: out });
+      this.log(`${tag} ✓ ${o.line(out)}  (${Date.now() - o.t0} ms)`);
+    }
+    outcomes.sort((a, b) => a.part.index - b.part.index);
+    const first = outcomes[0]!.outcome;
+    retention ||= first.retention;
+    provider ||= first.provider;
+    const at = Math.floor(Date.now() / 1000);
+    const paidStr = known ? total.toString() : undefined;
+    const leg: LegReceipt =
+      parts.length === 1
+        ? { network, id: first.id, sha256: o.sha, size: o.size, retention, provider, proof: first.proof, ...(paidStr ? { paid: paidStr } : {}), at }
+        : {
+            network,
+            id: first.id,
+            sha256: o.sha,
+            size: o.size,
+            retention,
+            provider,
+            ...(paidStr ? { paid: paidStr } : {}),
+            at,
+            parts: outcomes.map(({ part, outcome }) => {
+              const { retention: _r, provider: _p, ...proof } = outcome.proof ?? {};
+              return { index: part.index, id: outcome.id, sha256: part.sha256, size: part.size, ...(Object.keys(proof).length ? { proof } : {}), ...(outcome.price !== null ? { paid: outcome.price.toString() } : {}) };
+            }),
+          };
+    prog.legs[network] = leg;
+    this.saveProgress(o.sha, prog);
+    return leg;
+  }
+
+  /**
+   * Archive: arweave leg → walrus leg → filecoin leg → sign the bill of lading
+   * → publish to relay → write it to Arweave → name it on ArNS. Each leg is
+   * one paid job per part; a part that fails buys nothing downstream, and the
+   * parts already bought are saved so a re-run resumes, not re-buys.
+   */
+  async put(bytes: Uint8Array, po: PutOptions): Promise<PutResult> {
+    const R = this.opts.routes;
+    const skip = po.skip ?? {};
+    const doQuote = po.quote !== false;
+    const sha = sha256(bytes);
+    const name = po.name;
+    const parts = splitParts(bytes, po.partBytes ?? DEFAULT_PART_BYTES);
+    const n = parts.length;
+    const sk = this.nostrSecret();
+    const payerPubkey = getPublicKey(sk);
+    this.log(`${name}: ${bytes.length} bytes, sha256 ${sha}${n > 1 ? `, ${n} parts of up to ${Math.max(...parts.map((q) => q.size))} bytes` : ''}\npayer nostr pubkey ${payerPubkey}\nedge ${this.opts.edge}`);
+    const c = await this.client();
+    const legs: LegReceipt[] = [];
+    const paid: PaidRow[] = [];
+    const prog = this.loadProgress(sha);
+    if (Object.keys(prog.legs).length || Object.keys(prog.parts).length) {
+      for (const row of prog.paid) paid.push({ ...row, price: row.price === null ? null : BigInt(row.price) });
+      this.log(`resuming: ${Object.keys(prog.legs).join(',') || 'no'} legs and ${Object.entries(prog.parts).map(([k, v]) => `${k}=${v?.length ?? 0}`).join(' ') || 'no'} parts already bought`);
+    }
+    const t0 = Date.now();
+    const blobEvent = (kind: number, params: Record<string, string>, part: Part, extra: string[][] = []) =>
+      buildJobEvent({ kind, params, tags: [['i', Buffer.from(part.bytes).toString('base64'), 'blob'], ...extra] });
+    const common = { sha, size: bytes.length, parts, prog, paid, t0, baseName: name };
+
+    // Leg 1: Arweave, through the org store. The store FULFILLs on the txId.
+    if (!skip.arweave) {
+      legs.push(
+        await this.runLeg({
+          ...common,
+          network: 'arweave',
+          send: async (part) => {
+            const ev = blobEvent(5094, {}, part, [['bid', '100000', 'usdc'], ['output', po.mime ?? 'application/octet-stream']]);
+            const r = await this.job<{ txId?: string }>(R.ario, ev as never);
+            const txId = r.receipt.txId;
+            if (!txId) throw new Error(`arweave leg accepted without a txId: ${JSON.stringify(r.receipt)}`);
+            return { id: txId, proof: { readUrl: `https://${this.opts.gateway}/${txId}` }, retention: 'permanent', provider: 'toon-store', route: r.route, price: r.price };
+          },
+          line: (o) => o.id,
+        }),
+      );
+    }
+
+    // Leg 2: Walrus, through Lading's door. Lading FULFILLs on the blobId.
+    // Quoted first for the largest part: a leg the broker cannot deliver still
+    // costs its route price. With several parts the float must cover them all.
+    if (!skip.walrus && !prog.legs.walrus && doQuote) {
+      const q = await this.quoteWalrus(Math.max(...parts.map((x) => x.size)), name);
+      paid.push({ leg: 'walrus-quote', route: q.route, price: q.price });
+      const left = n - (prog.parts.walrus?.length ?? 0);
+      const need = timesMicro(q.receipt.downstream.amountUsdc, left);
+      const short = q.receipt.deliverable && left > 1 && micro(q.receipt.float.balance) < micro(need);
+      this.log(`walrus   quote ${fmtQuote(q.receipt)}${left > 1 ? `, ${left} parts need ${need} USDC` : ''}  (${Date.now() - t0} ms)`);
+      if (!q.receipt.deliverable || short) throw new Error(`walrus leg would not go through; nothing paid for it. Re-run with --skip-walrus to archive without it. (${short ? `float ${q.receipt.float.balance} USDC is under the ${need} USDC that ${left} parts cost` : q.receipt.reason})`);
+    }
+    if (!skip.walrus) {
+      legs.push(
+        await this.runLeg({
+          ...common,
+          network: 'walrus',
+          send: async (part, pname) => {
+            const r = await this.job<WalrusReceipt>(R.walrus, blobEvent(LEG_KIND, { op: 'walrus', name: pname || name }, part) as never, 240_000);
+            return { id: r.receipt.id, sha256: r.receipt.sha256, proof: r.receipt.proof, retention: r.receipt.retention, provider: r.receipt.provider, route: r.route, price: r.price };
+          },
+          line: (o) => `${o.id}  readback=${o.proof?.readback}`,
+        }),
+      );
+    }
+
+    // Leg 2b: Filecoin Onchain Cloud, through Lading's door. Lading FULFILLs on
+    // the PieceCID once the provider has committed the piece and served it back.
+    if (!skip.filecoin) {
+      let go = true;
+      if (doQuote && !prog.legs.filecoin) {
+        const q = await this.quoteFilecoin(Math.max(...parts.map((x) => x.size)), name);
+        paid.push({ leg: 'filecoin-quote', route: q.route, price: q.price });
+        const left = n - (prog.parts.filecoin?.length ?? 0);
+        const need = timesMicro(q.receipt.downstream.addPieceFeeUsdfc, left);
+        const short = q.receipt.deliverable && left > 1 && micro(q.receipt.float.available) < micro(need);
+        this.log(`filecoin quote ${fmtQuote(q.receipt)}${left > 1 ? `, ${left} parts need ${need} USDFC in fees` : ''}  (${Date.now() - t0} ms)`);
+        if (!q.receipt.deliverable || short) {
+          go = false;
+          this.log(`filecoin SKIPPED, nothing paid for it: ${short ? `available ${q.receipt.float.available} USDFC is under the ${need} USDFC that ${left} parts cost` : q.receipt.reason}`);
+        }
+      }
+      if (go) {
+        legs.push(
+          await this.runLeg({
+            ...common,
+            network: 'filecoin',
+            send: async (part, pname) => {
+              const r = await this.job<FilecoinReceipt>(R.filecoin, blobEvent(LEG_KIND, { op: 'filecoin', name: pname || name }, part) as never, 300_000);
+              return { id: r.receipt.id, sha256: r.receipt.sha256, proof: r.receipt.proof, retention: r.receipt.retention, provider: r.receipt.provider, route: r.route, price: r.price };
+            },
+            line: (o) => `${o.id}  dataSet=${o.proof?.dataSetId} copies=${o.proof?.copies} readback=${o.proof?.readback}`,
+          }),
+        );
+      }
+    }
+
+    if (legs.length === 0) throw new Error('every leg was skipped; nothing to attest');
+
+    // The bill of lading, signed by the payer.
+    const content: ManifestContent = {
+      sha256: sha,
+      size: bytes.length,
+      mime: po.mime,
+      legs,
+      ...(po.via ? { via: po.via } : {}),
+      created: Math.floor(Date.now() / 1000),
+    };
+    let manifest = buildManifest(content, sk);
+
+    // Leg 3: publish to the relay (a plain paid write of the signed event).
+    if (!skip.relay) {
+      const r = await c.send(R.relay, { body: { event: manifest } });
+      const price = r.fulfilled ? (r.claim?.amount ?? null) : null;
+      if (!r.fulfilled) throw new Error(`relay: ${r.code} ${r.message}`);
+      paid.push({ leg: 'relay', route: R.relay, price });
+      this.log(`relay    ✓ event ${manifest.id}  (${Date.now() - t0} ms)`);
+    }
+
+    // Leg 4: the manifest itself onto Arweave, then named.
+    let manifestTxId: string | undefined;
+    let nameReceipt: NameReceipt | undefined;
+    if (!skip.arweave) {
+      const ev = buildJobEvent({
+        kind: 5094,
+        params: {},
+        tags: [
+          ['i', Buffer.from(JSON.stringify(manifest)).toString('base64'), 'blob'],
+          ['bid', '100000', 'usdc'],
+          ['output', 'application/json'],
+        ],
+      });
+      const r = await this.job<{ txId?: string }>(R.ario, ev as never);
+      manifestTxId = r.receipt.txId;
+      if (!manifestTxId) throw new Error('manifest write accepted without a txId');
+      paid.push({ leg: 'manifest', route: r.route, price: r.price });
+      this.log(`manifest ✓ ${manifestTxId}  (${Date.now() - t0} ms)`);
+      this.save(sha, { manifest, manifestTxId, paid });
+      this.clearProgress(sha);
+
+      let nameOk = !skip.name;
+      const undername = po.undername ?? undernameFor(sha);
+      if (nameOk && doQuote) {
+        const q = await this.quoteName(undername, manifestTxId);
+        paid.push({ leg: 'name-quote', route: q.route, price: q.price });
+        this.log(`name     quote ${fmtQuote(q.receipt)}  (${Date.now() - t0} ms)`);
+        if (!q.receipt.deliverable) {
+          nameOk = false;
+          this.log(`name     SKIPPED, nothing paid for it; retry later with: lading name ${sha}`);
+        }
+      }
+      if (nameOk) {
+        const ev2 = buildJobEvent({ kind: LEG_KIND, params: { op: 'name', txid: manifestTxId, sha256: sha, undername } });
+        const r2 = await this.job<NameReceipt>(R.name, ev2 as never, 120_000);
+        nameReceipt = r2.receipt;
+        paid.push({ leg: 'name', route: r2.route, price: r2.price });
+        this.log(`name     ✓ ${nameReceipt.url}  (${Date.now() - t0} ms)`);
+        // Re-sign with the name known, so the relay copy and the file copy agree on where the manifest lives.
+        manifest = buildManifest({ ...content, arns: { undername, name: nameReceipt.name, manifestTxId } }, sk);
+        if (!skip.relay) await c.send(R.relay, { body: { event: manifest } });
+      }
+    }
+
+    const savedPath = this.save(sha, { manifest, manifestTxId, name: nameReceipt, paid });
+    this.clearProgress(sha);
+    const total = paid.reduce((a, p) => a + (p.price ?? 0n), 0n);
+    return {
+      sha256: sha,
+      size: bytes.length,
+      parts: n,
+      payerPubkey,
+      legs,
+      manifest,
+      manifestTxId,
+      name: nameReceipt,
+      paid,
+      total,
+      savedPath,
+      manifestUrl: manifestTxId ? `https://${this.opts.gateway}/${manifestTxId}` : undefined,
+    };
+  }
+
+  /** Retry the ArNS name leg for a saved manifest whose earlier name job failed, without re-uploading. */
+  async nameOnly(sha: string, o: { undername?: string; quote?: boolean; skipRelay?: boolean } = {}): Promise<{ name: NameReceipt; already: boolean; manifest: NostrEvent }> {
+    const R = this.opts.routes;
+    const p = this.manifestPath(sha);
+    if (!existsSync(p)) throw new Error(`no saved manifest for ${sha} at ${p}`);
+    const saved = JSON.parse(readFileSync(p, 'utf8')) as { manifest: NostrEvent; manifestTxId?: string; name?: NameReceipt; paid: unknown[] };
+    if (!saved.manifestTxId) throw new Error('saved manifest has no Arweave txId; run put again');
+    if (saved.name) {
+      this.log(`already named: ${saved.name.url}`);
+      return { name: saved.name, already: true, manifest: saved.manifest };
+    }
+    const content = parseManifest(saved.manifest);
+    const sk = this.nostrSecret();
+    const c = await this.client();
+    const undername = o.undername ?? undernameFor(sha);
+    if (o.quote !== false) {
+      const q = await this.quoteName(undername, saved.manifestTxId);
+      this.log(`name     quote ${fmtQuote(q.receipt)}`);
+      if (!q.receipt.deliverable) throw new Error(`name leg would not go through; nothing paid for it. (${q.receipt.reason})`);
+    }
+    const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'name', txid: saved.manifestTxId, sha256: sha, undername } });
+    const r = await this.job<NameReceipt>(R.name, ev as never, 120_000);
+    this.log(`name     ✓ ${r.receipt.url}`);
+    const manifest = buildManifest({ ...content, arns: { undername, name: r.receipt.name, manifestTxId: saved.manifestTxId } }, sk);
+    if (!o.skipRelay) {
+      const rr = await c.send(R.relay, { body: { event: manifest } });
+      this.log(rr.fulfilled ? `relay    ✓ re-signed manifest ${manifest.id}` : `relay    ✗ ${rr.code} ${rr.message}`);
+    }
+    writeFileSync(p, JSON.stringify({ ...saved, manifest, name: r.receipt, paid: [...saved.paid, { leg: 'name', route: r.route, price: r.price?.toString() }] }, null, 2));
+    return { name: r.receipt, already: false, manifest };
+  }
+
+  // ---- reading back ----
+
+  /** A manifest by ArNS name, Arweave txid, URL, or path to a saved file. */
+  async fetchManifest(ref: string): Promise<NostrEvent> {
+    if (existsSync(ref)) {
+      const j = JSON.parse(readFileSync(ref, 'utf8'));
+      return (j.manifest ?? j) as NostrEvent;
+    }
+    const url = /^[A-Za-z0-9_-]{43}$/.test(ref)
+      ? `https://${this.opts.gateway}/${ref}`
+      : ref.startsWith('http')
+        ? ref
+        : `https://${ref}.${this.opts.gateway}/`;
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`${url}: ${r.status}`);
+    return (await r.json()) as NostrEvent;
+  }
+
+  /** Where a network serves one id from, given what the receipt recorded. */
+  readUrlFor(network: string, id: string, proof?: Record<string, string | number | undefined>): string | undefined {
+    if (network === 'arweave') return `https://${this.opts.gateway}/${id}`;
+    if (network === 'walrus') return String(proof?.ipfsUrl ?? `${this.opts.walrusAggregator}/v1/blobs/${id}`);
+    return proof?.readUrl === undefined ? undefined : String(proof.readUrl);
+  }
+
+  /** Re-fetch every leg named in a manifest and compare sha256. */
+  async verify(ref: string): Promise<VerifyResult> {
+    const event = await this.fetchManifest(ref);
+    const m = parseManifest(event);
+    const rows: VerifyLegRow[] = [];
+    let ok = true;
+    for (const leg of m.legs) {
+      if (!leg.parts) {
+        const url = this.readUrlFor(leg.network, leg.id, leg.proof);
+        if (!url) {
+          rows.push({ label: leg.network, id: leg.id, ok: false, detail: 'no read url' });
+          ok = false;
+          continue;
+        }
+        const r = await fetchBytes(url);
+        const got = r.bytes ? sha256(r.bytes) : undefined;
+        const match = got === m.sha256;
+        ok &&= match;
+        rows.push({ label: leg.network, id: leg.id, ok: match, detail: match ? 'sha256 match' : `${r.status}${got ? ` got ${got.slice(0, 12)}` : ''}` });
+        continue;
+      }
+      // A chunked leg: every part must come back with its own sha256, and the
+      // reassembled object must hash to the manifest's.
+      const fetched: Array<{ index: number; sha256: string; bytes: Uint8Array }> = [];
+      let legOk = true;
+      for (const part of leg.parts) {
+        const url = this.readUrlFor(leg.network, part.id, part.proof);
+        const r = url ? await fetchBytes(url) : { status: 0 };
+        const got = r.bytes ? sha256(r.bytes) : undefined;
+        const match = got === part.sha256;
+        legOk &&= match;
+        rows.push({ label: `${leg.network}#${part.index + 1}`, id: part.id, ok: match, detail: match ? 'part sha256 match' : `${url ? r.status : 'no read url'}${got ? ` got ${got.slice(0, 12)}` : ''}` });
+        if (match && r.bytes) fetched.push({ index: part.index, sha256: part.sha256, bytes: r.bytes });
+      }
+      let whole: string | undefined;
+      let assembly = '';
+      if (legOk && fetched.length === leg.parts.length) {
+        try {
+          whole = sha256(assembleParts(fetched));
+        } catch (e) {
+          assembly = `assembly failed: ${(e as Error).message}`;
+        }
+      }
+      const match = whole === m.sha256;
+      ok &&= match;
+      rows.push({ label: leg.network, id: `${leg.parts.length} parts reassembled`, ok: match, detail: match ? 'sha256 match' : assembly || (whole ? `got ${whole.slice(0, 12)}` : 'parts missing') });
+    }
+    return { pubkey: event.pubkey, sha256: m.sha256, size: m.size, legs: m.legs.length, rows, ok, manifest: m };
+  }
+
+  // ---- renewals ----
+
+  /** What the payer holds on Walrus and when each record runs out. Free: reads local files, and with `live` Lighthouse's public price endpoint. */
+  async renewals(o: { within?: number; live?: boolean } = {}): Promise<{ rows: RenewalRow[]; due: RenewalRow[]; within: number }> {
+    const within = o.within ?? 60;
+    const rows = this.savedPuts().flatMap(({ saved }) => walrusRecords(saved));
+    if (o.live) {
+      for (const r of rows) {
+        const res = await fetch(`${this.opts.lighthouseX402}/api/renew/price?id=${encodeURIComponent(r.lighthouseId)}`);
+        if (res.status === 404) {
+          r.daysLeft = Number.NaN;
+          continue;
+        }
+        if (!res.ok) throw new Error(`lighthouse renew price for ${r.lighthouseId}: ${res.status}`);
+        const j = (await res.json()) as { currentExpiresAt?: number };
+        if (typeof j.currentExpiresAt === 'number') {
+          r.expiresAt = j.currentExpiresAt;
+          r.daysLeft = daysLeft(j.currentExpiresAt);
+        }
+      }
+    }
+    rows.sort((a, b) => a.expiresAt - b.expiresAt);
+    const due = dueWithin(rows.filter((r) => !Number.isNaN(r.daysLeft)), within);
+    return { rows, due, within };
+  }
+
+  /**
+   * Buy one more year on Walrus. `ref` is a saved put's sha256 (every record of
+   * that object, all parts) or one Lighthouse record id. Each record is quoted
+   * first and only paid when its quote says deliverable; the saved file records
+   * the new paid-through date so `lading renewals` reads it back.
+   */
+  async renew(ref: string, o: { quote?: boolean } = {}): Promise<RenewResult> {
+    const R = this.opts.routes;
+    const isSha = /^[0-9a-f]{64}$/.test(ref);
+    const isId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(ref);
+    if (!isSha && !isId) throw new Error('renew wants a saved put sha256 or a Lighthouse record id');
+    const puts = this.savedPuts();
+    const targets: Array<{ lighthouseId: string; blobId?: string; put?: { path: string; saved: SavedPut }; label: string }> = [];
+    if (isSha) {
+      const put = puts.find((p) => p.sha === ref);
+      if (!put) throw new Error(`no saved manifest for ${ref} under ${join(this.opts.home, 'manifests')}`);
+      for (const r of walrusRecords(put.saved)) targets.push({ lighthouseId: r.lighthouseId, blobId: r.blobId, put, label: `walrus${partLabel(r)}` });
+      if (targets.length === 0) throw new Error(`the saved put ${ref.slice(0, 12)} has no walrus records`);
+    } else {
+      const put = puts.find((p) => walrusRecords(p.saved).some((r) => r.lighthouseId === ref));
+      targets.push({ lighthouseId: ref, put, label: 'walrus' });
+    }
+    const t0 = Date.now();
+    let total = 0n;
+    let bought = 0;
+    const rows: RenewResult['rows'] = [];
+    for (const t of targets) {
+      const tag = t.label.padEnd(9);
+      if (o.quote !== false) {
+        const q = await this.quoteWalrusRenew(t.lighthouseId);
+        total += q.price ?? 0n;
+        this.log(`${tag} quote ${fmtRenewQuote(q.receipt)}  (${Date.now() - t0} ms)`);
+        if (!q.receipt.deliverable) {
+          this.log(`${tag} SKIPPED, nothing paid for it`);
+          rows.push({ label: t.label, lighthouseId: t.lighthouseId, blobId: t.blobId, skipped: q.receipt.reason ?? 'not deliverable', recorded: false });
+          continue;
+        }
+      }
+      const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'walrus-renew', lighthouseId: t.lighthouseId } });
+      const r = await this.job<WalrusRenewReceipt>(R.walrusRenew, ev as never, 180_000);
+      total += r.price ?? 0n;
+      bought++;
+      const rec: SavedRenewal = {
+        network: 'walrus',
+        lighthouseId: t.lighthouseId,
+        blobId: r.receipt.blobId,
+        previousExpiresAt: r.receipt.previousExpiresAt,
+        expiresAt: r.receipt.expiresAt,
+        route: r.route,
+        price: r.price?.toString() ?? null,
+        ...(r.receipt.proof.baseTx ? { baseTx: String(r.receipt.proof.baseTx) } : {}),
+        at: r.receipt.at,
+      };
+      if (t.put) {
+        t.put.saved.renewals = [...(t.put.saved.renewals ?? []), rec];
+        writeFileSync(t.put.path, JSON.stringify(t.put.saved, null, 2));
+      }
+      this.log(`${tag} ✓ ${r.receipt.blobId}  ${fmtDate(r.receipt.previousExpiresAt)} -> ${fmtDate(r.receipt.expiresAt)}${rec.baseTx ? `  base tx ${rec.baseTx}` : ''}${t.put ? '' : '  (no saved put; not recorded locally)'}  (${Date.now() - t0} ms)`);
+      rows.push({ label: t.label, lighthouseId: t.lighthouseId, blobId: r.receipt.blobId, previousExpiresAt: r.receipt.previousExpiresAt, expiresAt: r.receipt.expiresAt, baseTx: rec.baseTx, recorded: !!t.put });
+    }
+    return { rows, bought, targets: targets.length, total };
+  }
+
+  /** What the node serves: every route Lading uses and its price. */
+  async describe(): Promise<Array<{ key: string; route: string; price: bigint | null }>> {
+    const c = await this.client();
+    const out: Array<{ key: string; route: string; price: bigint | null }> = [];
+    for (const [key, route] of Object.entries(this.opts.routes)) {
+      const p = await c.price(route).catch(() => null);
+      out.push({ key, route, price: p === null ? null : BigInt(p as never) });
+    }
+    return out;
+  }
+
+  /** The whole bill before paying it: route prices from the edge, deliverability from the three quote doors. Costs three quotes. */
+  async quote(bytes: Uint8Array, o: { name: string; undername?: string; partBytes?: number }): Promise<QuoteResult> {
+    const R = this.opts.routes;
+    const sha = sha256(bytes);
+    const undername = o.undername ?? undernameFor(sha);
+    const parts = planParts(bytes.length, o.partBytes ?? DEFAULT_PART_BYTES);
+    const n = parts.length;
+    const largest = Math.max(...parts.map((q) => q.size));
+    const est = await this.estimate(bytes.length, o.partBytes ?? DEFAULT_PART_BYTES);
+    const row = (leg: string) => est.rows.find((r) => r.leg === leg)!;
+    const rows: QuoteRow[] = [];
+    rows.push(row('arweave'));
+    const wq = await this.quoteWalrus(largest, o.name);
+    const wNeed = timesMicro(wq.receipt.downstream.amountUsdc, n);
+    const wShort = wq.receipt.deliverable && n > 1 && micro(wq.receipt.float.balance) < micro(wNeed);
+    const wGo = wq.receipt.deliverable && !wShort;
+    rows.push({ leg: 'walrus-quote', route: wq.route, price: wq.price, note: fmtQuote(wq.receipt) + (n > 1 ? `, ${n} parts need ${wNeed} USDC${wShort ? ' (SHORT)' : ''}` : '') });
+    rows.push({ leg: 'walrus', route: R.walrus, price: wGo ? row('walrus').price : 0n, note: wGo ? row('walrus').note : 'would not be paid' });
+    const fq = await this.quoteFilecoin(largest, o.name);
+    const fNeed = timesMicro(fq.receipt.downstream.addPieceFeeUsdfc, n);
+    const fShort = fq.receipt.deliverable && n > 1 && micro(fq.receipt.float.available) < micro(fNeed);
+    const fGo = fq.receipt.deliverable && !fShort;
+    rows.push({ leg: 'filecoin-quote', route: fq.route, price: fq.price, note: fmtQuote(fq.receipt) + (n > 1 ? `, ${n} parts need ${fNeed} USDFC in fees${fShort ? ' (SHORT)' : ''}` : '') });
+    rows.push({ leg: 'filecoin', route: R.filecoin, price: fGo ? row('filecoin').price : 0n, note: fGo ? row('filecoin').note : 'would be skipped' });
+    rows.push(row('relay'));
+    rows.push(row('manifest'));
+    const nq = await this.quoteName(undername);
+    rows.push({ leg: 'name-quote', route: nq.route, price: nq.price, note: fmtQuote(nq.receipt) });
+    rows.push({ leg: 'name', route: R.name, price: nq.receipt.deliverable ? row('name').price : 0n, note: nq.receipt.deliverable ? 'flat' : 'would be skipped' });
+    const total = rows.reduce((a, r) => a + (r.price ?? 0n), 0n);
+    return { sha256: sha, size: bytes.length, parts: n, largestPart: largest, rows, total, quotesPaid: (wq.price ?? 0n) + (fq.price ?? 0n) + (nq.price ?? 0n) };
+  }
+}
+
+async function fetchBytes(url: string): Promise<{ status: number; bytes?: Uint8Array }> {
+  const r = await fetch(url);
+  return r.ok ? { status: r.status, bytes: new Uint8Array(await r.arrayBuffer()) } : { status: r.status };
+}
+
+export const partLabel = (r: RenewalRow) => (r.part < 0 ? '' : `#${r.part + 1}/${r.parts}`);
+
+export const fmtRenewQuote = (q: WalrusRenewQuote) =>
+  `${q.deliverable ? 'deliverable' : 'NOT deliverable'}, downstream ${q.downstream.amountUsdc} USDC, float ${q.float.balance} USDC on Base` +
+  (q.currentExpiresAt ? `, paid through ${fmtDate(q.currentExpiresAt)} (${q.daysLeft} days)` : '') +
+  (q.known ? '' : ', record not in the broker ledger') +
+  (q.reason ? `: ${q.reason}` : '');
+
+export const fmtQuote = (q: WalrusQuote | FilecoinQuote | NameQuote) => {
+  const head = q.deliverable ? 'deliverable' : 'NOT deliverable';
+  const tail = q.reason ? `: ${q.reason}` : '';
+  if (q.op === 'walrus') return `${head}, downstream ${q.downstream.amountUsdc} USDC, float ${q.float.balance} USDC on Base${tail}`;
+  if (q.op === 'filecoin') return `${head}, add-piece fee ${q.downstream.addPieceFeeUsdfc} USDFC for ${q.copies} copies, float ${q.float.available} USDFC, runway ${/^\d+$/.test(q.float.runwayDays) ? `${q.float.runwayDays}d` : q.float.runwayDays}${tail}`;
+  return `${head}, ${q.name}, float ${(Number(q.float.lamports) / 1e9).toFixed(4)} SOL${tail}`;
+};

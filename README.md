@@ -11,11 +11,36 @@ archived on several storage networks, paying per object per network, and
 each leg hands back the network's own identifier and proof. Every copy is
 then listed in a signed manifest that lives on Arweave under an ArNS name.
 
-Status: v0.4.0, Arweave, Walrus and Filecoin legs, ArNS naming, relay copy,
-a quote door in front of each broker leg, and objects over one packet
-travelling as parts. Runs against Drew's mainnet
-node today; the Filecoin door goes live the day its Filecoin Pay account is
-funded (see Run it).
+Status: v0.6.0, Arweave, Walrus and Filecoin legs, ArNS naming, relay copy,
+a quote door in front of each broker leg, objects over one packet travelling
+as parts, Walrus renewals, and a hosted x402 gate with an MCP shim so Claude
+can archive through it. Runs against Drew's mainnet node today.
+
+## Use it from Claude
+
+Claude's MCP client cannot pay x402 itself, so a small shim runs next to it,
+holds a Base key with a little USDC (no ETH needed) and pays the hosted gate
+once per tool call. Behind the door every hop is ILP through the TOON edge.
+
+```
+claude mcp add lading -e LADING_X402_KEY=0x… -- npx -y lading mcp --gate https://lading.167-233-221-236.sslip.io
+```
+
+Tools: `lading_describe`, `lading_quote` (free), `lading_put` (paid: file
+path or text, returns every network receipt, the manifest URL and the ArNS
+name), `lading_verify` (free), `lading_renew` (paid). Every paid call asks the
+gate's free quote first and refuses over `LADING_MAX_USDC_PER_CALL` (default
+0.50 USDC). A 1 MiB put is about 0.15 USDC; a small one about 0.10.
+
+The gate (`src/gate.ts`) prices a put on its `content-length`: the TOON bill
+for that size from the edge's route prices, times a margin (1.2), never under
+a floor (0.05 USDC). Settlement runs only after the put answered 2xx, so a
+failed put is not charged to the caller; the gate carries the route prices it
+already paid, which is what the margin is for. The manifest a gate put
+produces is signed by the gate's key and records `via: {door: 'x402', payer}`.
+Doors: `GET /v1/describe`, `GET /v1/quote?size=N`, `POST /v1/put`,
+`GET /v1/renew/quote?id=`, `POST /v1/renew`, `GET /v1/verify?ref=`. Design
+notes: `docs/x402-gate.md`.
 
 ## Why this exists
 
@@ -117,6 +142,11 @@ default, since one such put runs to several hundred thousand units.
 
 ```
 src/server.ts    the handler: POST /walrus, /filecoin, /name and their /quote doors, GET /describe, GET /health
+src/lib.ts       the client as a library: put, quote, estimate, verify, name, renewals, renew, describe; the CLI and the gate both run this
+src/cli.ts       the command line, a thin layer over lib.ts
+src/gate.ts      the hosted door: express + x402 (USDC on Base, PayAI facilitator), pays the TOON routes with its own key
+src/gate-price.ts what the door charges for a TOON bill: margin and floor, pure
+src/mcp.ts       the MCP shim Claude runs locally: pays the gate per tool call with LADING_X402_KEY
 src/walrus.ts    Lighthouse x402 upload (USDC on Base), blobId lookup, aggregator read-back
 src/filecoin.ts  Filecoin Onchain Cloud upload (Synapse SDK, USDFC in Filecoin Pay), provider read-back
 src/filecoin-fund.ts  operator tool: deposit USDFC and approve warm storage, once

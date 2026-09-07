@@ -1,6 +1,15 @@
 # The x402 gate: Lading for Claude, hosted (design, 2026-09-07)
 
-Decided with Drew 2026-09-07, not built yet. Shape A of three:
+Decided with Drew 2026-09-07. **Built 2026-09-07 (0.6.0): `src/lib.ts`,
+`src/gate.ts`, `src/gate-price.ts`, `src/mcp.ts`, the `lading-gate` compose
+service, `deploy/Caddyfile.lading`.** Checked locally against the live edge:
+the free quote for 1 MiB came to 122,070 units (the real 09-07 put was
+122,130), the door hands out a v2 402 for 97,344 micro-USDC on `eip155:8453`
+with PayAI synced, the shim lists five tools over stdio, its cap refuses a
+put over `LADING_MAX_USDC_PER_CALL`, and an unfunded key is refused by the
+facilitator before anything runs. Not yet done: deploy on the box (steps at
+the bottom), the first paid put through the door, npm publish.
+Shape A of three:
 
 > Hosted HTTP door on the node, gated by x402 on Base USDC, plus a thin local
 > MCP shim the user runs in Claude Desktop or Claude Code. The shim holds the
@@ -77,3 +86,14 @@ reintroduces a prepaid balance).
 A 1 MiB put cost 122,130 units (0.1221 USDC) on 2026-09-07 across 9 jobs. Gate
 price = quoted TOON total × 1.2, floor $0.05, so a small put is ~$0.06 and a
 1 MiB put ~$0.15. Renew ~$0.06.
+
+## Deploy (the box)
+
+1. Generate the gate's payer once: `node -e "const c=require('node:crypto');const {privateKey,publicKey}=c.generateKeyPairSync('ed25519');const d=Buffer.from(privateKey.export({format:'jwk'}).d,'base64url'),x=Buffer.from(publicKey.export({format:'jwk'}).x,'base64url');console.log(JSON.stringify([...Buffer.concat([d,x])]))"` into `/root/keys-2026-09-06/lading-gate-solana.json` (mode 600) and print its address; Drew funds it (~5 USDC + 0.05 SOL).
+2. Box `.env` (backup first): `LADING_GATE_SOLANA_KEYPAIR='[…]'`, `LADING_GATE_PAYTO=0x47fbAABeA97ee9cbF196fE0bAddaaF955520d84d` (the Walrus float key, so revenue refills the float), `LADING_GATE_URL=https://lading.167-233-221-236.sslip.io`.
+3. rsync the repo (`--exclude .env`, never `--delete`), then
+   `docker compose -p lading -f /opt/toon-relay/lading/docker-compose.yml --env-file /opt/toon-relay/lading/.env up -d --build lading-gate`.
+4. Caddy: append `deploy/Caddyfile.lading` to `/opt/toon-relay/deploy/Caddyfile` (backup first), then
+   `docker exec deploy-caddy-1 caddy reload --config /etc/caddy/Caddyfile` (or `docker compose ... restart caddy`). Caddy fetches the sslip.io certificate on first hit.
+5. Check: `curl https://lading.167-233-221-236.sslip.io/health`, `…/v1/quote?size=1048576`, and a `POST /v1/put` without payment returns 402 with the right amount.
+6. First paid put: from the Mac, `LADING_X402_KEY=<a Base key with ~1 USDC> npx tsx src/cli.ts mcp --gate https://lading.…` under Claude, or the driver in the scratchpad. Record it in `node-artifacts/lading-first-put-2026-09-06.md`.

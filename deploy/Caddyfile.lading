@@ -1,0 +1,14 @@
+# Append to /opt/toon-relay/deploy/Caddyfile (back it up first). The gate runs
+# in the lading compose project on relay_deploy_net, so Caddy reaches it by
+# container name. A chunked put runs for minutes: no proxy timeout.
+lading.167-233-221-236.sslip.io {
+	encode zstd gzip
+	request_body {
+		max_size 4MB
+	}
+	reverse_proxy lading-gate:3601 {
+		transport http {
+			response_header_timeout 0
+		}
+	}
+}
