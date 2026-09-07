@@ -18,7 +18,7 @@ import { createHash } from 'node:crypto';
 import { x402Client, wrapFetchWithPayment } from '@x402/fetch';
 import { registerExactEvmScheme } from '@x402/evm/exact/client';
 import { privateKeyToAccount } from 'viem/accounts';
-import type { WalrusReceipt } from './kinds.js';
+import type { WalrusReceipt, WalrusRenewReceipt } from './kinds.js';
 
 export const LIGHTHOUSE_X402 = process.env.LIGHTHOUSE_X402_URL ?? 'https://x402-walrus.lighthouse.storage';
 export const LIGHTHOUSE_API = process.env.LIGHTHOUSE_API_URL ?? 'https://api.lighthouse.storage';
@@ -26,8 +26,36 @@ export const WALRUS_AGGREGATOR =
   process.env.WALRUS_AGGREGATOR_URL ?? 'https://aggregator.walrus-mainnet.walrus.space';
 
 export interface WalrusUploader {
+  /** The Base address that pays Lighthouse, and so the only wallet Lighthouse lets renew what this door uploaded. */
+  readonly address: `0x${string}`;
   quote(size: number): Promise<{ amountUsdc: string; raw: unknown }>;
   upload(bytes: Uint8Array, fileName: string): Promise<WalrusReceipt>;
+  /** Lighthouse's own answer for a record: price of one more period and the current paid-through instant. `found: false` on a 404. */
+  renewQuote(lighthouseId: string): Promise<RenewQuote>;
+  /** Buy one more storage period for a record this key uploaded. Lighthouse stacks it on the current expiry. */
+  renew(lighthouseId: string): Promise<WalrusRenewReceipt>;
+}
+
+export interface RenewQuote {
+  found: boolean;
+  amountUsdc: string;
+  cid?: string;
+  size?: number;
+  currentExpiresAt?: number;
+  storagePeriodDays?: number;
+  raw: unknown;
+}
+
+interface LighthouseRenewResponse {
+  success: boolean;
+  id: string;
+  cid: string;
+  fileName: string;
+  fileSizeBytes: number;
+  previousExpiresAt: number;
+  expiresAt: number;
+  storagePeriodDays: number;
+  publicKey: string;
 }
 
 interface LighthouseUploadResponse {
@@ -137,6 +165,17 @@ export async function readBack(
   return { checks, strong };
 }
 
+/** The x402 settlement header, when the facilitator sent one back: Base tx and payer. Unreadable is not a receipt failure. */
+function settlementOf(res: Response): { transaction?: string; payer?: string } {
+  const settle = res.headers.get('payment-response') ?? res.headers.get('x-payment-response');
+  if (!settle) return {};
+  try {
+    return JSON.parse(Buffer.from(settle, 'base64').toString('utf8'));
+  } catch {
+    return {};
+  }
+}
+
 export function lighthouseUploader(evmPrivateKey: `0x${string}`): WalrusUploader {
   const signer = privateKeyToAccount(evmPrivateKey);
   const client = new x402Client();
@@ -144,6 +183,55 @@ export function lighthouseUploader(evmPrivateKey: `0x${string}`): WalrusUploader
   const payFetch = wrapFetchWithPayment(fetch, client);
 
   return {
+    address: signer.address,
+
+    async renewQuote(lighthouseId) {
+      const r = await fetch(`${LIGHTHOUSE_X402}/api/renew/price?id=${encodeURIComponent(lighthouseId)}`);
+      if (r.status === 404) return { found: false, amountUsdc: '0', raw: await r.json().catch(() => null) };
+      if (!r.ok) throw new Error(`renew price failed: ${r.status} ${await r.text()}`);
+      const raw = (await r.json()) as Record<string, unknown>;
+      // Live shape (2026-09-07): { id, cid, fileSizeBytes, billableMiB, totalPrice: "$0.034500", storagePeriodDays, currentExpiresAt, network, payTo }
+      const total = String(raw.totalPrice ?? '').replace(/^\$/, '');
+      if (!/^\d+(\.\d+)?$/.test(total)) throw new Error(`renew price has no totalPrice: ${JSON.stringify(raw)}`);
+      return {
+        found: true,
+        amountUsdc: total,
+        cid: typeof raw.cid === 'string' ? raw.cid : undefined,
+        size: typeof raw.fileSizeBytes === 'number' ? raw.fileSizeBytes : undefined,
+        currentExpiresAt: typeof raw.currentExpiresAt === 'number' ? raw.currentExpiresAt : undefined,
+        storagePeriodDays: typeof raw.storagePeriodDays === 'number' ? raw.storagePeriodDays : undefined,
+        raw,
+      };
+    },
+
+    async renew(lighthouseId) {
+      const res = await payFetch(`${LIGHTHOUSE_X402}/api/renew`, { method: 'POST', headers: { 'x-file-id': lighthouseId } });
+      if (!res.ok) throw new Error(`lighthouse renew failed: ${res.status} ${await res.text()}`);
+      const out = (await res.json()) as LighthouseRenewResponse;
+      if (!out.success || !out.expiresAt || out.expiresAt <= (out.previousExpiresAt ?? 0)) throw new Error(`lighthouse renew returned no new expiry: ${JSON.stringify(out)}`);
+      const settlement = settlementOf(res);
+      const blobIds = await walrusBlobIds(out.cid);
+      const blobId = blobIds[0]!;
+      return {
+        network: 'walrus',
+        op: 'renew',
+        lighthouseId: out.id,
+        blobId,
+        cid: out.cid,
+        size: out.fileSizeBytes,
+        previousExpiresAt: out.previousExpiresAt,
+        expiresAt: out.expiresAt,
+        extended: `P${out.storagePeriodDays ?? 365}D`,
+        provider: 'lighthouse-x402',
+        proof: {
+          readUrl: `${WALRUS_AGGREGATOR}/v1/blobs/${blobId}`,
+          ...(settlement.transaction ? { baseTx: settlement.transaction } : {}),
+          ...(settlement.payer ? { payer: settlement.payer } : {}),
+        },
+        at: Math.floor(Date.now() / 1000),
+      };
+    },
+
     async quote(size) {
       const r = await fetch(`${LIGHTHOUSE_X402}/api/upload/price?size=${size}`);
       if (!r.ok) throw new Error(`price quote failed: ${r.status} ${await r.text()}`);
@@ -169,15 +257,7 @@ export function lighthouseUploader(evmPrivateKey: `0x${string}`): WalrusUploader
       const out = (await res.json()) as LighthouseUploadResponse;
       if (!out.success || !out.cid) throw new Error(`lighthouse upload returned no cid: ${JSON.stringify(out)}`);
 
-      let settlement: { transaction?: string; payer?: string } = {};
-      const settle = res.headers.get('payment-response') ?? res.headers.get('x-payment-response');
-      if (settle) {
-        try {
-          settlement = JSON.parse(Buffer.from(settle, 'base64').toString('utf8'));
-        } catch {
-          /* header present but unreadable: not a receipt failure */
-        }
-      }
+      const settlement = settlementOf(res);
 
       const blobIds = await walrusBlobIds(out.cid);
       const blobId = blobIds[0]!;

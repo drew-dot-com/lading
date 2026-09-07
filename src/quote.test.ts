@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cached, decideFilecoin, decideName, decideWalrus } from './quote.js';
+import { cached, decideFilecoin, decideName, decideWalrus, decideWalrusRenew } from './quote.js';
 
 test('walrus quote: deliverable only with the reserve on the Base key', () => {
   const base = { size: 5535, maxBytes: 3 * 1024 * 1024, priceUsdc: '0.032500' };
@@ -49,4 +49,16 @@ test('filecoin quote: piece bounds, then a funded account, then runway', () => {
   assert.match(decideFilecoin({ ...ok, ready: false, depositNeededUsdfc: '1.234' }).reason ?? '', /1.234 USDFC deposit/);
   assert.match(decideFilecoin({ ...ok, runwayDays: 3n }).reason ?? '', /3 days, under the 7-day/);
   assert.equal(decideFilecoin({ ...ok, runwayDays: 7n }).deliverable, true);
+});
+
+test('walrus renew quote: the record must exist, then the same reserve rule as an upload', () => {
+  const base = { priceUsdc: '0.034500', balanceUsdc: '4.8375' };
+  assert.equal(decideWalrusRenew({ ...base, found: true }).deliverable, true);
+  const gone = decideWalrusRenew({ ...base, found: false });
+  assert.equal(gone.deliverable, false);
+  assert.match(gone.reason ?? '', /no record/);
+  const short = decideWalrusRenew({ found: true, priceUsdc: '0.034500', balanceUsdc: '0.068' });
+  assert.equal(short.deliverable, false);
+  assert.match(short.reason ?? '', /under the 0.069000 USDC reserve for a 0.034500 USDC renewal/);
+  assert.equal(decideWalrusRenew({ found: true, priceUsdc: '0.034500', balanceUsdc: '0.069' }).deliverable, true);
 });

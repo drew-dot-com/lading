@@ -1,0 +1,74 @@
+/**
+ * The payer's view of what it has on Walrus and when each record runs out.
+ * Reads the saved manifests under ~/.lading/manifests: each walrus leg (or
+ * each part of a chunked one) carries the Lighthouse record id and the
+ * paid-through instant the door reported at write time; a renewal paid later
+ * through `lading renew` is appended to the saved file and moves the date.
+ */
+import type { Event as NostrEvent } from 'nostr-tools/pure';
+import type { LegReceipt } from './kinds.js';
+import { daysLeft } from './ledger.js';
+
+export interface RenewalRow {
+  sha256: string;
+  /** Which slice of the object this record holds: 0-based part index, or -1 for a whole object. */
+  part: number;
+  parts: number;
+  blobId: string;
+  lighthouseId: string;
+  size: number;
+  /** ms epoch as of the latest record we hold (write time, or the last renewal). */
+  expiresAt: number;
+  renewals: number;
+  daysLeft: number;
+  name?: string;
+}
+
+/** A renewal the payer bought, as appended to the saved manifest file. */
+export interface SavedRenewal {
+  network: 'walrus';
+  lighthouseId: string;
+  blobId: string;
+  previousExpiresAt: number;
+  expiresAt: number;
+  route: string;
+  price: string | null;
+  baseTx?: string;
+  at: number;
+}
+
+export interface SavedPut {
+  manifest: NostrEvent;
+  manifestTxId?: string;
+  name?: { name: string; url: string };
+  paid: unknown[];
+  renewals?: SavedRenewal[];
+}
+
+/** The renewable records in one saved put, with the latest expiry we know. */
+export function walrusRecords(saved: SavedPut, nowMs = Date.now()): RenewalRow[] {
+  const content = JSON.parse(saved.manifest.content) as { sha256: string; legs: LegReceipt[] };
+  const out: RenewalRow[] = [];
+  for (const leg of content.legs) {
+    if (leg.network !== 'walrus') continue;
+    const slices = leg.parts ? leg.parts.map((p) => ({ part: p.index, id: p.id, size: p.size, proof: p.proof })) : [{ part: -1, id: leg.id, size: leg.size, proof: leg.proof }];
+    for (const s of slices) {
+      const lighthouseId = String(s.proof?.lighthouseId ?? '');
+      if (!lighthouseId) continue;
+      let expiresAt = Number(s.proof?.expiresAt ?? 0);
+      let renewals = 0;
+      for (const r of saved.renewals ?? []) {
+        if (r.lighthouseId !== lighthouseId) continue;
+        renewals++;
+        if (r.expiresAt > expiresAt) expiresAt = r.expiresAt;
+      }
+      out.push({ sha256: content.sha256, part: s.part, parts: leg.parts?.length ?? 1, blobId: s.id, lighthouseId, size: s.size, expiresAt, renewals, daysLeft: daysLeft(expiresAt, nowMs), name: saved.name?.name });
+    }
+  }
+  return out;
+}
+
+/** Records due within `withinDays`, soonest first. */
+export const dueWithin = (rows: RenewalRow[], withinDays: number) => rows.filter((r) => r.daysLeft <= withinDays).sort((a, b) => a.expiresAt - b.expiresAt);
+
+export const fmtDate = (ms: number) => new Date(ms).toISOString().slice(0, 10);

@@ -21,7 +21,11 @@ services:
       LADING_SOLANA_KEYPAIR: ${LADING_SOLANA_KEYPAIR}          # JSON array; the ANT owner's key
       SOLANA_RPC: ${SOLANA_RPC:-https://api.mainnet-beta.solana.com}
       LADING_NODE_SECRET: ${LADING_NODE_SECRET:-}
+      LADING_DATA_DIR: /data                                   # the walrus ledger: every Lighthouse record this broker paid for, and when it runs out
+    volumes: [lading_data:/data]
     networks: [relay_deploy_net]
+volumes:
+  lading_data:
 networks:
   relay_deploy_net:
     external: true

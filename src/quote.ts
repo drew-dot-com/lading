@@ -23,6 +23,26 @@ export interface WalrusQuote {
   at: number;
 }
 
+export interface WalrusRenewQuote {
+  op: 'walrus-renew';
+  deliverable: boolean;
+  reason?: string;
+  lighthouseId: string;
+  cid?: string;
+  /** Known when the broker's ledger holds the record (uploaded through this door). */
+  blobId?: string;
+  size?: number;
+  /** Paid-through instant Lighthouse reports now, ms epoch. */
+  currentExpiresAt?: number;
+  daysLeft?: number;
+  /** Whether this broker's key is the record's payer as far as its ledger knows; Lighthouse refuses a renewal from any other wallet. */
+  known: boolean;
+  downstream: { provider: 'lighthouse-x402'; amountUsdc: string; extends: 'P365D' };
+  float: { chain: 'base'; asset: 'USDC'; balance: string; reserve: string };
+  executeDoor: '/walrus/renew';
+  at: number;
+}
+
 export interface FilecoinQuote {
   op: 'filecoin';
   deliverable: boolean;
@@ -76,6 +96,33 @@ export function decideWalrus(input: {
     return {
       deliverable: false,
       reason: `walrus float ${input.balanceUsdc} USDC on Base is under the ${reserveUsdc} USDC reserve for a ${input.priceUsdc} USDC upload`,
+      reserveUsdc,
+    };
+  }
+  return { deliverable: true, reserveUsdc };
+}
+
+/**
+ * A renewal goes through when Lighthouse still has the record and the Base key
+ * holds the renewal price with the same reserve the upload quote uses. A
+ * record the ledger does not know is still quoted on price and float, flagged
+ * `known: false`: Lighthouse alone decides ownership, and it answers 403 to
+ * any wallet but the uploader's, so the execute door refuses before paying.
+ */
+export function decideWalrusRenew(input: {
+  found: boolean;
+  priceUsdc: string;
+  balanceUsdc: string;
+  reserveMultiple?: number;
+}): { deliverable: boolean; reason?: string; reserveUsdc: string } {
+  const mult = BigInt(input.reserveMultiple ?? 2);
+  const reserve = micro(input.priceUsdc) * mult;
+  const reserveUsdc = (Number(reserve) / 1e6).toFixed(6);
+  if (!input.found) return { deliverable: false, reason: 'lighthouse has no record with that id', reserveUsdc };
+  if (micro(input.balanceUsdc) < reserve) {
+    return {
+      deliverable: false,
+      reason: `walrus float ${input.balanceUsdc} USDC on Base is under the ${reserveUsdc} USDC reserve for a ${input.priceUsdc} USDC renewal`,
       reserveUsdc,
     };
   }

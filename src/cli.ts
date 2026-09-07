@@ -16,21 +16,29 @@
  *   lading quote <file>     the full bill before paying it: every route's price
  *                           plus each leg's quote (deliverable right now, and
  *                           the downstream cost the broker will carry).
+ *   lading renewals         every Walrus record in the saved manifests with its
+ *                           paid-through date; --within <days> (default 60) marks
+ *                           what is due; --live asks Lighthouse for today's date.
+ *   lading renew <sha|id>   buy one more year on Walrus for a saved put's records
+ *                           (or one Lighthouse record id) through the renew door,
+ *                           quote first; the saved file records the new date.
  *   lading describe         what the node serves.
  *
  * Coordination lives here, not in the handler: that is the pattern every TOON
  * app follows (a handler is a leaf), and it keeps the broker unable to spend
  * on the payer's behalf beyond the one leg it was paid for.
  */
-import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import { ToonClient, buildJobEvent, sendJob, chargeFor } from '@toon-protocol/client';
 import { getPublicKey, type Event as NostrEvent } from 'nostr-tools/pure';
-import { LEG_KIND, type FilecoinReceipt, type LegReceipt, type NameReceipt, type PartReceipt, type WalrusReceipt } from './kinds.js';
+import { LEG_KIND, type FilecoinReceipt, type LegReceipt, type NameReceipt, type PartReceipt, type WalrusReceipt, type WalrusRenewReceipt } from './kinds.js';
 import { assembleParts, DEFAULT_PART_BYTES, partName, planParts, splitParts, type Part } from './parts.js';
-import type { FilecoinQuote, NameQuote, WalrusQuote } from './quote.js';
+import type { FilecoinQuote, NameQuote, WalrusQuote, WalrusRenewQuote } from './quote.js';
+import { dueWithin, fmtDate, walrusRecords, type RenewalRow, type SavedPut, type SavedRenewal } from './renewals.js';
+import { daysLeft } from './ledger.js';
 import { buildManifest, parseManifest, type ManifestContent } from './manifest.js';
 import { undernameFor } from './arns.js';
 
@@ -40,6 +48,8 @@ const ROUTES = {
   ario: env('LADING_ROUTE_ARIO', 'g.drew.ario'),
   walrus: env('LADING_ROUTE_WALRUS', 'g.drew.lading.walrus'),
   walrusQuote: env('LADING_ROUTE_WALRUS_QUOTE', 'g.drew.lading.walrus.quote'),
+  walrusRenew: env('LADING_ROUTE_WALRUS_RENEW', 'g.drew.lading.walrus.renew'),
+  walrusRenewQuote: env('LADING_ROUTE_WALRUS_RENEW_QUOTE', 'g.drew.lading.walrus.renew.quote'),
   filecoin: env('LADING_ROUTE_FILECOIN', 'g.drew.lading.filecoin'),
   filecoinQuote: env('LADING_ROUTE_FILECOIN_QUOTE', 'g.drew.lading.filecoin.quote'),
   name: env('LADING_ROUTE_NAME', 'g.drew.lading.name'),
@@ -47,6 +57,7 @@ const ROUTES = {
   relay: env('LADING_ROUTE_RELAY', 'g.drew.relay'),
 };
 const GATEWAY = env('LADING_ARNS_GATEWAY', 'permagate.io');
+const LIGHTHOUSE_X402 = env('LIGHTHOUSE_X402_URL', 'https://x402-walrus.lighthouse.storage');
 const AGGREGATOR = env('WALRUS_AGGREGATOR_URL', 'https://aggregator.walrus-mainnet.walrus.space');
 const HOME = join(homedir(), '.lading');
 
@@ -260,6 +271,18 @@ async function quoteName(c: ToonClient, undername: string, txid?: string): Promi
   const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'name', phase: 'quote', undername, ...(txid ? { txid } : {}) } });
   return job<NameQuote>(c, ROUTES.nameQuote, ev as never, 60_000);
 }
+
+/** Ask the renew quote door what one more year on a Lighthouse record costs and when it currently runs out. 1,000 units, against 40,000 for the renewal. */
+async function quoteWalrusRenew(c: ToonClient, lighthouseId: string): Promise<Paid<WalrusRenewQuote>> {
+  const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'walrus-renew', phase: 'quote', lighthouseId } });
+  return job<WalrusRenewQuote>(c, ROUTES.walrusRenewQuote, ev as never, 60_000);
+}
+
+const fmtRenewQuote = (q: WalrusRenewQuote) =>
+  `${q.deliverable ? 'deliverable' : 'NOT deliverable'}, downstream ${q.downstream.amountUsdc} USDC, float ${q.float.balance} USDC on Base` +
+  (q.currentExpiresAt ? `, paid through ${fmtDate(q.currentExpiresAt)} (${q.daysLeft} days)` : '') +
+  (q.known ? '' : ', record not in the broker ledger') +
+  (q.reason ? `: ${q.reason}` : '');
 
 const fmtQuote = (q: WalrusQuote | FilecoinQuote | NameQuote) => {
   const head = q.deliverable ? 'deliverable' : 'NOT deliverable';
@@ -548,6 +571,113 @@ async function verify(ref: string) {
   process.exitCode = ok ? 0 : 1;
 }
 
+/** Every saved put, oldest first. */
+function savedPuts(): Array<{ path: string; sha: string; saved: SavedPut }> {
+  const dir = join(HOME, 'manifests');
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
+    .filter((f) => /^[0-9a-f]{64}\.json$/.test(f))
+    .map((f) => ({ path: join(dir, f), sha: f.slice(0, 64), saved: JSON.parse(readFileSync(join(dir, f), 'utf8')) as SavedPut }))
+    .sort((a, b) => a.saved.manifest.created_at - b.saved.manifest.created_at);
+}
+
+const partLabel = (r: RenewalRow) => (r.part < 0 ? '' : `#${r.part + 1}/${r.parts}`);
+
+/** What the payer holds on Walrus and when each record runs out. Free: reads local files, and with --live Lighthouse's public price endpoint. */
+async function renewals() {
+  const within = Number(opt('within') ?? 60);
+  const rows = savedPuts().flatMap(({ saved }) => walrusRecords(saved));
+  if (rows.length === 0) {
+    console.log(`no walrus records under ${join(HOME, 'manifests')}`);
+    return;
+  }
+  if (flag('live')) {
+    for (const r of rows) {
+      const res = await fetch(`${LIGHTHOUSE_X402}/api/renew/price?id=${encodeURIComponent(r.lighthouseId)}`);
+      if (res.status === 404) {
+        r.daysLeft = Number.NaN;
+        continue;
+      }
+      if (!res.ok) throw new Error(`lighthouse renew price for ${r.lighthouseId}: ${res.status}`);
+      const j = (await res.json()) as { currentExpiresAt?: number };
+      if (typeof j.currentExpiresAt === 'number') {
+        r.expiresAt = j.currentExpiresAt;
+        r.daysLeft = daysLeft(j.currentExpiresAt);
+      }
+    }
+  }
+  rows.sort((a, b) => a.expiresAt - b.expiresAt);
+  console.log(`${rows.length} walrus records${flag('live') ? ', dates from Lighthouse now' : ', dates as of the last write or renewal'}; due = within ${within} days\n`);
+  console.log(`  ${'due'.padEnd(4)} ${'paid through'.padEnd(12)} ${'days'.padStart(5)}  ${'object'.padEnd(12)} ${'part'.padEnd(6)} ${'blobId'.padEnd(43)} ${'lighthouse record'.padEnd(36)} renewals  name`);
+  for (const r of rows) {
+    const due = Number.isNaN(r.daysLeft) ? 'GONE' : r.daysLeft <= within ? 'DUE' : '';
+    console.log(`  ${due.padEnd(4)} ${fmtDate(r.expiresAt).padEnd(12)} ${String(Number.isNaN(r.daysLeft) ? '-' : r.daysLeft).padStart(5)}  ${r.sha256.slice(0, 12)} ${partLabel(r).padEnd(6)} ${r.blobId.padEnd(43)} ${r.lighthouseId.padEnd(36)} ${String(r.renewals).padStart(8)}  ${r.name ?? ''}`);
+  }
+  const due = dueWithin(rows.filter((r) => !Number.isNaN(r.daysLeft)), within);
+  if (due.length) console.log(`\n${due.length} due: lading renew ${[...new Set(due.map((r) => r.sha256))].map((s) => s.slice(0, 12)).join(' / ')}`);
+}
+
+/**
+ * Buy one more year on Walrus. <ref> is a saved put's sha256 (every record of
+ * that object, all parts) or one Lighthouse record id. Each record is quoted
+ * first and only paid when its quote says deliverable; the saved file records
+ * the new paid-through date so `lading renewals` reads it back.
+ */
+async function renew(ref: string) {
+  const isSha = /^[0-9a-f]{64}$/.test(ref);
+  const isId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(ref);
+  if (!isSha && !isId) throw new Error('renew wants a saved put sha256 or a Lighthouse record id');
+  const puts = savedPuts();
+  const targets: Array<{ lighthouseId: string; blobId?: string; put?: { path: string; saved: SavedPut }; label: string }> = [];
+  if (isSha) {
+    const put = puts.find((p) => p.sha === ref);
+    if (!put) throw new Error(`no saved manifest for ${ref} under ${join(HOME, 'manifests')}`);
+    for (const r of walrusRecords(put.saved)) targets.push({ lighthouseId: r.lighthouseId, blobId: r.blobId, put, label: `walrus${partLabel(r)}` });
+    if (targets.length === 0) throw new Error(`the saved put ${ref.slice(0, 12)} has no walrus records`);
+  } else {
+    const put = puts.find((p) => walrusRecords(p.saved).some((r) => r.lighthouseId === ref));
+    targets.push({ lighthouseId: ref, put, label: 'walrus' });
+  }
+  const c = await client();
+  const t0 = Date.now();
+  let total = 0n;
+  let bought = 0;
+  for (const t of targets) {
+    const tag = t.label.padEnd(9);
+    if (!flag('no-quote')) {
+      const q = await quoteWalrusRenew(c, t.lighthouseId);
+      total += q.price ?? 0n;
+      console.log(`${tag} quote ${fmtRenewQuote(q.receipt)}  (${Date.now() - t0} ms)`);
+      if (!q.receipt.deliverable) {
+        console.log(`${tag} SKIPPED, nothing paid for it`);
+        continue;
+      }
+    }
+    const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'walrus-renew', lighthouseId: t.lighthouseId } });
+    const r = await job<WalrusRenewReceipt>(c, ROUTES.walrusRenew, ev as never, 180_000);
+    total += r.price ?? 0n;
+    bought++;
+    const rec: SavedRenewal = {
+      network: 'walrus',
+      lighthouseId: t.lighthouseId,
+      blobId: r.receipt.blobId,
+      previousExpiresAt: r.receipt.previousExpiresAt,
+      expiresAt: r.receipt.expiresAt,
+      route: r.route,
+      price: r.price?.toString() ?? null,
+      ...(r.receipt.proof.baseTx ? { baseTx: String(r.receipt.proof.baseTx) } : {}),
+      at: r.receipt.at,
+    };
+    if (t.put) {
+      t.put.saved.renewals = [...(t.put.saved.renewals ?? []), rec];
+      writeFileSync(t.put.path, JSON.stringify(t.put.saved, null, 2));
+    }
+    console.log(`${tag} ✓ ${r.receipt.blobId}  ${fmtDate(r.receipt.previousExpiresAt)} -> ${fmtDate(r.receipt.expiresAt)}${rec.baseTx ? `  base tx ${rec.baseTx}` : ''}${t.put ? '' : '  (no saved put; not recorded locally)'}  (${Date.now() - t0} ms)`);
+  }
+  console.log(`\nrenewed ${bought} of ${targets.length} records, paid ${total} base units`);
+  await (c as { close?: () => Promise<void> }).close?.();
+}
+
 async function describe() {
   const c = await client();
   for (const [k, route] of Object.entries(ROUTES)) {
@@ -607,9 +737,9 @@ async function quote(file: string) {
 
 const [cmd, arg] = process.argv.slice(2);
 const run =
-  cmd === 'put' && arg ? put(arg) : cmd === 'quote' && arg ? quote(arg) : cmd === 'verify' && arg ? verify(arg) : cmd === 'name' && arg ? nameOnly(arg) : cmd === 'describe' ? describe() : null;
+  cmd === 'put' && arg ? put(arg) : cmd === 'quote' && arg ? quote(arg) : cmd === 'verify' && arg ? verify(arg) : cmd === 'name' && arg ? nameOnly(arg) : cmd === 'renewals' ? renewals() : cmd === 'renew' && arg ? renew(arg) : cmd === 'describe' ? describe() : null;
 if (!run) {
-  console.log('usage: lading put <file> [--name n] [--mime m] [--undername u] [--part-bytes n] [--no-quote] [--skip-arweave|--skip-walrus|--skip-filecoin|--skip-relay|--skip-name]\n       lading quote <file> [--part-bytes n]\n       lading verify <arns-name|manifest-txid|saved.json>\n       lading name <sha256> [--no-quote]\n       lading describe');
+  console.log('usage: lading put <file> [--name n] [--mime m] [--undername u] [--part-bytes n] [--no-quote] [--skip-arweave|--skip-walrus|--skip-filecoin|--skip-relay|--skip-name]\n       lading quote <file> [--part-bytes n]\n       lading verify <arns-name|manifest-txid|saved.json>\n       lading name <sha256> [--no-quote]\n       lading renewals [--within days] [--live]\n       lading renew <sha256|lighthouse-record-id> [--no-quote]\n       lading describe');
   process.exit(2);
 }
 run.catch((e) => {

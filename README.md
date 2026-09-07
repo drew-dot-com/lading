@@ -152,9 +152,21 @@ Lighthouse bills Walrus on the erasure-coded size, about 63 MiB of overhead per
 blob, so a 10-byte upload and a 1 MiB upload both cost about $0.033 downstream
 (`/api/upload/price` is exact). With the 2 MiB packet cap every job lands
 between $0.032 and $0.036, hence a flat 40,000 base units on the route.
-Retention is 365 days; renewal is bound to the paying wallet, which is the
-broker's Base key. A native Walrus leg (own publisher, SUI plus WAL) would
-return the Sui blob object and certified epoch directly and is the v2 path.
+Retention is 365 days and renewal is bound to the paying wallet, which is the
+broker's Base key: Lighthouse answers 403 to any other wallet. So the broker
+is the one party that can keep a blob alive, and it sells that too. Each
+upload's receipt carries the Lighthouse record id and the paid-through instant;
+`lading renewals` lists every record in the saved manifests with its date
+(`--live` asks Lighthouse for today's, free), and `lading renew <sha256>`
+buys one more year per record through `g.drew.lading.walrus.renew` (flat
+40,000, same downstream price as the upload), quoting first on
+`g.drew.lading.walrus.renew.quote` (1,000: Lighthouse's own renew price, the
+current paid-through date, the float). The blob and its id do not change, so
+the manifest stands; the renewal is appended to the payer's saved file and to
+the broker's ledger (`LADING_DATA_DIR/walrus-ledger.jsonl`, one JSON line per
+change, `GET /walrus/ledger` for the operator's view). A native Walrus leg
+(own publisher, SUI plus WAL) would return the Sui blob object and certified
+epoch directly and is the v2 path.
 
 Filecoin Onchain Cloud is pay-per-epoch out of a USDFC deposit in Filecoin
 Pay, with one data set per copy per provider (two copies by default). The

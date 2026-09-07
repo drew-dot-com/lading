@@ -5,6 +5,9 @@
  *   POST /filecoin       kind:5320, `['i', base64, 'blob']`  → FilecoinReceipt
  *   POST /name           kind:5320, params op=name, txid, undername → NameReceipt
  *   POST /walrus/quote   kind:5320, params op=walrus, phase=quote, size → WalrusQuote
+ *   POST /walrus/renew   kind:5320, params op=walrus-renew, lighthouseId → WalrusRenewReceipt
+ *   POST /walrus/renew/quote kind:5320, params op=walrus-renew, phase=quote, lighthouseId → WalrusRenewQuote
+ *   GET  /walrus/ledger  every Lighthouse record this broker paid for, soonest expiry first (operator view)
  *   POST /filecoin/quote kind:5320, params op=filecoin, phase=quote, size → FilecoinQuote
  *   POST /name/quote     kind:5320, params op=name, phase=quote, undername, txid → NameQuote
  *   GET  /describe what this node serves, derived from what booted
@@ -26,7 +29,8 @@ import { getPublicKey, verifyEvent, type Event as NostrEvent } from 'nostr-tools
 import { LEG_KIND, MANIFEST_KIND } from './kinds.js';
 import { lighthouseUploader, sha256Hex, LIGHTHOUSE_X402, WALRUS_AGGREGATOR, type WalrusUploader } from './walrus.js';
 import { solanaNamer, undernameFor, UNDERNAME_RE, type Namer } from './arns.js';
-import { cached, decideFilecoin, decideName, decideWalrus, type FilecoinQuote, type NameQuote, type WalrusQuote } from './quote.js';
+import { cached, decideFilecoin, decideName, decideWalrus, decideWalrusRenew, type FilecoinQuote, type NameQuote, type WalrusQuote, type WalrusRenewQuote } from './quote.js';
+import { daysLeft, openLedger, type Ledger } from './ledger.js';
 import { filecoinChain, synapseUploader, runwayText, FILECOIN_MIN_BYTES, type FilecoinUploader } from './filecoin.js';
 import { createPublicClient, http as viemHttp, erc20Abi, formatUnits } from 'viem';
 import { base } from 'viem/chains';
@@ -36,7 +40,7 @@ import { createSolanaRpc, address as solAddress } from '@solana/kit';
 const PORT = Number(process.env.PORT ?? 3600);
 const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES ?? 3 * 1024 * 1024);
 const DEV_MODE = process.env.DEV_MODE === '1';
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
 /** Lamports the name key must hold before a name job is quoted deliverable: record rent (~2.81M) plus fee, with a margin for a second job in flight. */
 const NAME_NEED_LAMPORTS = BigInt(process.env.LADING_NAME_NEED_LAMPORTS ?? 6_000_000);
 /** The Base key must hold this many times the downstream price before a walrus job is quoted deliverable. */
@@ -46,6 +50,8 @@ const FILECOIN_MIN_RUNWAY_DAYS = BigInt(process.env.LADING_FILECOIN_MIN_RUNWAY_D
 const BASE_USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' as const;
 const BASE_RPC = process.env.BASE_RPC ?? 'https://mainnet.base.org';
 const FLOAT_CACHE_MS = 30_000;
+/** Where the broker keeps its ledger of Walrus records. Unset = memory only. */
+const DATA_DIR = process.env.LADING_DATA_DIR;
 
 const paramOf = (event: NostrEvent, key: string) =>
   event.tags.find((t) => t[0] === 'param' && t[1] === key)?.[2];
@@ -120,7 +126,7 @@ async function openJob(req: IncomingMessage, res: ServerResponse, op: string, ph
   return { event, meta };
 }
 
-function walrusDoor(uploader: WalrusUploader) {
+function walrusDoor(uploader: WalrusUploader, ledger: Ledger) {
   return async (req: IncomingMessage, res: ServerResponse) => {
     const job = await openJob(req, res, 'walrus');
     if (!job) return;
@@ -138,6 +144,22 @@ function walrusDoor(uploader: WalrusUploader) {
     const t0 = Date.now();
     try {
       const receipt = await uploader.upload(bytes, fileName);
+      const lighthouseId = String(receipt.proof.lighthouseId ?? '');
+      if (lighthouseId) {
+        ledger.upsert({
+          lighthouseId,
+          blobId: receipt.id,
+          cid: String(receipt.proof.cid ?? ''),
+          sha256: receipt.sha256,
+          size: receipt.size,
+          expiresAt: Number(receipt.proof.expiresAt ?? 0),
+          paidAt: receipt.at,
+          renewals: 0,
+          last: 'upload',
+          lastAt: receipt.at,
+          ...(receipt.proof.baseTx ? { baseTx: String(receipt.proof.baseTx) } : {}),
+        });
+      }
       console.log(
         `walrus ok ${bytes.length}B sha=${receipt.sha256.slice(0, 12)} blob=${receipt.id} readback=${receipt.proof.readback ?? '?'} ` +
           `payer=${meta.payer ?? '-'} amount=${meta.amount ?? '-'} chain=${meta.chain ?? '-'} ${Date.now() - t0}ms`,
@@ -192,6 +214,96 @@ function walrusQuoteDoor(uploader: WalrusUploader, float: ReturnType<typeof walr
       const msg = (e as Error).message;
       console.log(`walrus quote REJECT ${size}B ${Date.now() - t0}ms: ${msg}`);
       return refuse(res, 502, 'T00', `walrus quote failed: ${msg}`);
+    }
+  };
+}
+
+const LIGHTHOUSE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Resolve the record a renew job names: a Lighthouse record id, or a blobId the ledger knows. */
+function renewTarget(event: NostrEvent, ledger: Ledger): { lighthouseId?: string; error?: string } {
+  const id = paramOf(event, 'lighthouseId') ?? paramOf(event, 'id');
+  if (id) return LIGHTHOUSE_ID_RE.test(id) ? { lighthouseId: id } : { error: `param lighthouseId ${id} is not a Lighthouse record id` };
+  const blobId = paramOf(event, 'blobId');
+  if (blobId) {
+    const row = ledger.byBlobId(blobId);
+    return row ? { lighthouseId: row.lighthouseId } : { error: `blobId ${blobId} is not in this broker's ledger; pass the Lighthouse record id from the manifest proof` };
+  }
+  return { error: 'param lighthouseId (from the walrus leg proof) or blobId is required' };
+}
+
+function walrusRenewQuoteDoor(uploader: WalrusUploader, float: ReturnType<typeof walrusFloat>, ledger: Ledger) {
+  return async (req: IncomingMessage, res: ServerResponse) => {
+    const job = await openJob(req, res, 'walrus-renew', 'quote');
+    if (!job) return;
+    const { event, meta } = job;
+    const target = renewTarget(event, ledger);
+    if (!target.lighthouseId) return refuse(res, 422, 'F00', target.error!);
+    const lighthouseId = target.lighthouseId;
+    const t0 = Date.now();
+    try {
+      const [q, balance] = await Promise.all([uploader.renewQuote(lighthouseId), float.read()]);
+      const d = decideWalrusRenew({ found: q.found, priceUsdc: q.amountUsdc, balanceUsdc: balance, reserveMultiple: WALRUS_RESERVE_MULTIPLE });
+      const row = ledger.get(lighthouseId);
+      if (row && q.found && q.currentExpiresAt && q.currentExpiresAt !== row.expiresAt) {
+        ledger.upsert({ ...row, expiresAt: q.currentExpiresAt, last: 'refresh', lastAt: Math.floor(Date.now() / 1000) });
+      }
+      const quote: WalrusRenewQuote = {
+        op: 'walrus-renew',
+        deliverable: d.deliverable,
+        ...(d.reason ? { reason: d.reason } : {}),
+        lighthouseId,
+        ...(q.cid ? { cid: q.cid } : {}),
+        ...(row ? { blobId: row.blobId } : {}),
+        ...(q.size !== undefined ? { size: q.size } : {}),
+        ...(q.currentExpiresAt ? { currentExpiresAt: q.currentExpiresAt, daysLeft: daysLeft(q.currentExpiresAt) } : {}),
+        known: !!row,
+        downstream: { provider: 'lighthouse-x402', amountUsdc: q.amountUsdc, extends: 'P365D' },
+        float: { chain: 'base', asset: 'USDC', balance, reserve: d.reserveUsdc },
+        executeDoor: '/walrus/renew',
+        at: Math.floor(Date.now() / 1000),
+      };
+      console.log(`walrus renew quote ${lighthouseId} deliverable=${d.deliverable} known=${!!row} downstream=${q.amountUsdc} float=${balance} payer=${meta.payer ?? '-'} ${Date.now() - t0}ms${d.reason ? `: ${d.reason}` : ''}`);
+      return acceptReceipt(res, quote, meta);
+    } catch (e) {
+      const msg = (e as Error).message;
+      console.log(`walrus renew quote REJECT ${lighthouseId} ${Date.now() - t0}ms: ${msg}`);
+      return refuse(res, 502, 'T00', `walrus renew quote failed: ${msg}`);
+    }
+  };
+}
+
+function walrusRenewDoor(uploader: WalrusUploader, ledger: Ledger) {
+  return async (req: IncomingMessage, res: ServerResponse) => {
+    const job = await openJob(req, res, 'walrus-renew');
+    if (!job) return;
+    const { event, meta } = job;
+    const target = renewTarget(event, ledger);
+    if (!target.lighthouseId) return refuse(res, 422, 'F00', target.error!);
+    const lighthouseId = target.lighthouseId;
+    const t0 = Date.now();
+    try {
+      const receipt = await uploader.renew(lighthouseId);
+      const row = ledger.get(lighthouseId);
+      ledger.upsert({
+        lighthouseId,
+        blobId: receipt.blobId,
+        cid: receipt.cid,
+        sha256: row?.sha256 ?? '',
+        size: receipt.size,
+        expiresAt: receipt.expiresAt,
+        paidAt: row?.paidAt ?? receipt.at,
+        renewals: (row?.renewals ?? 0) + 1,
+        last: 'renew',
+        lastAt: receipt.at,
+        ...(receipt.proof.baseTx ? { baseTx: String(receipt.proof.baseTx) } : row?.baseTx ? { baseTx: row.baseTx } : {}),
+      });
+      console.log(`walrus renew ok ${lighthouseId} blob=${receipt.blobId} ${new Date(receipt.previousExpiresAt).toISOString().slice(0, 10)} -> ${new Date(receipt.expiresAt).toISOString().slice(0, 10)} payer=${meta.payer ?? '-'} amount=${meta.amount ?? '-'} ${Date.now() - t0}ms`);
+      return acceptReceipt(res, receipt, meta);
+    } catch (e) {
+      const msg = (e as Error).message;
+      console.log(`walrus renew REJECT ${lighthouseId} payer=${meta.payer ?? '-'} ${Date.now() - t0}ms: ${msg}`);
+      return refuse(res, 502, 'T00', `walrus renewal failed, nothing charged downstream: ${msg}`);
     }
   };
 }
@@ -339,11 +451,31 @@ async function main() {
   const describeDoors: Record<string, Record<string, unknown>> = {};
 
   const evmKey = process.env.LADING_EVM_PRIVATE_KEY as `0x${string}` | undefined;
+  let ledger: Ledger | undefined;
   if (evmKey) {
     const uploader = lighthouseUploader(evmKey);
     const float = walrusFloat(evmKey);
-    doors['/walrus'] = walrusDoor(uploader);
+    ledger = openLedger(DATA_DIR);
+    console.log(ledger.path ? `walrus ledger ${ledger.path}: ${ledger.list().length} records` : 'LADING_DATA_DIR unset: the walrus ledger is in memory only');
+    doors['/walrus'] = walrusDoor(uploader, ledger);
     doors['/walrus/quote'] = walrusQuoteDoor(uploader, float);
+    doors['/walrus/renew'] = walrusRenewDoor(uploader, ledger);
+    doors['/walrus/renew/quote'] = walrusRenewQuoteDoor(uploader, float, ledger);
+    describeDoors.walrusRenewQuote = {
+      path: '/walrus/renew/quote',
+      answers: 'WalrusRenewQuote: deliverable, current paid-through date, downstream USDC price, float',
+      input: 'params op=walrus-renew, phase=quote, lighthouseId (from the walrus leg proof) or blobId',
+      floatAddress: float.address,
+    };
+    describeDoors.walrusRenew = {
+      path: '/walrus/renew',
+      network: 'walrus',
+      provider: 'lighthouse-x402',
+      extends: 'P365D',
+      renewer: uploader.address,
+      note: 'Lighthouse lets only the paying wallet renew; that is this address for every record sold through /walrus',
+      input: 'params op=walrus-renew, lighthouseId or blobId',
+    };
     describeDoors.walrusQuote = {
       path: '/walrus/quote',
       answers: 'WalrusQuote: deliverable, downstream USDC price, float',
@@ -457,6 +589,11 @@ async function main() {
     try {
       if (req.method === 'GET' && req.url === '/health') return send(res, 200, { ok: true, doors: Object.keys(doors), devMode: DEV_MODE });
       if (req.method === 'GET' && req.url === '/describe') return send(res, 200, describe);
+      if (req.method === 'GET' && req.url === '/walrus/ledger') {
+        if (!ledger) return refuse(res, 404, 'F00', 'the walrus door is OFF');
+        const now = Date.now();
+        return send(res, 200, { records: ledger.list().map((r) => ({ ...r, daysLeft: daysLeft(r.expiresAt, now) })), path: ledger.path ?? null, at: Math.floor(now / 1000) });
+      }
       const door = req.method === 'POST' && req.url ? doors[req.url] : undefined;
       if (door) return await door(req, res);
       return refuse(res, 404, 'F00', 'not found');

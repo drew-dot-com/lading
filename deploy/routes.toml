@@ -48,3 +48,19 @@ price = 1000
 prefix = "g.drew.lading.name.quote"
 handler_url = "http://lading:3600/name/quote"
 price = 1000
+
+# Walrus renewal: one more year on a record the broker paid Lighthouse for.
+# Lighthouse lets only the paying wallet renew, and that is the broker's Base
+# key for every record sold through g.drew.lading.walrus, so the broker is the
+# one party that can. Same downstream price as an upload (billed on the
+# erasure-coded size), so the same flat 40,000. The quote door reads
+# Lighthouse's own renew price and the record's current paid-through date.
+[[routes]]
+prefix = "g.drew.lading.walrus.renew"
+handler_url = "http://lading:3600/walrus/renew"
+price = 40000
+
+[[routes]]
+prefix = "g.drew.lading.walrus.renew.quote"
+handler_url = "http://lading:3600/walrus/renew/quote"
+price = 1000

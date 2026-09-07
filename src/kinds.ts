@@ -77,3 +77,24 @@ export interface NameReceipt {
   url: string;
   at: number;
 }
+
+/**
+ * What the Walrus renew door answers with: one more storage period bought from
+ * Lighthouse for a record the broker paid for. The blob and its id do not
+ * change; only the paid-through instant moves.
+ */
+export interface WalrusRenewReceipt {
+  network: 'walrus';
+  op: 'renew';
+  lighthouseId: string;
+  blobId: string;
+  cid: string;
+  size: number;
+  previousExpiresAt: number;
+  expiresAt: number;
+  /** The period added, ISO-8601. */
+  extended: string;
+  provider: 'lighthouse-x402';
+  proof: { readUrl: string; baseTx?: string; payer?: string; [k: string]: string | number | undefined };
+  at: number;
+}
