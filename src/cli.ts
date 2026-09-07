@@ -88,7 +88,7 @@ async function client() {
     solanaSecretKey: Uint8Array.from(JSON.parse(readFileSync(keypair, 'utf8')) as number[]),
     evmPrivateKey: ('0x' + randomBytes(32).toString('hex')) as `0x${string}`,
     chain: 'solana',
-    rpcUrl: env('SOLANA_RPC', 'https://solana-rpc.publicnode.com'),
+    rpcUrl: env('SOLANA_RPC', 'https://api.mainnet-beta.solana.com'),
     transport: 'http',
     channelStore: env('LADING_CHANNEL_STORE', join(HOME, 'channel-store.json')),
     autoOpenChannel: true,
