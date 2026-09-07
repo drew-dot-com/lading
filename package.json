@@ -46,5 +46,21 @@
     "dist",
     "README.md",
     "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/drew-dot-com/lading.git"
+  },
+  "homepage": "https://github.com/drew-dot-com/lading#readme",
+  "keywords": [
+    "toon",
+    "ilp",
+    "x402",
+    "arweave",
+    "walrus",
+    "filecoin",
+    "arns",
+    "mcp",
+    "archive"
   ]
 }
