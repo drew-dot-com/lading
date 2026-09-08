@@ -19,6 +19,7 @@ runMcp({
   keyFile: env('LADING_X402_KEY_FILE') ?? defaultKeyFile(),
   autoKey: true,
   maxUsdc: env('LADING_MAX_USDC_PER_CALL') ?? '0.50',
+  callBudgetS: Number(env('LADING_CALL_BUDGET_S') ?? 45),
   baseRpc: env('LADING_BASE_RPC'),
 }).catch((e) => {
   console.error('lading extension:', (e as Error).message);

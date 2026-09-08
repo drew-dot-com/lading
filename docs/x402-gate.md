@@ -99,6 +99,17 @@ float: the org store spends about 35 ARIO per 1 MiB part
 ARIO), not refilled during. Progress files for objects never assembled should
 be swept after a week.
 
+Found while proving it (2026-09-08): a 1 MiB part takes about 110 s through
+the door (Filecoin's commit is most of it), and the MCP SDK's client times a
+tool call out at 60 s unless progress notifications arrive and the client
+resets on them. So the shim sends one part per tool call (`LADING_CALL_BUDGET_S`),
+returns `inProgress` with the gate's held/remaining lists, and emits progress
+notifications every 15 s while a part runs; Claude calls `lading_put` again
+until the last call assembles. Also seen: Lighthouse's upload path answered a
+502 page and then a 500 wrapping a 403 for a minute; the gate refused the part
+with `nothing charged downstream`, the shim reported it, and the retry went
+through. That is the per-part shape doing its job.
+
 Open for Drew: build the per-part shape as written, or change the part size at
 the door (bigger parts, fewer payments, longer requests, the 4 MB Caddy cap and
 the ~1.56 MB packet cap both bind). Proving it live costs about 0.6 USDC for a

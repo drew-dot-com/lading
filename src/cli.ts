@@ -113,7 +113,7 @@ async function mcp() {
   const { runMcp, defaultKeyFile } = await import('./mcp.js');
   // A key from the environment wins; otherwise LADING_X402_KEY_FILE (or ~/.lading/x402.key with --autokey, generated when missing).
   const keyFile = process.env.LADING_X402_KEY_FILE ?? (flag('autokey') ? defaultKeyFile() : undefined);
-  await runMcp({ gate, key: process.env.LADING_X402_KEY, keyFile, autoKey: flag('autokey'), maxUsdc: process.env.LADING_MAX_USDC_PER_CALL ?? '0.50' });
+  await runMcp({ gate, key: process.env.LADING_X402_KEY, keyFile, autoKey: flag('autokey'), maxUsdc: process.env.LADING_MAX_USDC_PER_CALL ?? '0.50', callBudgetS: Number(process.env.LADING_CALL_BUDGET_S ?? 45) });
 }
 
 const [cmd, arg] = process.argv.slice(2);

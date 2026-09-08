@@ -165,7 +165,13 @@ network that holds only some parts makes assemble answer 409 with the missing
 indexes (send those again, or `skip` that network). A slice the gate already
 bought on Arweave and Walrus is priced at the floor; `GET /v1/parts?sha=` shows
 what it holds, free, and the shim skips those. Nothing is held in escrow: every
-payment settles on its own answer. A 1 MiB part is about 0.12 USDC, the finish
+payment settles on its own answer. One tool call does a bounded amount of it:
+a part takes about two minutes and an MCP client times a tool call out (the
+SDK default is 60 s), so after `LADING_CALL_BUDGET_S` (45) of parts
+`lading_put` returns `inProgress` with what is held and what remains, and the
+next call with the same input resumes from the gate's record; the last call
+assembles. While a part runs the shim sends MCP progress notifications, which
+keep a client that resets its timeout on progress waiting. A 1 MiB part is about 0.12 USDC, the finish
 sits on the floor; 50 MB is about 50 payments, 6 USDC and an hour, and needs
 the org store's ARIO funded ahead (about 35 ARIO per part). Progress files
 never assembled are swept after `LADING_PROGRESS_MAX_AGE_DAYS` (7).

@@ -44,6 +44,8 @@ export interface McpOptions {
   autoKey?: boolean;
   /** USDC cap per paid call, decimal string. */
   maxUsdc: string;
+  /** Seconds of parts one multipart tool call sends before handing back progress (an MCP client times a tool call out; the next call resumes). */
+  callBudgetS?: number;
   /** Base RPC for balance reads (free tool), default mainnet.base.org. */
   baseRpc?: string;
 }
@@ -133,8 +135,30 @@ export async function runMcp(o: McpOptions) {
    * POST /v1/parts per slice, then one POST /v1/assemble. Every request is
    * short and every payment settles on its own answer; a slice that fails is
    * simply sent again (at the floor once its legs are in).
+   *
+   * One tool call does a bounded amount of it: an MCP client times a tool call
+   * out (the SDK's default is 60 s; a part takes about that), so after
+   * `callBudgetS` of parts the call returns progress and the next call with
+   * the same input resumes from the gate's own record of what it holds.
    */
-  async function multipartPut(bytes: Uint8Array<ArrayBuffer>, sha: string, fileName: string, contentType: string, partBytes: number): Promise<unknown> {
+  /** MCP progress for a client that asked for it (a progressToken in the call's _meta): one tick per part, and a heartbeat while a part runs, so a client that resets its timeout on progress keeps the call alive. */
+  type Extra = { _meta?: { progressToken?: string | number }; sendNotification?: (n: { method: 'notifications/progress'; params: { progressToken: string | number; progress: number; total?: number; message?: string } }) => Promise<void> };
+  function progressOf(extra: Extra | undefined) {
+    const token = extra?._meta?.progressToken;
+    const send = extra?.sendNotification;
+    if (token === undefined || !send) return { tick: async (_p: number, _t: number, _m: string) => undefined, heartbeat: (_m: () => string) => () => undefined };
+    return {
+      tick: (progress: number, total: number, message: string) => send({ method: 'notifications/progress', params: { progressToken: token, progress, total, message } }).catch(() => undefined),
+      heartbeat: (message: () => string) => {
+        let n = 0;
+        const h = setInterval(() => void send({ method: 'notifications/progress', params: { progressToken: token, progress: ++n, message: message() } }).catch(() => undefined), 15_000);
+        return () => clearInterval(h);
+      },
+    };
+  }
+
+  async function multipartPut(bytes: Uint8Array<ArrayBuffer>, sha: string, fileName: string, contentType: string, partBytes: number, extra?: Extra): Promise<unknown> {
+    const prog = progressOf(extra);
     const q = (await getJson(`/v1/quote/parts?size=${bytes.length}&part-bytes=${partBytes}&sha=${sha}`)) as {
       parts: number;
       plan: Array<{ index: number; size: number; reused: boolean; price: string }>;
@@ -147,17 +171,26 @@ export async function runMcp(o: McpOptions) {
     const slices = plan(bytes.length, partBytes);
     if (slices.length !== q.parts) throw new Error(`the door plans ${q.parts} parts, this shim ${slices.length}; part size disagreement`);
     log(`put ${fileName} ${bytes.length} B as ${q.parts} parts of ${partBytes} B: ${q.total.usdc} USDC over ${q.total.payments} payments`);
+    const budgetMs = (o.callBudgetS ?? 45) * 1000;
+    const started = Date.now();
     const sent: number[] = [];
     const skipped: number[] = [];
+    const remaining: number[] = [];
     for (const p of slices) {
       const held = (['arweave', 'walrus'] as const).every((n) => q.status?.networks[n]?.sealed || q.status?.networks[n]?.indexes.includes(p.index));
       if (held) {
         skipped.push(p.index);
         continue;
       }
+      if (sent.length > 0 && Date.now() - started > budgetMs) {
+        remaining.push(p.index);
+        continue;
+      }
       const slice = bytes.subarray(p.offset, p.offset + p.size);
       const partSha = sha256Hex(slice);
       const t0 = Date.now();
+      await prog.tick(skipped.length + sent.length, slices.length + 1, `part ${p.index + 1}/${slices.length}: sending ${slice.length} bytes`);
+      const stopBeat = prog.heartbeat(() => `part ${p.index + 1}/${slices.length}: legs running, ${Math.round((Date.now() - t0) / 1000)} s`);
       const r = (await paid('/v1/parts', {
         method: 'POST',
         headers: {
@@ -173,15 +206,34 @@ export async function runMcp(o: McpOptions) {
           'x-mime': contentType,
         },
         body: slice,
-      })) as { receipts?: Record<string, unknown>; missing?: string[]; toon?: { usdc?: string }; x402?: { transaction?: string } };
+      }).finally(stopBeat)) as { receipts?: Record<string, unknown>; missing?: string[]; toon?: { usdc?: string }; x402?: { transaction?: string } };
       sent.push(p.index);
       log(`part ${p.index + 1}/${slices.length} ${slice.length} B: ${Object.keys(r.receipts ?? {}).join('+') || 'nothing'}${r.missing?.length ? ` (missing ${r.missing.join(',')})` : ''} ${Date.now() - t0} ms`);
     }
+    if (remaining.length) {
+      const done = skipped.length + sent.length;
+      log(`put ${fileName}: ${done}/${slices.length} parts held by the gate after this call; ${remaining.length} to go`);
+      return {
+        inProgress: true,
+        sha256: sha,
+        size: bytes.length,
+        parts: slices.length,
+        partsHeld: done,
+        sentThisCall: sent,
+        alreadyHeld: skipped,
+        remaining,
+        quotedTotalUsdc: q.total.usdc,
+        next: `Call lading_put again with the same input to continue: the gate keeps every part it bought, those are skipped free, and the last call assembles the bill of lading. ${remaining.length} part(s) and the finish remain.`,
+      };
+    }
+    await prog.tick(slices.length, slices.length + 1, 'assembling: manifest, relay copy, ArNS name');
+    const stopBeat = prog.heartbeat(() => 'assembling');
     const a = await paid('/v1/assemble', {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-object-sha256': sha, 'x-part-count': String(slices.length) },
       body: JSON.stringify({ sha256: sha, size: bytes.length, partCount: slices.length, partBytes, name: fileName, mime: contentType }),
-    });
+    }).finally(stopBeat);
+    await prog.tick(slices.length + 1, slices.length + 1, 'done');
     return { ...(a as object), multipart: { parts: slices.length, partBytes, sent, skipped, quotedTotalUsdc: q.total.usdc } };
   }
 
@@ -325,7 +377,7 @@ export async function runMcp(o: McpOptions) {
         force: z.boolean().optional().describe('archive again even if the gate already holds these bytes (pays the full price)'),
       },
     },
-    async ({ path, text: body, name, mime, force }) => {
+    async ({ path, text: body, name, mime, force }, extra) => {
       try {
         const bytes = inputBytes(path, body);
         const sha = sha256Hex(bytes);
@@ -341,7 +393,7 @@ export async function runMcp(o: McpOptions) {
         const facts = await door();
         if (bytes.length > facts.maxBodyBytes) {
           if (!payFetch) throw new Error('no LADING_X402_KEY: this shim can only call the free tools (wallet, describe, quote, lookup, verify)');
-          return text(await multipartPut(bytes, sha, fileName, contentType, facts.partBytes));
+          return text(await multipartPut(bytes, sha, fileName, contentType, facts.partBytes, extra as Extra));
         }
         const { usdc } = await guard(`/v1/quote?size=${bytes.length}${force ? '' : `&sha=${sha}`}`, `archiving ${bytes.length} bytes`);
         log(`put ${fileName} ${bytes.length} B for ${usdc} USDC${force ? ' (forced)' : ''}`);
