@@ -8,7 +8,8 @@
  * something that does not speak ILP; TOON is the inside.
  *
  *   GET  /health
- *   GET  /v1/describe             what this gate sells, the payer, the prices; free
+ *   GET  /v1/describe             what this gate sells, the payer, the prices, and `health`: every float
+ *                                 behind this door judged against its low-water mark (refuel polls it); free
  *   GET  /v1/quote?size=N         the door price for an object of N bytes; free
  *   GET  /v1/manifest?sha=<hex>   the bill of lading this gate already holds for those bytes, or 404; free
  *   POST /v1/put                  octet-stream body, x-file-name, x-mime, x-sha256; x402 priced per request.
@@ -31,7 +32,11 @@ import { HTTPFacilitatorClient } from '@x402/core/server';
 import { ExactEvmScheme } from '@x402/evm/exact/server';
 import { decodePaymentSignatureHeader } from '@x402/core/http';
 import { privateKeyToAccount } from 'viem/accounts';
+import { existsSync, readFileSync } from 'node:fs';
+import { createKeyPairSignerFromBytes } from '@solana/kit';
 import { Lading, optionsFromEnv, sha256, type Estimate, type PutResult } from './lib.js';
+import { judge, lamportsToSol, microToDecimal, report, solanaHoldings, type FloatRow, type FloatsReport } from './floats.js';
+import { cached } from './quote.js';
 import { DEFAULT_PART_BYTES } from './parts.js';
 import { gatePriceMicro, gatePriceUsdc, microToUsdc, pricingFromEnv, usdcToMicro } from './gate-price.js';
 
@@ -47,6 +52,11 @@ const PAY_TO =
   (process.env.LADING_EVM_PRIVATE_KEY ? privateKeyToAccount(process.env.LADING_EVM_PRIVATE_KEY as `0x${string}`).address : undefined);
 const PUBLIC_URL = process.env.LADING_GATE_URL ?? `http://127.0.0.1:${PORT}`;
 const pricing = pricingFromEnv();
+/** The broker whose float rows this gate republishes under `health`; unset = only the gate's own payer is reported. */
+const BROKER_URL = process.env.LADING_BROKER_URL;
+/** The payer must hold a channel deposit's worth of USDC so the client can open the next channel, and enough SOL for its rent and fees. */
+const GATE_LOW_USDC = process.env.LADING_GATE_LOW_USDC ?? microToDecimal(BigInt(process.env.LADING_CHANNEL_DEPOSIT ?? '2000000'));
+const GATE_LOW_SOL = process.env.LADING_GATE_LOW_SOL ?? '0.01';
 
 if (!FREE && !PAY_TO) {
   console.error('gate: set LADING_GATE_PAYTO (Base address for revenue) or LADING_EVM_PRIVATE_KEY, or GATE_FREE=1 for a free door');
@@ -65,6 +75,77 @@ function serialize<T>(fn: () => Promise<T>): Promise<T> {
     () => undefined,
   );
   return p;
+}
+
+/** The gate's TOON payer address, once. */
+const payerAddress = (async () => {
+  const secret = lading.opts.solanaSecret ?? Uint8Array.from(JSON.parse(readFileSync(lading.opts.solanaKeypair, 'utf8')) as number[]);
+  return (await createKeyPairSignerFromBytes(secret)).address;
+})();
+
+/** The open channel as the client's store records it: headroom is what is left of the deposit before the next channel has to open. */
+function channelHeadroom(): Record<string, string | number | null> {
+  try {
+    if (!existsSync(lading.opts.channelStore)) return { channel: null };
+    const store = JSON.parse(readFileSync(lading.opts.channelStore, 'utf8')) as Record<string, { nonce: number; cumulativeAmount: string }>;
+    const [id, c] = Object.entries(store).at(-1) ?? [];
+    if (!id || !c) return { channel: null };
+    const used = BigInt(c.cumulativeAmount);
+    const deposit = lading.opts.channelDeposit;
+    return { channel: id, nonce: c.nonce, usedUnits: used.toString(), depositUnits: deposit.toString(), headroomUnits: (deposit > used ? deposit - used : 0n).toString() };
+  } catch (e) {
+    return { channel: `unreadable: ${(e as Error).message.slice(0, 80)}` };
+  }
+}
+
+/** The gate's own two floats, read together and cached: one RPC round per 30 s however often describe is hit. */
+const payerFloats = cached(30_000, async (): Promise<FloatRow[]> => {
+  const owner = await payerAddress;
+  const h = await solanaHoldings(lading.opts.solanaRpc, owner);
+  return [
+    judge({
+      name: 'gate-payer-usdc',
+      role: 'the gate\'s TOON payer: USDC locked as each channel deposit, spent per leg as off-chain claims',
+      chain: 'solana',
+      asset: 'USDC',
+      address: owner,
+      balance: microToDecimal(h.usdcMicro),
+      low: GATE_LOW_USDC,
+      fund: `Send USDC (SPL) on Solana to ${owner}.`,
+      extra: channelHeadroom(),
+    }),
+    judge({
+      name: 'gate-payer-sol',
+      role: 'rent and fees for the gate payer\'s channel opens and settlements',
+      chain: 'solana',
+      asset: 'SOL',
+      address: owner,
+      balance: lamportsToSol(h.lamports),
+      low: GATE_LOW_SOL,
+      fund: `Send SOL to ${owner}.`,
+    }),
+  ];
+});
+
+/** The broker's rows, fetched fresh: it caches its own reads. Unreachable = one row that is not ok. */
+async function brokerFloats(): Promise<FloatRow[]> {
+  if (!BROKER_URL) return [];
+  try {
+    const r = await fetch(`${BROKER_URL.replace(/\/+$/, '')}/floats`, { signal: AbortSignal.timeout(20_000) });
+    if (!r.ok) throw new Error(`broker answered ${r.status}`);
+    return ((await r.json()) as FloatsReport).floats;
+  } catch (e) {
+    return [{ name: 'broker', role: 'the broker behind this gate (walrus, filecoin, name doors)', chain: '?', asset: '?', address: BROKER_URL, balance: '?', low: '?', ok: false, fund: `broker unreachable: ${(e as Error).message.slice(0, 120)}` }];
+  }
+}
+
+/** Every float behind this door. */
+async function health(): Promise<FloatsReport> {
+  const [mine, theirs] = await Promise.all([
+    payerFloats().catch((e: Error) => [{ name: 'gate-payer', role: 'the gate\'s TOON payer', chain: 'solana', asset: '?', address: '?', balance: '?', low: '?', ok: false, fund: `read failed: ${e.message.slice(0, 120)}` }] as FloatRow[]),
+    brokerFloats(),
+  ]);
+  return report([...mine, ...theirs]);
 }
 
 const partBytesOf = (raw: unknown) => {
@@ -221,13 +302,23 @@ if (!FREE) {
   );
 }
 
-app.get('/health', (_req, res) => {
-  res.json({ ok: true, version: VERSION, free: FREE, edge: lading.opts.edge, network: NETWORK, payTo: PAY_TO ?? null, facilitator: FREE ? null : FACILITATOR });
+app.get('/health', async (_req, res) => {
+  const h = await health().catch(() => undefined);
+  res.json({ ok: true, version: VERSION, free: FREE, edge: lading.opts.edge, network: NETWORK, payTo: PAY_TO ?? null, facilitator: FREE ? null : FACILITATOR, floats: h ? { ok: h.ok, low: h.low } : null });
+});
+
+/** The float rows alone, for anything that polls: the same object `describe` carries under `health`. */
+app.get('/v1/floats', async (_req, res, next) => {
+  try {
+    res.json(await health());
+  } catch (e) {
+    next(e);
+  }
 });
 
 app.get('/v1/describe', async (_req, res, next) => {
   try {
-    const routes = await lading.describe();
+    const [routes, h] = await Promise.all([lading.describe(), health()]);
     res.json({
       service: 'lading',
       version: VERSION,
@@ -235,10 +326,11 @@ app.get('/v1/describe', async (_req, res, next) => {
       door: { url: PUBLIC_URL, network: NETWORK, payTo: PAY_TO ?? null, facilitator: FREE ? null : FACILITATOR, free: FREE, margin: pricing.margin, floorUsdc: pricing.floorUsdc, maxBodyBytes: MAX_BODY_BYTES },
       edge: lading.opts.edge,
       read: { arns: lading.opts.gateway, arnsFallback: lading.arnsGateways(), txid: lading.readGateways() },
-      payer: { nostrPubkey: lading.payerPubkey() },
+      payer: { nostrPubkey: lading.payerPubkey(), solana: await payerAddress },
+      health: h,
       routes: routes.map((r) => ({ key: r.key, route: r.route, units: r.price?.toString() ?? null })),
       install: `claude mcp add lading -e LADING_X402_KEY=0x… -- npx -y lading mcp --gate ${PUBLIC_URL}`,
-      endpoints: ['GET /v1/quote?size=N[&sha=]', 'GET /v1/manifest?sha=', 'POST /v1/put', 'GET /v1/renew/quote?id=', 'POST /v1/renew', 'GET /v1/verify?ref='],
+      endpoints: ['GET /v1/quote?size=N[&sha=]', 'GET /v1/manifest?sha=', 'POST /v1/put', 'GET /v1/renew/quote?id=', 'POST /v1/renew', 'GET /v1/verify?ref=', 'GET /v1/floats'],
       idempotent: 'POST /v1/put with x-sha256 set to a hash this gate already archived answers from the saved bill of lading at the floor price and buys no leg; GET /v1/manifest?sha= reads it free.',
     });
   } catch (e) {

@@ -54,6 +54,7 @@ services:
       LADING_CHANNEL_DEPOSIT: ${LADING_GATE_CHANNEL_DEPOSIT:-2000000}
       LADING_NOSTR_KEY: ${LADING_GATE_NOSTR_KEY:-}             # hex; unset = generated once under /data/gate
       LADING_HOME: /data/gate                                  # channel store, saved manifests, progress files, nostr key
+      LADING_BROKER_URL: http://lading:3600                    # its float rows ride along under health in /v1/describe (refuel polls that)
       LADING_ARNS_GATEWAY: ${LADING_ARNS_GATEWAY:-permagate.io}
       LADING_READ_GATEWAYS: ${LADING_READ_GATEWAYS:-permagate.io,arweave.net,ardrive.net}
       LADING_ARNS_GATEWAYS: ${LADING_ARNS_GATEWAYS:-ardrive.net,vilenarios.com}

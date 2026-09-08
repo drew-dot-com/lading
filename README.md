@@ -49,7 +49,8 @@ already paid, which is what the margin is for. The manifest a gate put
 produces is signed by the gate's key and records `via: {door: 'x402', payer}`.
 Doors: `GET /v1/describe`, `GET /v1/quote?size=N[&sha=]`,
 `GET /v1/manifest?sha=`, `POST /v1/put`, `GET /v1/renew/quote?id=`,
-`POST /v1/renew`, `GET /v1/verify?ref=`. Design notes: `docs/x402-gate.md`.
+`POST /v1/renew`, `GET /v1/verify?ref=`, `GET /v1/floats`. Design notes:
+`docs/x402-gate.md`.
 
 
 ## Claude Desktop extension
@@ -148,6 +149,21 @@ compares sha256. `lading describe` prints route prices.
 The manifest is a Nostr event, so a relay query for kind 30320 by `#d` finds
 every attestation for a given object hash across payers.
 
+## Floats and alarms
+
+Every hot key behind a put is judged in one place. The broker answers
+`GET /floats` (internal) with a row per key: the Walrus float (USDC on Base,
+low under `LADING_WALRUS_LOW_USDC`, default 1), the Filecoin Pay runway
+(USDFC, not ok under `LADING_FILECOIN_LOW_RUNWAY_DAYS` days, default 30, or
+under `LADING_FILECOIN_LOW_FIL` of gas), and the name key (SOL, low under
+`LADING_NAME_LOW_SOL`, default 0.008). The gate adds its own TOON payer (USDC
+on Solana, low under one channel deposit; SOL under `LADING_GATE_LOW_SOL`) with
+the open channel's headroom, and publishes the whole list as `health` in
+`GET /v1/describe` and alone at `GET /v1/floats`; `/health` on both carries
+`floats: {ok, low}`. Each row says what to send where. Nothing here alerts:
+refuel (the operator's top-up timer) polls `/v1/floats` every half hour, fills
+the rows its treasuries can fill, and pushes the rest to the phone.
+
 ## Large objects: parts
 
 The connector caps one ILP packet at 2 MiB, and a blob rides inside the
@@ -193,6 +209,7 @@ src/filecoin-fund.ts  operator tool: deposit USDFC and approve warm storage, onc
 src/quote.ts     the pure deliverability decisions behind the quote doors
 src/arns.ts      ANT undername write, owner or controller
 src/manifest.ts  build and verify the kind 30320 bill of lading
+src/floats.ts    float rows: each hot key judged against its low-water mark; GET /floats on the broker, health in the gate's describe
 src/cli.ts       the paying client that composes the legs
 deploy/routes.toml   the [[routes]] rows for the edge connector
 ```

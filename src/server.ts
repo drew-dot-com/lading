@@ -11,6 +11,7 @@
  *   POST /filecoin/quote kind:5320, params op=filecoin, phase=quote, size → FilecoinQuote
  *   POST /name/quote     kind:5320, params op=name, phase=quote, undername, txid → NameQuote
  *   GET  /describe what this node serves, derived from what booted
+ *   GET  /floats   every hot key this broker spends from, judged against its low-water mark
  *   GET  /health
  *
  * Payment is the connector's business: by the time a request lands here the
@@ -41,6 +42,12 @@ const PORT = Number(process.env.PORT ?? 3600);
 const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES ?? 3 * 1024 * 1024);
 const DEV_MODE = process.env.DEV_MODE === '1';
 import { VERSION } from './version.js';
+import { judge, lamportsToSol, report, type FloatRow } from './floats.js';
+/** Under these the float rows at GET /floats read not ok: refuel's low-water marks, so the alarm and the refill agree. */
+const WALRUS_LOW_USDC = process.env.LADING_WALRUS_LOW_USDC ?? '1';
+const FILECOIN_LOW_RUNWAY_DAYS = process.env.LADING_FILECOIN_LOW_RUNWAY_DAYS ?? '30';
+const FILECOIN_LOW_FIL = process.env.LADING_FILECOIN_LOW_FIL ?? '0.02';
+const NAME_LOW_SOL = process.env.LADING_NAME_LOW_SOL ?? '0.008';
 /** Lamports the name key must hold before a name job is quoted deliverable: record rent (~2.81M) plus fee, with a margin for a second job in flight. */
 const NAME_NEED_LAMPORTS = BigInt(process.env.LADING_NAME_NEED_LAMPORTS ?? 6_000_000);
 /** The Base key must hold this many times the downstream price before a walrus job is quoted deliverable. */
@@ -449,6 +456,8 @@ function loadSolanaSecret(): Uint8Array | undefined {
 async function main() {
   const doors: Record<string, (req: IncomingMessage, res: ServerResponse) => Promise<unknown>> = {};
   const describeDoors: Record<string, Record<string, unknown>> = {};
+  /** One reader per hot key, run together for GET /floats. A reader that throws becomes a row that is not ok, never a missing row. */
+  const floatReaders: Array<() => Promise<FloatRow>> = [];
 
   const evmKey = process.env.LADING_EVM_PRIVATE_KEY as `0x${string}` | undefined;
   let ledger: Ledger | undefined;
@@ -458,6 +467,18 @@ async function main() {
     ledger = openLedger(DATA_DIR);
     console.log(ledger.path ? `walrus ledger ${ledger.path}: ${ledger.list().length} records` : 'LADING_DATA_DIR unset: the walrus ledger is in memory only');
     doors['/walrus'] = walrusDoor(uploader, ledger);
+    floatReaders.push(async () =>
+      judge({
+        name: 'walrus-float',
+        role: 'pays Lighthouse x402 per Walrus upload and renewal (~0.033 USDC each)',
+        chain: 'base',
+        asset: 'USDC',
+        address: float.address,
+        balance: await float.read(),
+        low: WALRUS_LOW_USDC,
+        fund: `Send USDC on Base to ${float.address}.`,
+      }),
+    );
     doors['/walrus/quote'] = walrusQuoteDoor(uploader, float);
     doors['/walrus/renew'] = walrusRenewDoor(uploader, ledger);
     doors['/walrus/renew/quote'] = walrusRenewQuoteDoor(uploader, float, ledger);
@@ -504,6 +525,25 @@ async function main() {
     // One conservative answer (priced at the packet cap) per FLOAT_CACHE_MS, however many quotes arrive.
     const info = cached(FLOAT_CACHE_MS, () => uploader.quote(MAX_BODY_BYTES));
     doors['/filecoin'] = filecoinDoor(uploader);
+    floatReaders.push(async () => {
+      const q = await info();
+      const runway = runwayText(q.runwayDays);
+      // Runway is the float: USDFC sits in Filecoin Pay and drains per epoch. FIL is only the gas for the next deposit tx.
+      const days = judge({
+        name: 'filecoin-runway',
+        role: `Filecoin Pay runway for every piece this broker stores (${copies} copies, ${q.ratePerMonthUsdfc} USDFC/month at the packet cap)`,
+        chain: `filecoin:${chain.id}`,
+        asset: 'USDFC',
+        address: uploader.address,
+        balance: q.availableUsdfc,
+        low: '0',
+        fund: `Send USDFC on Filecoin to ${uploader.address}, then run npm run fund:filecoin -- --yes on the box to deposit it into Filecoin Pay.`,
+        extra: { runwayDays: runway, lowRunwayDays: FILECOIN_LOW_RUNWAY_DAYS, fil: q.filBalance, lowFil: FILECOIN_LOW_FIL, depositNeededUsdfc: q.depositNeededUsdfc },
+      });
+      const runwayOk = runway === 'unbounded' || Number(runway) >= Number(FILECOIN_LOW_RUNWAY_DAYS);
+      const filOk = Number(q.filBalance) >= Number(FILECOIN_LOW_FIL);
+      return { ...days, ok: days.ok && runwayOk && filOk && q.ready };
+    });
     doors['/filecoin/quote'] = filecoinQuoteDoor(uploader, info);
     describeDoors.filecoinQuote = {
       path: '/filecoin/quote',
@@ -542,6 +582,19 @@ async function main() {
     const rpc = createSolanaRpc(rpcUrl);
     const lamports = cached(FLOAT_CACHE_MS, async () => BigInt((await rpc.getBalance(solAddress(namer.signerAddress)).send()).value));
     doors['/name'] = nameDoor(namer);
+    floatReaders.push(async () =>
+      judge({
+        name: 'name-key',
+        role: 'ANT controller on Solana; each new undername costs ~0.0028 SOL of record rent',
+        chain: 'solana',
+        asset: 'SOL',
+        address: namer.signerAddress,
+        balance: lamportsToSol(await lamports()),
+        low: NAME_LOW_SOL,
+        fund: `Send SOL to ${namer.signerAddress}.`,
+        extra: { needLamports: NAME_NEED_LAMPORTS.toString() },
+      }),
+    );
     doors['/name/quote'] = nameQuoteDoor(namer, lamports);
     describeDoors.nameQuote = {
       path: '/name/quote',
@@ -585,9 +638,23 @@ async function main() {
     },
   };
 
+  /** Every reader at once; a failed read is a row that is not ok, so an RPC outage shows up as an alarm and not as silence. */
+  async function floats() {
+    const rows = await Promise.all(
+      floatReaders.map((r) =>
+        r().catch((e: Error) => ({ name: 'unreadable', role: 'a float read failed', chain: '?', asset: '?', address: '?', balance: '?', low: '?', ok: false, fund: `read failed: ${e.message.slice(0, 120)}` }) as FloatRow),
+      ),
+    );
+    return report(rows);
+  }
+
   const server = createServer(async (req, res) => {
     try {
-      if (req.method === 'GET' && req.url === '/health') return send(res, 200, { ok: true, doors: Object.keys(doors), devMode: DEV_MODE });
+      if (req.method === 'GET' && req.url === '/health') {
+        const f = await floats().catch(() => undefined);
+        return send(res, 200, { ok: true, version: VERSION, doors: Object.keys(doors), devMode: DEV_MODE, floats: f ? { ok: f.ok, low: f.low } : null });
+      }
+      if (req.method === 'GET' && req.url === '/floats') return send(res, 200, await floats());
       if (req.method === 'GET' && req.url === '/describe') return send(res, 200, describe);
       if (req.method === 'GET' && req.url === '/walrus/ledger') {
         if (!ledger) return refuse(res, 404, 'F00', 'the walrus door is OFF');
