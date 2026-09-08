@@ -26,11 +26,20 @@ once per tool call. Behind the door every hop is ILP through the TOON edge.
 claude mcp add lading -e LADING_X402_KEY=0x… -- npx -y lading mcp --gate https://lading.167-233-221-236.sslip.io
 ```
 
-Tools: `lading_describe`, `lading_quote` (free), `lading_put` (paid: file
-path or text, returns every network receipt, the manifest URL and the ArNS
-name), `lading_verify` (free), `lading_renew` (paid). Every paid call asks the
-gate's free quote first and refuses over `LADING_MAX_USDC_PER_CALL` (default
-0.50 USDC). A 1 MiB put is about 0.15 USDC; a small one about 0.10.
+Tools: `lading_wallet`, `lading_describe`, `lading_quote`, `lading_lookup`
+(free), `lading_put` (paid: file path or text, returns every network receipt,
+the manifest URL and the ArNS name), `lading_verify` (free), `lading_renew`
+(paid). Every paid call asks the gate's free quote first and refuses over
+`LADING_MAX_USDC_PER_CALL` (default 0.50 USDC). A 1 MiB put is about 0.15
+USDC; a small one about 0.10.
+
+A put is idempotent. `lading_put` hashes the bytes and asks the gate's free
+`GET /v1/manifest?sha=` first; bytes the gate already archived come back as the
+existing bill of lading with `reused: true` and nothing is paid (`force: true`
+archives again at the full price). On the wire the shim declares `x-sha256`,
+so a hash the gate already holds is priced at the floor and answered from the
+saved record with no leg bought; a paid put that does not declare its hash and
+lands on known bytes gets a 409 with the record and is not settled.
 
 The gate (`src/gate.ts`) prices a put on its `content-length`: the TOON bill
 for that size from the edge's route prices, times a margin (1.2), never under
@@ -38,9 +47,9 @@ a floor (0.05 USDC). Settlement runs only after the put answered 2xx, so a
 failed put is not charged to the caller; the gate carries the route prices it
 already paid, which is what the margin is for. The manifest a gate put
 produces is signed by the gate's key and records `via: {door: 'x402', payer}`.
-Doors: `GET /v1/describe`, `GET /v1/quote?size=N`, `POST /v1/put`,
-`GET /v1/renew/quote?id=`, `POST /v1/renew`, `GET /v1/verify?ref=`. Design
-notes: `docs/x402-gate.md`.
+Doors: `GET /v1/describe`, `GET /v1/quote?size=N[&sha=]`,
+`GET /v1/manifest?sha=`, `POST /v1/put`, `GET /v1/renew/quote?id=`,
+`POST /v1/renew`, `GET /v1/verify?ref=`. Design notes: `docs/x402-gate.md`.
 
 
 ## Claude Desktop extension
@@ -126,6 +135,10 @@ not deliverable skips that leg and carries on; the manifest then simply lists
 fewer legs. The local record is written as soon as the
 manifest is on Arweave, so a failed name leg is resumable with
 `lading name <sha256>` without re-uploading anything.
+
+The same bytes put twice from the same home buy nothing the second time:
+`put` finds the saved manifest for that sha256 and returns it (`reused`),
+buying only a name leg that is still owed; `--force` archives again.
 
 `lading quote <file>` prints the whole bill before paying it (route prices from
 the edge plus the three quotes; costs the three quotes). `lading verify <arns-name |

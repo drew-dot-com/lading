@@ -148,6 +148,8 @@ export interface PutOptions {
   skip?: Partial<Record<'arweave' | 'walrus' | 'filecoin' | 'relay' | 'name', boolean>>;
   /** Recorded on the manifest when the put came through a door other than the CLI. */
   via?: ManifestContent['via'];
+  /** Archive again even when this home already holds a manifest for the same bytes (default false: the saved record is returned, nothing re-bought). */
+  force?: boolean;
 }
 
 export interface PutResult {
@@ -164,6 +166,10 @@ export interface PutResult {
   total: bigint;
   savedPath: string;
   manifestUrl?: string;
+  /** True when no leg ran: a manifest for these bytes was already saved under `home` and is what this result carries. */
+  reused?: boolean;
+  /** Unix seconds the manifest was signed. */
+  archivedAt: number;
 }
 
 export interface QuoteRow {
@@ -311,6 +317,47 @@ export class Lading {
       .filter((f) => /^[0-9a-f]{64}\.json$/.test(f))
       .map((f) => ({ path: join(dir, f), sha: f.slice(0, 64), saved: JSON.parse(readFileSync(join(dir, f), 'utf8')) as SavedPut }))
       .sort((a, b) => a.saved.manifest.created_at - b.saved.manifest.created_at);
+  }
+
+  /** The saved put for one object hash, when this home holds one. */
+  savedPut(sha: string): { path: string; saved: SavedPut } | undefined {
+    if (!/^[0-9a-f]{64}$/.test(sha)) return undefined;
+    const p = this.manifestPath(sha);
+    if (!existsSync(p)) return undefined;
+    return { path: p, saved: JSON.parse(readFileSync(p, 'utf8')) as SavedPut };
+  }
+
+  /**
+   * A saved put read back as a PutResult. Only a put whose manifest reached
+   * Arweave counts: a record without `manifestTxId` is a put that died before
+   * its manifest and is resumed through the progress file, not reused.
+   */
+  archived(sha: string): PutResult | undefined {
+    const hit = this.savedPut(sha);
+    if (!hit?.saved.manifestTxId) return undefined;
+    const { saved, path } = hit;
+    const content = parseManifest(saved.manifest);
+    const paid: PaidRow[] = (saved.paid as Array<{ leg: string; route: string; price: string | null | undefined }>).map((p) => ({
+      leg: p.leg,
+      route: p.route,
+      price: p.price === null || p.price === undefined ? null : BigInt(p.price),
+    }));
+    return {
+      sha256: sha,
+      size: content.size,
+      parts: Math.max(1, ...content.legs.map((l) => l.parts?.length ?? 1)),
+      payerPubkey: saved.manifest.pubkey,
+      legs: content.legs,
+      manifest: saved.manifest,
+      manifestTxId: saved.manifestTxId,
+      name: saved.name as NameReceipt | undefined,
+      paid,
+      total: paid.reduce((a, p) => a + (p.price ?? 0n), 0n),
+      savedPath: path,
+      manifestUrl: `https://${this.opts.gateway}/${saved.manifestTxId}`,
+      reused: true,
+      archivedAt: saved.manifest.created_at,
+    };
   }
 
   // ---- pricing ----
@@ -523,6 +570,17 @@ export class Lading {
     const sk = this.nostrSecret();
     const payerPubkey = getPublicKey(sk);
     this.log(`${name}: ${bytes.length} bytes, sha256 ${sha}${n > 1 ? `, ${n} parts of up to ${Math.max(...parts.map((q) => q.size))} bytes` : ''}\npayer nostr pubkey ${payerPubkey}\nedge ${this.opts.edge}`);
+    // Same bytes, same home: the bill of lading already exists, so hand it back
+    // rather than buying every leg again. A saved put that never got its name
+    // gets the name leg now, which is the one thing still owed.
+    if (!po.force) {
+      const prior = this.archived(sha);
+      if (prior) {
+        this.log(`already archived ${fmtDate(prior.archivedAt * 1000)}: manifest ${prior.manifestTxId}${prior.name ? `, named ${prior.name.name}` : ', not yet named'}; nothing re-bought (force to archive again)`);
+        if (!prior.name && !skip.name) await this.nameOnly(sha, { undername: po.undername, quote: doQuote, skipRelay: skip.relay });
+        return this.archived(sha)!;
+      }
+    }
     const c = await this.client();
     const legs: LegReceipt[] = [];
     const paid: PaidRow[] = [];
@@ -693,6 +751,7 @@ export class Lading {
       total,
       savedPath,
       manifestUrl: manifestTxId ? `https://${this.opts.gateway}/${manifestTxId}` : undefined,
+      archivedAt: manifest.created_at,
     };
   }
 

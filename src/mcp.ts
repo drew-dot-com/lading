@@ -15,6 +15,7 @@
  * stdout belongs to the MCP transport; every log line here goes to stderr.
  */
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -26,8 +27,10 @@ import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { createPublicClient, erc20Abi, formatUnits, http } from 'viem';
 import { base } from 'viem/chains';
 import { usdcToMicro } from './gate-price.js';
+import { VERSION } from './version.js';
 
-export const MCP_VERSION = process.env.LADING_BUNDLED_VERSION ?? '0.7.0';
+/** The bundle bakes its version in at build time (no package.json beside it); the CLI reads package.json. */
+export const MCP_VERSION = process.env.LADING_BUNDLED_VERSION ?? VERSION;
 /** USDC on Base mainnet, 6 decimals. */
 export const BASE_USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' as const;
 
@@ -64,6 +67,7 @@ export function resolveKey(o: Pick<McpOptions, 'key' | 'keyFile' | 'autoKey'>, l
 
 export const defaultKeyFile = () => join(process.env.LADING_HOME ?? join(homedir(), '.lading'), 'x402.key');
 
+const sha256Hex = (b: Uint8Array) => createHash('sha256').update(b).digest('hex');
 const text = (v: unknown) => ({ content: [{ type: 'text' as const, text: typeof v === 'string' ? v : JSON.stringify(v, null, 2) }] });
 const fail = (msg: string) => ({ content: [{ type: 'text' as const, text: msg }], isError: true as const });
 
@@ -101,6 +105,23 @@ export async function runMcp(o: McpOptions) {
     return body;
   }
 
+  /** The bill of lading the gate already holds for these bytes, or undefined. Free. */
+  async function archived(sha: string): Promise<Record<string, unknown> | undefined> {
+    const r = await fetch(`${gate}/v1/manifest?sha=${sha}`);
+    if (r.status === 404) return undefined;
+    const body = (await r.json().catch(() => ({ error: `gate answered ${r.status} with no JSON` }))) as Record<string, unknown>;
+    if (!r.ok) throw new Error(`gate ${r.status}: ${String(body.error ?? JSON.stringify(body))}`);
+    return body;
+  }
+
+  /** The bytes a tool was handed: a file, or a text string. */
+  function inputBytes(path: string | undefined, body: string | undefined): Uint8Array<ArrayBuffer> {
+    if (!path && body === undefined) throw new Error('give path or text');
+    const bytes = path ? new Uint8Array(readFileSync(resolve(path))) : new TextEncoder().encode(body!);
+    if (bytes.length === 0) throw new Error('nothing to archive: empty input');
+    return bytes;
+  }
+
   /** The gate's free quote, checked against the cap, before any paid call. */
   async function guard(quotePath: string, what: string): Promise<{ usdc: string }> {
     const q = (await getJson(quotePath)) as { price?: { usdc?: string } };
@@ -111,7 +132,7 @@ export async function runMcp(o: McpOptions) {
   }
 
   async function paid(path: string, init: RequestInit): Promise<unknown> {
-    if (!payFetch) throw new Error('no LADING_X402_KEY: this shim can only call the free tools (describe, quote, verify)');
+    if (!payFetch) throw new Error('no LADING_X402_KEY: this shim can only call the free tools (wallet, describe, quote, lookup, verify)');
     const r = await payFetch(`${gate}${path}`, init);
     const body = (await r.json().catch(() => ({ error: `gate answered ${r.status} with no JSON` }))) as Record<string, unknown>;
     if (r.status === 402) {
@@ -168,14 +189,37 @@ export async function runMcp(o: McpOptions) {
     'lading_quote',
     {
       title: 'Quote a Lading put',
-      description: 'Free. The USDC price this door charges to archive an object of the given size (or the file at path), with the underlying TOON bill per leg.',
-      inputSchema: { size: z.number().int().positive().optional().describe('object size in bytes'), path: z.string().optional().describe('local file to size instead') },
+      description: 'Free. The USDC price this door charges to archive an object of the given size (or the file at path), with the underlying TOON bill per leg. With a path the file is hashed too, so a file the gate already archived quotes at the floor with reused: true.',
+      inputSchema: { size: z.number().int().positive().optional().describe('object size in bytes'), path: z.string().optional().describe('local file to size and hash instead') },
     },
     async ({ size, path }) => {
       try {
         const n = path ? statSync(resolve(path)).size : size;
         if (!n) return fail('give size or path');
-        return text(await getJson(`/v1/quote?size=${n}`));
+        const sha = path ? `&sha=${sha256Hex(new Uint8Array(readFileSync(resolve(path))))}` : '';
+        return text(await getJson(`/v1/quote?size=${n}${sha}`));
+      } catch (e) {
+        return fail((e as Error).message);
+      }
+    },
+  );
+
+  server.registerTool(
+    'lading_lookup',
+    {
+      title: 'Is this already archived?',
+      description: 'Free. Whether the gate already holds a bill of lading for a file (path), a text string, or a sha256. Returns the existing record (receipts, manifest URL, ArNS name) or says it is not archived. lading_put runs this first and pays nothing for bytes the gate already archived.',
+      inputSchema: {
+        path: z.string().optional().describe('local file to hash'),
+        text: z.string().optional().describe('text to hash instead of a file'),
+        sha256: z.string().regex(/^[0-9a-fA-F]{64}$/).optional().describe('the object hash directly'),
+      },
+    },
+    async ({ path, text: body, sha256: sha }) => {
+      try {
+        const hash = sha ? sha.toLowerCase() : sha256Hex(inputBytes(path, body));
+        const hit = await archived(hash);
+        return text(hit ? { archived: true, ...hit } : { archived: false, sha256: hash, note: 'not archived by this gate; lading_put would archive it' });
       } catch (e) {
         return fail((e as Error).message);
       }
@@ -187,26 +231,40 @@ export async function runMcp(o: McpOptions) {
     {
       title: 'Archive with Lading',
       description:
-        'PAID (USDC on Base, quoted first, refused over the cap). Archives a local file (path) or a text string onto Arweave, Walrus and Filecoin through the TOON mesh, writes a signed bill of lading to Arweave and names it on ArNS. Returns every network receipt, the manifest URL and the ArNS name.',
+        'PAID (USDC on Base, quoted first, refused over the cap). Archives a local file (path) or a text string onto Arweave, Walrus and Filecoin through the TOON mesh, writes a signed bill of lading to Arweave and names it on ArNS. Returns every network receipt, the manifest URL and the ArNS name. Idempotent: bytes the gate already archived come back from the existing record and nothing is paid, unless force is true.',
       inputSchema: {
         path: z.string().optional().describe('local file to archive'),
         text: z.string().optional().describe('text to archive instead of a file'),
         name: z.string().optional().describe('file name to record (default: basename of path, or text.txt)'),
         mime: z.string().optional().describe('content type (default from the name, or text/plain for text)'),
+        force: z.boolean().optional().describe('archive again even if the gate already holds these bytes (pays the full price)'),
       },
     },
-    async ({ path, text: body, name, mime }) => {
+    async ({ path, text: body, name, mime, force }) => {
       try {
-        if (!path && body === undefined) return fail('give path or text');
-        const bytes = path ? new Uint8Array(readFileSync(resolve(path))) : new TextEncoder().encode(body!);
-        if (bytes.length === 0) return fail('nothing to archive: empty input');
+        const bytes = inputBytes(path, body);
+        const sha = sha256Hex(bytes);
         const fileName = name ?? (path ? basename(path) : 'text.txt');
         const contentType = mime ?? (path ? 'application/octet-stream' : 'text/plain; charset=utf-8');
-        const { usdc } = await guard(`/v1/quote?size=${bytes.length}`, `archiving ${bytes.length} bytes`);
-        log(`put ${fileName} ${bytes.length} B for ${usdc} USDC`);
+        if (!force) {
+          const hit = await archived(sha);
+          if (hit) {
+            log(`put ${fileName} ${bytes.length} B already archived as ${String(hit.manifestTxId)}; nothing paid`);
+            return text({ ...hit, reused: true, paidThisCall: '0 USDC: the gate already held a bill of lading for these bytes (pass force to archive again)' });
+          }
+        }
+        const { usdc } = await guard(`/v1/quote?size=${bytes.length}${force ? '' : `&sha=${sha}`}`, `archiving ${bytes.length} bytes`);
+        log(`put ${fileName} ${bytes.length} B for ${usdc} USDC${force ? ' (forced)' : ''}`);
         const r = await paid('/v1/put', {
           method: 'POST',
-          headers: { 'content-type': contentType, 'x-file-name': encodeURIComponent(fileName), 'x-mime': contentType, 'content-length': String(bytes.length) },
+          headers: {
+            'content-type': contentType,
+            'x-file-name': encodeURIComponent(fileName),
+            'x-mime': contentType,
+            'content-length': String(bytes.length),
+            // Declared so the door can answer a hash it already holds at the floor instead of buying every leg again.
+            ...(force ? {} : { 'x-sha256': sha }),
+          },
           body: bytes,
         });
         return text(r);

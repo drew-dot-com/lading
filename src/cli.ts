@@ -55,9 +55,10 @@ async function put(file: string) {
     undername: opt('undername'),
     partBytes: partBytes(),
     quote: !flag('no-quote'),
+    force: flag('force'),
     skip: { arweave: flag('skip-arweave'), walrus: flag('skip-walrus'), filecoin: flag('skip-filecoin'), relay: flag('skip-relay'), name: flag('skip-name') },
   });
-  console.log('\nBILL OF LADING');
+  console.log(r.reused ? `\nBILL OF LADING (already archived ${new Date(r.archivedAt * 1000).toISOString().slice(0, 10)}, nothing bought; --force archives again)` : '\nBILL OF LADING');
   for (const l of r.legs) console.log(`  ${l.network.padEnd(8)} ${l.id}  ${l.retention}${l.parts ? `  (${l.parts.length} parts)` : ''}`);
   if (r.manifestUrl) console.log(`  manifest ${r.manifestUrl}`);
   if (r.name) console.log(`  name     ${r.name.url}`);
@@ -128,7 +129,7 @@ const run =
   : null;
 if (!run) {
   console.log(
-    'usage: lading put <file> [--name n] [--mime m] [--undername u] [--part-bytes n] [--no-quote] [--skip-arweave|--skip-walrus|--skip-filecoin|--skip-relay|--skip-name]\n' +
+    'usage: lading put <file> [--name n] [--mime m] [--undername u] [--part-bytes n] [--no-quote] [--force] [--skip-arweave|--skip-walrus|--skip-filecoin|--skip-relay|--skip-name]\n' +
       '       lading quote <file> [--part-bytes n]\n' +
       '       lading verify <arns-name|manifest-txid|saved.json>\n' +
       '       lading name <sha256> [--no-quote]\n' +

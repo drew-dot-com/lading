@@ -10,7 +10,10 @@
  *   GET  /health
  *   GET  /v1/describe             what this gate sells, the payer, the prices; free
  *   GET  /v1/quote?size=N         the door price for an object of N bytes; free
- *   POST /v1/put                  octet-stream body, x-file-name, x-mime; x402 priced per request
+ *   GET  /v1/manifest?sha=<hex>   the bill of lading this gate already holds for those bytes, or 404; free
+ *   POST /v1/put                  octet-stream body, x-file-name, x-mime, x-sha256; x402 priced per request.
+ *                                 A declared sha this gate already archived is answered from the saved
+ *                                 record at the floor price, no leg re-bought (idempotent put).
  *   GET  /v1/renew/quote?id=      the door price for one more year on a Lighthouse record; free
  *   POST /v1/renew                JSON {lighthouseId}; x402, flat
  *   GET  /v1/verify?ref=          re-fetch every leg of a manifest and compare sha256; free
@@ -28,9 +31,9 @@ import { HTTPFacilitatorClient } from '@x402/core/server';
 import { ExactEvmScheme } from '@x402/evm/exact/server';
 import { decodePaymentSignatureHeader } from '@x402/core/http';
 import { privateKeyToAccount } from 'viem/accounts';
-import { Lading, optionsFromEnv, sha256, type Estimate } from './lib.js';
+import { Lading, optionsFromEnv, sha256, type Estimate, type PutResult } from './lib.js';
 import { DEFAULT_PART_BYTES } from './parts.js';
-import { gatePriceMicro, gatePriceUsdc, microToUsdc, pricingFromEnv } from './gate-price.js';
+import { gatePriceMicro, gatePriceUsdc, microToUsdc, pricingFromEnv, usdcToMicro } from './gate-price.js';
 
 import { VERSION } from './version.js';
 const PORT = Number(process.env.PORT ?? 3601);
@@ -79,10 +82,38 @@ class HttpError extends Error {
   }
 }
 
-/** The bill for a put of `size` bytes and the door price on top, both as numbers a caller can check. */
-async function quotePut(size: number, partBytes: number) {
+const SHA_RE = /^[0-9a-f]{64}$/;
+/** A declared object hash, lower-cased, or undefined when the caller declared none. */
+function declaredSha(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const sha = raw.trim().toLowerCase();
+  if (!SHA_RE.test(sha)) throw new HttpError(400, 'x-sha256 must be 64 hex characters');
+  return sha;
+}
+
+/** The floor as the door quotes it: the same six-decimal string every other price uses. */
+const floorUsdc = () => microToUsdc(usdcToMicro(pricing.floorUsdc));
+
+/**
+ * The bill for a put of `size` bytes and the door price on top, both as
+ * numbers a caller can check. With a `sha` this gate already archived the
+ * price is the floor: the record is handed back, no leg is bought.
+ */
+async function quotePut(size: number, partBytes: number, sha?: string) {
   if (!Number.isInteger(size) || size <= 0) throw new HttpError(400, 'size must be a positive integer');
   if (size > MAX_BODY_BYTES) throw new HttpError(413, `size over the ${MAX_BODY_BYTES} byte ceiling`);
+  const prior = sha ? lading.archived(sha) : undefined;
+  if (prior) {
+    return {
+      size,
+      parts: prior.parts,
+      partBytes,
+      reused: true,
+      existing: { manifestTxId: prior.manifestTxId, manifestUrl: prior.manifestUrl, name: prior.name?.name ?? null, archivedAt: prior.archivedAt },
+      toon: { units: '0', usdc: microToUsdc(0n), rows: [] },
+      price: { usdc: floorUsdc(), network: NETWORK, payTo: PAY_TO ?? null, margin: pricing.margin, floorUsdc: pricing.floorUsdc },
+    };
+  }
   const est: Estimate = await lading.estimate(size, partBytes);
   if (est.unpriced.length) throw new HttpError(503, `edge did not price ${est.unpriced.join(', ')}`);
   const price = gatePriceMicro(est.total, pricing);
@@ -90,8 +121,28 @@ async function quotePut(size: number, partBytes: number) {
     size,
     parts: est.parts,
     partBytes,
+    reused: false,
     toon: { units: est.total.toString(), usdc: microToUsdc(est.total), rows: est.rows.map((r) => ({ leg: r.leg, route: r.route, units: r.price?.toString() ?? null, note: r.note })) },
     price: { usdc: microToUsdc(price), network: NETWORK, payTo: PAY_TO ?? null, margin: pricing.margin, floorUsdc: pricing.floorUsdc },
+  };
+}
+
+/** The bill of lading as every door answers it, for a fresh put and a reused one alike. */
+function putBody(r: PutResult, extra: Record<string, unknown> = {}) {
+  return {
+    sha256: r.sha256,
+    size: r.size,
+    parts: r.parts,
+    reused: r.reused ?? false,
+    archivedAt: r.archivedAt,
+    legs: r.legs,
+    manifest: r.manifest,
+    manifestTxId: r.manifestTxId ?? null,
+    manifestUrl: r.manifestUrl ?? null,
+    name: r.name ?? null,
+    paid: r.paid.map((p) => ({ leg: p.leg, route: p.route, units: p.price?.toString() ?? null })),
+    toon: { units: r.total.toString(), usdc: microToUsdc(r.total) },
+    ...extra,
   };
 }
 
@@ -144,11 +195,11 @@ if (!FREE) {
             maxTimeoutSeconds: 900,
             price: async (ctx) => {
               const size = Number(ctx.adapter.getHeader('content-length'));
-              const q = await quotePut(size, partBytesOf(ctx.adapter.getHeader('x-part-bytes') || undefined));
+              const q = await quotePut(size, partBytesOf(ctx.adapter.getHeader('x-part-bytes') || undefined), declaredSha(ctx.adapter.getHeader('x-sha256') || undefined));
               return q.price.usdc;
             },
           },
-          description: 'Lading put: the bytes onto Arweave, Walrus and Filecoin, a signed bill of lading on Arweave, named on ArNS. Priced on content-length.',
+          description: 'Lading put: the bytes onto Arweave, Walrus and Filecoin, a signed bill of lading on Arweave, named on ArNS. Priced on content-length; a declared x-sha256 this gate already archived is answered from the record at the floor price.',
           mimeType: 'application/json',
           serviceName: 'lading',
         },
@@ -187,7 +238,8 @@ app.get('/v1/describe', async (_req, res, next) => {
       payer: { nostrPubkey: lading.payerPubkey() },
       routes: routes.map((r) => ({ key: r.key, route: r.route, units: r.price?.toString() ?? null })),
       install: `claude mcp add lading -e LADING_X402_KEY=0x… -- npx -y lading mcp --gate ${PUBLIC_URL}`,
-      endpoints: ['GET /v1/quote?size=N', 'POST /v1/put', 'GET /v1/renew/quote?id=', 'POST /v1/renew', 'GET /v1/verify?ref='],
+      endpoints: ['GET /v1/quote?size=N[&sha=]', 'GET /v1/manifest?sha=', 'POST /v1/put', 'GET /v1/renew/quote?id=', 'POST /v1/renew', 'GET /v1/verify?ref='],
+      idempotent: 'POST /v1/put with x-sha256 set to a hash this gate already archived answers from the saved bill of lading at the floor price and buys no leg; GET /v1/manifest?sha= reads it free.',
     });
   } catch (e) {
     next(e);
@@ -196,7 +248,7 @@ app.get('/v1/describe', async (_req, res, next) => {
 
 app.get('/v1/quote', async (req, res, next) => {
   try {
-    res.json(await quotePut(Number(req.query.size), partBytesOf(req.query['part-bytes'])));
+    res.json(await quotePut(Number(req.query.size), partBytesOf(req.query['part-bytes']), declaredSha(req.query.sha === undefined ? undefined : String(req.query.sha))));
   } catch (e) {
     next(e);
   }
@@ -216,6 +268,27 @@ app.get('/v1/renew/quote', async (req, res, next) => {
   }
 });
 
+app.get('/v1/manifest', (req, res, next) => {
+  try {
+    const sha = declaredSha(String(req.query.sha ?? ''));
+    if (!sha) throw new HttpError(400, 'sha required');
+    const prior = lading.archived(sha);
+    if (!prior) return res.status(404).json({ error: 'not archived by this gate', sha256: sha });
+    return res.json(putBody(prior, { via: parseVia(prior) }));
+  } catch (e) {
+    return next(e);
+  }
+});
+
+/** The `via` a saved manifest recorded, when it came through a door. */
+function parseVia(r: PutResult): unknown {
+  try {
+    return (JSON.parse(r.manifest.content) as { via?: unknown }).via ?? null;
+  } catch {
+    return null;
+  }
+}
+
 app.get('/v1/verify', async (req, res, next) => {
   try {
     const ref = String(req.query.ref ?? '');
@@ -232,13 +305,26 @@ app.post('/v1/put', express.raw({ type: () => true, limit: MAX_BODY_BYTES }), as
     const bytes = new Uint8Array(req.body as Buffer);
     if (bytes.length === 0) throw new HttpError(400, 'empty body');
     const sha = sha256(bytes);
+    const declared = declaredSha(req.get('x-sha256') || undefined);
+    // The door was priced on the declared hash; the body has to be those bytes. Nothing settles on a 4xx.
+    if (declared && declared !== sha) throw new HttpError(400, `x-sha256 ${declared.slice(0, 12)}… does not match the body (${sha.slice(0, 12)}…)`);
     const rawName = req.get('x-file-name');
     const name = rawName ? basename(decodeURIComponent(rawName)).slice(0, 200) || `object-${sha.slice(0, 12)}` : `object-${sha.slice(0, 12)}`;
     const mime = req.get('x-mime') || req.get('content-type') || undefined;
     const partBytes = partBytesOf(req.get('x-part-bytes') || undefined);
     const payer = payerOf(req);
-    const quoted = await quotePut(bytes.length, partBytes);
-    log(`put ${sha.slice(0, 12)} ${bytes.length} B "${name}" payer=${payer ?? (FREE ? 'free' : '?')} price=${quoted.price.usdc} USDC toon=${quoted.toon.units}`);
+    const prior = lading.archived(sha);
+    if (prior && !declared && !FREE) {
+      // Paid the full price for bytes this gate already holds. Answer without settling (4xx): the record is
+      // free at /v1/manifest, and a repeat put that declares its hash is priced at the floor.
+      log(`put ${sha.slice(0, 12)} ${bytes.length} B already archived, undeclared: 409, nothing settled`);
+      return res.status(409).json({
+        error: `already archived by this gate on ${new Date(prior.archivedAt * 1000).toISOString()}; nothing was charged. Read it free at GET /v1/manifest?sha=${sha}, or repeat the put with x-sha256: ${sha} to have it answered at the floor price.`,
+        existing: putBody(prior, { via: parseVia(prior) }),
+      });
+    }
+    const quoted = await quotePut(bytes.length, partBytes, declared);
+    log(`put ${sha.slice(0, 12)} ${bytes.length} B "${name}" payer=${payer ?? (FREE ? 'free' : '?')} price=${quoted.price.usdc} USDC toon=${quoted.toon.units}${prior ? ' (already archived: reuse)' : ''}`);
     const r = await serialize(() =>
       lading.put(bytes, {
         name,
@@ -247,23 +333,16 @@ app.post('/v1/put', express.raw({ type: () => true, limit: MAX_BODY_BYTES }), as
         via: { door: 'x402', network: NETWORK, ...(payer ? { payer } : {}) },
       }),
     );
-    log(`put ${sha.slice(0, 12)} done: ${r.legs.map((l) => l.network).join('+')} manifest=${r.manifestTxId ?? '-'} name=${r.name?.name ?? '-'} paid=${r.total}`);
-    res.json({
-      sha256: r.sha256,
-      size: r.size,
-      parts: r.parts,
-      legs: r.legs,
-      manifest: r.manifest,
-      manifestTxId: r.manifestTxId ?? null,
-      manifestUrl: r.manifestUrl ?? null,
-      name: r.name ?? null,
-      paid: r.paid.map((p) => ({ leg: p.leg, route: p.route, units: p.price?.toString() ?? null })),
-      toon: { units: r.total.toString(), usdc: microToUsdc(r.total) },
-      price: quoted.price,
-      via: { door: 'x402', network: NETWORK, payer: payer ?? null },
-    });
+    log(`put ${sha.slice(0, 12)} ${r.reused ? 'reused' : 'done'}: ${r.legs.map((l) => l.network).join('+')} manifest=${r.manifestTxId ?? '-'} name=${r.name?.name ?? '-'} paid=${r.reused ? 0 : r.total}`);
+    return res.json(
+      putBody(r, {
+        price: quoted.price,
+        via: r.reused ? parseVia(r) : { door: 'x402', network: NETWORK, payer: payer ?? null },
+        ...(r.reused ? { thisCall: { door: 'x402', network: NETWORK, payer: payer ?? null, toonUnits: '0' } } : {}),
+      }),
+    );
   } catch (e) {
-    next(e);
+    return next(e);
   }
 });
 

@@ -17,6 +17,22 @@ Shape A of three:
 > ILP through the edge, paid by the gate's own TOON payer. x402 is the ingress
 > at the boundary with something that does not speak ILP; TOON is the inside.
 
+## Idempotent puts (0.8.0, 2026-09-08)
+
+x402 prices a request before the body is read (the 402 challenge carries the
+amount), so the door cannot discover on its own that it already holds the
+bytes. The caller declares `x-sha256`; a declared hash with a saved manifest
+under the gate's home (`/data/gate/manifests/<sha>.json`, only records whose
+manifest reached Arweave) is priced at the floor and answered from the record
+through the same `lading.put()`, which returns `reused: true` without opening
+a channel or buying a leg (a missing name leg is the one thing it still buys).
+A paid put that lands on known bytes without declaring them answers 409 with
+the record; the middleware settles only on 2xx, so nothing is charged.
+`GET /v1/manifest?sha=` reads the record free, and the shim asks it before
+paying anything, so from Claude a repeat put costs nothing. The hash is a
+public fact (the manifest is on Arweave and the relay, kind 30320 `d` tag), so
+the lookup door leaks nothing new.
+
 ## Why a shim
 
 Claude's own MCP client cannot sign x402 payments. So either a local process
