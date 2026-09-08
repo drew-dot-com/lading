@@ -783,10 +783,16 @@ setInterval(sweep, 86_400_000).unref();
 const server = app.listen(PORT, () => {
   log(`lading gate ${VERSION} on :${PORT}${FREE ? ' FREE (no x402)' : ` x402 ${NETWORK} payTo=${PAY_TO} facilitator=${FACILITATOR}`} edge=${lading.opts.edge} margin=${pricing.margin} floor=${pricing.floorUsdc} maxBody=${MAX_BODY_BYTES}`);
 });
-// A chunked put runs for minutes; do not let Node cut the request off.
+// A put runs for minutes; do not let Node cut the connection. headersTimeout
+// must be 0 too: with it at 60 s Node closed every connection whose response
+// took longer than that once the request body had been read (seen 2026-09-08:
+// a Blossom PUT and a slow GET /v1/verify both died at 60.0 s through Caddy,
+// the shim's resume-next-call design had hidden it for POST /v1/put). Caddy
+// in front carries the slow-loris protection this gave up.
 server.requestTimeout = 0;
-server.headersTimeout = 60_000;
+server.headersTimeout = 0;
 server.timeout = 0;
+server.keepAliveTimeout = 0;
 
 const stop = async () => {
   server.close();
