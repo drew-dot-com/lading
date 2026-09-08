@@ -28,6 +28,7 @@ import { createPublicClient, erc20Abi, formatUnits, http } from 'viem';
 import { base } from 'viem/chains';
 import { usdcToMicro } from './gate-price.js';
 import { VERSION } from './version.js';
+import { installLongFetch } from './long-fetch.js';
 
 /** The bundle bakes its version in at build time (no package.json beside it); the CLI reads package.json. */
 export const MCP_VERSION = process.env.LADING_BUNDLED_VERSION ?? VERSION;
@@ -74,6 +75,7 @@ const text = (v: unknown) => ({ content: [{ type: 'text' as const, text: typeof 
 const fail = (msg: string) => ({ content: [{ type: 'text' as const, text: msg }], isError: true as const });
 
 export async function runMcp(o: McpOptions) {
+  installLongFetch();
   const gate = o.gate.replace(/\/+$/, '');
   const maxMicro = usdcToMicro(o.maxUsdc);
   const log = (...a: unknown[]) => console.error('lading mcp:', ...a);

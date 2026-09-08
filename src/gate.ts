@@ -48,6 +48,8 @@ import { DEFAULT_PART_BYTES, planParts } from './parts.js';
 import { gatePriceMicro, gatePriceUsdc, microToUsdc, pricingFromEnv, usdcToMicro } from './gate-price.js';
 
 import { VERSION } from './version.js';
+import { installLongFetch } from './long-fetch.js';
+installLongFetch();
 const PORT = Number(process.env.PORT ?? 3601);
 const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES ?? 3 * 1024 * 1024);
 const FREE = process.env.GATE_FREE === '1';

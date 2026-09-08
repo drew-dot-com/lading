@@ -32,6 +32,8 @@ import { basename, join } from 'node:path';
 import { DEFAULT_PART_BYTES } from './parts.js';
 import { fmtDate } from './renewals.js';
 import { Lading, optionsFromEnv, partLabel } from './lib.js';
+import { installLongFetch } from './long-fetch.js';
+installLongFetch();
 
 const flag = (name: string) => process.argv.includes(`--${name}`);
 const opt = (name: string) => {
