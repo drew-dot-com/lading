@@ -1,0 +1,63 @@
+{
+  "manifest_version": "0.3",
+  "name": "lading",
+  "display_name": "Lading",
+  "version": "0.7.0",
+  "description": "Archive a file onto Arweave, Walrus and Filecoin in one call, paid in USDC on Base, with a signed bill of lading named on ArNS.",
+  "long_description": "Lading is an archive broker on the TOON mesh. This extension gives Claude five tools: describe the gate, quote a put, archive a file or text (paid), verify a bill of lading by its ArNS name, and renew a Walrus record (paid). Payment is x402 over USDC on Base from a key this extension generates on first run at ~/.lading/x402.key; ask Claude to run lading_wallet for the address to fund. Every paid call is quoted first and refused above the per-call cap. No ETH is ever needed.",
+  "author": { "name": "Drew Pierson", "url": "https://github.com/drew-dot-com/lading" },
+  "homepage": "https://github.com/drew-dot-com/lading",
+  "documentation": "https://github.com/drew-dot-com/lading#claude-desktop-extension",
+  "license": "MIT",
+  "icon": "icon.png",
+  "keywords": ["arweave", "walrus", "filecoin", "arns", "x402", "toon", "archive", "storage"],
+  "server": {
+    "type": "node",
+    "entry_point": "server/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/server/index.js"],
+      "env": {
+        "LADING_GATE": "${user_config.gate}",
+        "LADING_MAX_USDC_PER_CALL": "${user_config.max_usdc}",
+        "LADING_X402_KEY": "${user_config.key}"
+      }
+    }
+  },
+  "tools": [
+    { "name": "lading_wallet", "description": "Free. The payer address, its USDC balance on Base, and how to fund it." },
+    { "name": "lading_describe", "description": "Free. What the gate sells, prices, network, payTo." },
+    { "name": "lading_quote", "description": "Free. USDC price to archive an object of a given size." },
+    { "name": "lading_put", "description": "Paid. Archive a file or text on Arweave, Walrus and Filecoin with a named bill of lading." },
+    { "name": "lading_verify", "description": "Free. Re-fetch every leg of a bill of lading and compare sha256." },
+    { "name": "lading_renew", "description": "Paid. One more year on Walrus for a record this gate uploaded." }
+  ],
+  "user_config": {
+    "gate": {
+      "type": "string",
+      "title": "Lading gate URL",
+      "description": "The hosted door to pay. Leave the default unless you run your own gate.",
+      "default": "https://lading.167-233-221-236.sslip.io",
+      "required": false
+    },
+    "max_usdc": {
+      "type": "string",
+      "title": "Cap per paid call (USDC)",
+      "description": "Any put or renewal quoted above this is refused before paying.",
+      "default": "0.50",
+      "required": false
+    },
+    "key": {
+      "type": "string",
+      "title": "Base private key (optional)",
+      "description": "Leave empty: a key is generated at ~/.lading/x402.key on first run. Paste a 0x hex key only to pay from a wallet you already hold.",
+      "sensitive": true,
+      "required": false
+    }
+  },
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": { "node": ">=20.0.0" }
+  }
+}

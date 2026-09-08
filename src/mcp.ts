@@ -14,24 +14,55 @@
  *
  * stdout belongs to the MCP transport; every log line here goes to stderr.
  */
-import { readFileSync, statSync } from 'node:fs';
-import { basename, resolve } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { basename, dirname, join, resolve } from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { x402Client, wrapFetchWithPayment } from '@x402/fetch';
 import { registerExactEvmScheme } from '@x402/evm/exact/client';
-import { privateKeyToAccount } from 'viem/accounts';
+import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
+import { createPublicClient, erc20Abi, formatUnits, http } from 'viem';
+import { base } from 'viem/chains';
 import { usdcToMicro } from './gate-price.js';
+
+export const MCP_VERSION = '0.7.0';
+/** USDC on Base mainnet, 6 decimals. */
+export const BASE_USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' as const;
 
 export interface McpOptions {
   /** The gate's public URL. */
   gate: string;
-  /** Hex Base private key that pays the door. Optional: without it only the free tools answer. */
+  /** Hex Base private key that pays the door. Optional: without it only the free tools answer, unless `keyFile` is set. */
   key?: string;
+  /** Where the payer key lives when `key` is not given. With `autoKey`, a fresh key is generated there (0600) on first run. */
+  keyFile?: string;
+  autoKey?: boolean;
   /** USDC cap per paid call, decimal string. */
   maxUsdc: string;
+  /** Base RPC for balance reads (free tool), default mainnet.base.org. */
+  baseRpc?: string;
 }
+
+/** The shim's key: explicit hex first, then the key file, generating one when asked. Returns undefined when none. */
+export function resolveKey(o: Pick<McpOptions, 'key' | 'keyFile' | 'autoKey'>, log: (...a: unknown[]) => void): { key?: `0x${string}`; from: string } {
+  if (o.key?.trim()) return { key: o.key.trim() as `0x${string}`, from: 'env' };
+  if (!o.keyFile) return { from: 'none' };
+  if (existsSync(o.keyFile)) {
+    const k = readFileSync(o.keyFile, 'utf8').trim();
+    if (!/^0x[0-9a-fA-F]{64}$/.test(k)) throw new Error(`${o.keyFile} is not a 32-byte hex key`);
+    return { key: k as `0x${string}`, from: o.keyFile };
+  }
+  if (!o.autoKey) return { from: 'none' };
+  const k = generatePrivateKey();
+  mkdirSync(dirname(o.keyFile), { recursive: true, mode: 0o700 });
+  writeFileSync(o.keyFile, `${k}\n`, { mode: 0o600 });
+  log(`generated a new payer key at ${o.keyFile} (address ${privateKeyToAccount(k).address}); fund it with USDC on Base`);
+  return { key: k, from: `${o.keyFile} (new)` };
+}
+
+export const defaultKeyFile = () => join(process.env.LADING_HOME ?? join(homedir(), '.lading'), 'x402.key');
 
 const text = (v: unknown) => ({ content: [{ type: 'text' as const, text: typeof v === 'string' ? v : JSON.stringify(v, null, 2) }] });
 const fail = (msg: string) => ({ content: [{ type: 'text' as const, text: msg }], isError: true as const });
@@ -43,14 +74,25 @@ export async function runMcp(o: McpOptions) {
 
   let payFetch: typeof fetch | undefined;
   let payer: string | undefined;
-  if (o.key) {
-    const signer = privateKeyToAccount(o.key as `0x${string}`);
+  const resolved = resolveKey(o, log);
+  if (resolved.key) {
+    const signer = privateKeyToAccount(resolved.key);
     payer = signer.address;
     const client = new x402Client();
     registerExactEvmScheme(client, { signer });
     client.setSpendControls({ maxAmountPerPayment: o.maxUsdc });
     payFetch = wrapFetchWithPayment(fetch, client) as typeof fetch;
   }
+
+  const chain = createPublicClient({ chain: base, transport: http(o.baseRpc ?? 'https://mainnet.base.org') });
+  /** The payer's USDC on Base, read from chain. Free. */
+  async function balance(): Promise<{ address: string; usdc: string } | undefined> {
+    if (!payer) return undefined;
+    const raw = await chain.readContract({ address: BASE_USDC, abi: erc20Abi, functionName: 'balanceOf', args: [payer as `0x${string}`] });
+    return { address: payer, usdc: formatUnits(raw, 6) };
+  }
+  const fundingNote = (address: string) =>
+    `Send USDC on Base (chain id 8453, USDC contract ${BASE_USDC}) to ${address}. No ETH is needed: x402 payments use EIP-3009 and the facilitator pays gas. Do not send USDC on any other chain.`;
 
   async function getJson(path: string): Promise<unknown> {
     const r = await fetch(`${gate}${path}`);
@@ -77,14 +119,32 @@ export async function runMcp(o: McpOptions) {
       const pr = decodeReceipt(r.headers.get('payment-required') ?? '') as { error?: string; accepts?: Array<{ amount?: string }> } | string;
       const why = typeof pr === 'object' && pr?.error ? pr.error : 'payment refused';
       const amount = typeof pr === 'object' && pr?.accepts?.[0]?.amount ? ` (asked ${Number(pr.accepts[0].amount) / 1e6} USDC on Base from ${payer})` : '';
-      throw new Error(`payment not accepted: ${why}${amount}. The payer needs USDC on Base; no ETH is needed.`);
+      throw new Error(`payment not accepted: ${why}${amount}. ${payer ? fundingNote(payer) : 'The payer needs USDC on Base; no ETH is needed.'}`);
     }
     if (!r.ok) throw new Error(`gate ${r.status}: ${String(body.error ?? JSON.stringify(body))}`);
     const receipt = r.headers.get('payment-response') ?? r.headers.get('x-payment-response');
     return receipt ? { ...body, x402: decodeReceipt(receipt) } : body;
   }
 
-  const server = new McpServer({ name: 'lading', version: '0.6.0' });
+  const server = new McpServer({ name: 'lading', version: MCP_VERSION });
+
+  server.registerTool(
+    'lading_wallet',
+    {
+      title: 'Lading payer wallet',
+      description: 'Free. The address this shim pays the door from, its USDC balance on Base, where the key is kept, and how to fund it. Call this when a paid tool is refused for balance.',
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        if (!payer) return text({ payer: null, keyFrom: resolved.from, note: 'No payer key. Set LADING_X402_KEY, or point LADING_X402_KEY_FILE at a hex key (the extension generates one on first run).' });
+        const b = (await balance().catch((e: Error) => ({ address: payer!, usdc: `unavailable (${e.message.slice(0, 60)})` }))) ?? { address: payer, usdc: 'unavailable' };
+        return text({ payer: b.address, usdcOnBase: b.usdc, keyFrom: resolved.from, maxUsdcPerCall: o.maxUsdc, network: 'eip155:8453', usdcContract: BASE_USDC, fund: fundingNote(b.address) });
+      } catch (e) {
+        return fail((e as Error).message);
+      }
+    },
+  );
 
   server.registerTool(
     'lading_describe',
@@ -96,7 +156,8 @@ export async function runMcp(o: McpOptions) {
     async () => {
       try {
         const d = await getJson('/v1/describe');
-        return text({ ...(d as object), shim: { payer: payer ?? null, maxUsdcPerCall: o.maxUsdc, paidToolsEnabled: !!payFetch } });
+        const b = await balance().catch(() => undefined);
+        return text({ ...(d as object), shim: { payer: payer ?? null, usdcOnBase: b?.usdc ?? null, keyFrom: resolved.from, maxUsdcPerCall: o.maxUsdc, paidToolsEnabled: !!payFetch } });
       } catch (e) {
         return fail((e as Error).message);
       }
@@ -191,7 +252,7 @@ export async function runMcp(o: McpOptions) {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  log(`connected: gate=${gate} payer=${payer ?? 'none (free tools only)'} cap=${o.maxUsdc} USDC`);
+  log(`connected: gate=${gate} payer=${payer ?? 'none (free tools only)'} key=${resolved.from} cap=${o.maxUsdc} USDC`);
   // Keep the process alive until the client closes the pipe.
   await new Promise<void>((done) => {
     transport.onclose = () => done();

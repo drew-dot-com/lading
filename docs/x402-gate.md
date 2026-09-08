@@ -24,6 +24,15 @@ pays (this design), or the user prepays for a bearer token (shape B, deferred:
 Claude Desktop remote connectors want OAuth, not a static header, and it
 reintroduces a prepaid balance).
 
+Decided 2026-09-08: instead of shape B, the local shim is packaged as a Claude
+Desktop extension (`extension/manifest.json`, built by `npm run extension`
+into `dist/lading-<version>.mcpb`). The key is generated on first run and
+`lading_wallet` shows the address to fund, so a non-developer never touches a
+private key, and every call stays a per-call x402 payment from a key the user
+holds. Shape B stays deferred. The next step for remote connectors is a
+payment link per put: the tool returns a hosted page URL, the user pays it in
+a browser wallet, the page reports the tx to the gate, and the put proceeds.
+
 ## Facts checked 2026-09-07
 
 - Facilitators settling x402 **v2, `exact`, `eip155:8453` (Base mainnet)**:

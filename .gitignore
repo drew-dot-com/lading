@@ -3,3 +3,6 @@ dist/
 .env
 channel-store*.json
 *.key
+extension/server/
+extension/package.json
+*.mcpb

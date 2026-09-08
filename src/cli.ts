@@ -109,8 +109,10 @@ async function quote(file: string) {
 async function mcp() {
   const gate = opt('gate') ?? process.env.LADING_GATE_URL;
   if (!gate) throw new Error('lading mcp needs --gate <url> (or LADING_GATE_URL)');
-  const { runMcp } = await import('./mcp.js');
-  await runMcp({ gate, key: process.env.LADING_X402_KEY, maxUsdc: process.env.LADING_MAX_USDC_PER_CALL ?? '0.50' });
+  const { runMcp, defaultKeyFile } = await import('./mcp.js');
+  // A key from the environment wins; otherwise LADING_X402_KEY_FILE (or ~/.lading/x402.key with --autokey, generated when missing).
+  const keyFile = process.env.LADING_X402_KEY_FILE ?? (flag('autokey') ? defaultKeyFile() : undefined);
+  await runMcp({ gate, key: process.env.LADING_X402_KEY, keyFile, autoKey: flag('autokey'), maxUsdc: process.env.LADING_MAX_USDC_PER_CALL ?? '0.50' });
 }
 
 const [cmd, arg] = process.argv.slice(2);
@@ -133,7 +135,7 @@ if (!run) {
       '       lading renewals [--within days] [--live]\n' +
       '       lading renew <sha256|lighthouse-record-id> [--no-quote]\n' +
       '       lading describe\n' +
-      '       lading mcp --gate <url>          (LADING_X402_KEY pays; LADING_MAX_USDC_PER_CALL caps a call, default 0.50)',
+      '       lading mcp --gate <url> [--autokey]          (LADING_X402_KEY pays; LADING_MAX_USDC_PER_CALL caps a call, default 0.50)',
   );
   process.exit(2);
 }

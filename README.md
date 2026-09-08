@@ -42,6 +42,33 @@ Doors: `GET /v1/describe`, `GET /v1/quote?size=N`, `POST /v1/put`,
 `GET /v1/renew/quote?id=`, `POST /v1/renew`, `GET /v1/verify?ref=`. Design
 notes: `docs/x402-gate.md`.
 
+
+## Claude Desktop extension
+
+For anyone who does not want a terminal. One file, `lading-<version>.mcpb`,
+installs the same shim into Claude Desktop with the key handled for you.
+
+1. Download `lading-<version>.mcpb` from the GitHub releases page.
+2. Claude Desktop: Settings, Extensions, Advanced settings, Install Extension
+   (or double-click the file). Leave the three settings at their defaults.
+3. Ask Claude to run `lading_wallet`. On first run the extension generates a
+   Base key at `~/.lading/x402.key` (mode 0600, never shown) and answers with
+   its address and USDC balance.
+4. Send a few USDC on Base (chain id 8453) to that address. No ETH is needed.
+5. Ask Claude to archive a file. Every paid call is quoted first and refused
+   above the per-call cap (default 0.50 USDC).
+
+Six tools: `lading_wallet`, `lading_describe`, `lading_quote` (free),
+`lading_put` (paid), `lading_verify` (free), `lading_renew` (paid). The
+settings are the gate URL, the per-call cap, and an optional private key for
+people who would rather pay from a wallet they already hold; the key field can
+stay empty.
+
+The bundle is the shim compiled to one file by esbuild (no `node_modules`
+inside, about 400 KB); `npm run extension` rebuilds it into `dist/`. The
+manifest lives in `extension/manifest.json`. The same first-run key generation
+is available to the CLI shim as `lading mcp --gate <url> --autokey`.
+
 ## Why this exists
 
 Every storage micropayment product on the market (Lighthouse, Turbo, Pinata
