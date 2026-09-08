@@ -148,6 +148,30 @@ export class CreditLedger {
     return this.balance(pubkey);
   }
 
+  /**
+   * Debits that never resolved: more debits than refunds for a pubkey and blob,
+   * and the blob is not archived. A gate that died mid-put (a restart, a crash)
+   * took the credit and delivered nothing; the boot refunds these.
+   */
+  orphanedDebits(archived: (ref: string) => boolean): CreditRow[] {
+    const byKey = new Map<string, { debits: CreditRow[]; refunds: number }>();
+    for (const r of this.rows) {
+      if (r.kind === 'topup') continue;
+      const k = `${r.pubkey}:${r.ref}`;
+      const e = byKey.get(k) ?? { debits: [], refunds: 0 };
+      if (r.kind === 'debit') e.debits.push(r);
+      else e.refunds += 1;
+      byKey.set(k, e);
+    }
+    const out: CreditRow[] = [];
+    for (const e of byKey.values()) {
+      const open = e.debits.length - e.refunds;
+      if (open <= 0 || archived(e.debits[0].ref)) continue;
+      out.push(...e.debits.slice(-open));
+    }
+    return out;
+  }
+
   history(pubkey: string): CreditRow[] {
     return this.rows.filter((r) => r.pubkey === pubkey);
   }
@@ -277,7 +301,8 @@ const CORS_HEADERS = {
 /** `X-Reason` is the only thing a Blossom client shows the user; keep it to one line. */
 function refuse(res: Response, e: unknown): void {
   const status = e instanceof BlossomError ? e.status : 500;
-  const message = ((e as Error)?.message ?? String(e)).replace(/\s+/g, ' ').slice(0, 200);
+  // A header value is ASCII only: Node refuses the rest, and a refusal that throws is a 500 with no reason.
+  const message = ((e as Error)?.message ?? String(e)).replace(/…/g, '...').replace(/[^\x20-\x7e]/g, '').replace(/\s+/g, ' ').slice(0, 200);
   res.status(status).set('X-Reason', message).json({ error: message });
 }
 

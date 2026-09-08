@@ -706,6 +706,10 @@ app.post('/v1/renew', express.json({ limit: '4kb' }), async (req, res, next) => 
 // Blossom: credit per Nostr pubkey, and the BUD doors at the root of the host (docs/blossom.md).
 
 const credit = new CreditLedger(join(lading.opts.home, 'blossom-credit.jsonl'));
+for (const o of credit.orphanedDebits((sha) => !!lading.archived(sha))) {
+  const left = credit.refund(o.pubkey, BigInt(o.micro), o.ref);
+  log(`credit ${npubOf(o.pubkey).slice(0, 16)}… refunded ${microToUsdc(BigInt(o.micro))} USDC for ${o.ref.slice(0, 12)}… (debited ${new Date(o.at * 1000).toISOString()}, never archived) → ${microToUsdc(left)}`);
+}
 
 /** A Lading record in the shape the Blossom doors describe and serve. */
 function blobRecord(r: PutResult): BlobRecord {

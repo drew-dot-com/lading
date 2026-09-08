@@ -84,6 +84,21 @@ test('CreditLedger tops up, debits, refunds, refuses with a 402 that names the f
   assert.equal(again.history(pk).length, 4);
 });
 
+test('orphanedDebits: a debit with no refund and no archive is owed back; refunded or archived ones are not', () => {
+  const l = new CreditLedger();
+  l.topUp(pk, 1_000_000n, 'tx');
+  l.debit(pk, 100n, 'a', 'f');
+  l.debit(pk, 200n, 'b', 'f');
+  l.refund(pk, 200n, 'b');
+  l.debit(pk, 300n, 'c', 'f');
+  l.debit(pk, 400n, 'b', 'f');
+  const orphans = l.orphanedDebits((ref) => ref === 'c');
+  assert.deepEqual(orphans.map((r) => [r.ref, r.micro]), [['a', '100'], ['b', '400']]);
+  for (const o of orphans) l.refund(o.pubkey, BigInt(o.micro), o.ref);
+  assert.deepEqual(l.orphanedDebits((ref) => ref === 'c'), []);
+  assert.equal(l.balance(pk), 1_000_000n - 300n);
+});
+
 test('describe builds the BUD-02 descriptor with an extension from the type', () => {
   const rec: BlobRecord = { sha256: 'ab'.repeat(32), size: 3, mime: 'image/png', archivedAt: 1_700_000_000, legs: [{ network: 'arweave', id: 'tx' }, { network: 'ipfs', id: 'cid' }], manifestUrl: 'https://permagate.io/m', name: 'l-x' };
   const d = describe('https://gate/', rec);
