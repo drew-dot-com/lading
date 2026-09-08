@@ -197,7 +197,6 @@ export async function runMcp(o: McpOptions) {
         method: 'POST',
         headers: {
           'content-type': 'application/octet-stream',
-          'content-length': String(slice.length),
           'x-object-sha256': sha,
           'x-object-size': String(bytes.length),
           'x-part-index': String(p.index),
@@ -405,7 +404,6 @@ export async function runMcp(o: McpOptions) {
             'content-type': contentType,
             'x-file-name': encodeURIComponent(fileName),
             'x-mime': contentType,
-            'content-length': String(bytes.length),
             // Declared so the door can answer a hash it already holds at the floor instead of buying every leg again.
             ...(force ? {} : { 'x-sha256': sha }),
           },

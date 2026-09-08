@@ -248,7 +248,6 @@ export function lighthouseUploader(evmPrivateKey: `0x${string}`): WalrusUploader
         method: 'POST',
         headers: {
           'content-type': 'application/octet-stream',
-          'content-length': String(bytes.length),
           'x-file-name': fileName,
         },
         body: new Blob([bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer]),
