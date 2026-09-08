@@ -702,7 +702,6 @@ app.post('/v1/renew', express.json({ limit: '4kb' }), async (req, res, next) => 
   }
 });
 
-app.use((_req, res) => res.status(404).json({ error: 'no such door' }));
 // ---------------------------------------------------------------------------
 // Blossom: credit per Nostr pubkey, and the BUD doors at the root of the host (docs/blossom.md).
 
@@ -760,6 +759,8 @@ app.use(
   }),
 );
 app.use(blossomErrorHandler);
+
+app.use((_req, res) => res.status(404).json({ error: 'no such door' }));
 
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   const status = err instanceof HttpError ? err.status : err instanceof BlossomError ? err.status : err instanceof InputError ? 400 : (err as { status?: number; statusCode?: number })?.status ?? (err as { statusCode?: number })?.statusCode ?? 502;
