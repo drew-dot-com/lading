@@ -33,6 +33,78 @@ paying anything, so from Claude a repeat put costs nothing. The hash is a
 public fact (the manifest is on Arweave and the relay, kind 30320 `d` tag), so
 the lookup door leaks nothing new.
 
+## Multipart at the door: design pass (2026-09-08, backlog 6, not built)
+
+The question: how does a 50 MB object get through the door from Claude, when the
+door takes one body of at most 3 MiB (`MAX_BODY_BYTES`; Caddy caps the request
+at 4 MB) and x402 pays one request at a time?
+
+What already exists below the door: `lib.put()` splits an object into 1 MiB
+parts (`parts.ts`), buys one job per part per network, records every outcome
+in a progress file keyed by the whole object's sha256, and the manifest leg
+carries `parts[]`; `verify` reassembles. So the mesh side of "large" is done.
+Only the HTTP boundary is missing, and the boundary is where the payment
+model has to be chosen.
+
+Two shapes:
+
+**Escrow.** One paid request opens a session priced on the whole object;
+unpaid part uploads follow; a commit runs the legs. One payment, one cap check,
+simple for the caller. But x402 settles when the session request answers 2xx,
+before any leg ran, so the gate holds money for work not yet done. When a leg
+fails later there is no refund primitive: the gate would need a hot Base key
+that sends USDC back (a new attack surface and a new float), or a credit note
+(shape B, deferred). That is the prepaid balance the README says this door
+does not have, and it breaks the one property the door is sold on: settlement
+only after the put answered. Rejected.
+
+**Per-part charge.** The shim splits the object with the same `planParts`
+the lib uses and pays the door once per part, then once for the finish:
+
+- `POST /v1/parts` (x402, priced on the part's size: the three leg routes and
+  their quote doors for that many bytes, times the margin, floor applies).
+  Headers: `x-object-sha256`, `x-object-size`, `x-part-index`, `x-part-count`,
+  `x-sha256` (the part's own hash), `x-file-name`. The gate runs the three legs
+  for that slice under the object's progress file (`<home>/progress/<sha>.json`,
+  the same file a CLI put resumes from) and answers the per-network part
+  receipts. A part whose hash the progress file already holds on every network
+  is answered from it at the floor, like an idempotent put.
+- `POST /v1/assemble` (x402, priced on the finish: manifest write on the
+  Arweave schedule for the manifest's size, relay copy, name quote, name).
+  Body: JSON `{sha256, size, partCount, name, mime}`. The gate checks the
+  progress file holds every index on every network for that object, builds
+  the `parts[]` legs, writes and names the manifest, saves the record, and
+  answers the bill of lading. From then on `GET /v1/manifest?sha=` and a plain
+  `POST /v1/put` with `x-sha256` see it as archived.
+
+Why this one: every request stays short (one part is about the 96 s the first
+paid put took), every payment is small and settles on its own 2xx, a failed
+part costs the caller nothing at the door and is retried at the floor once its
+legs are in the progress file, and nothing is held. The lib change is small:
+`put()` already does this per part inside one call; it needs a `putPart(bytes,
+{sha, size, index, count, name, mime})` that runs the legs for one slice into
+the progress file, and a `finish(sha, {size, count, name, mime, via})` that
+does what the tail of `put()` does from the progress file without the bytes.
+The gate's serialisation (one TOON job at a time) means parts land in order
+whatever the shim does; the shim uploads them sequentially and shows progress.
+
+Numbers to state plainly: a 1 MiB part is about 103,000 units on the mesh, so
+about 0.124 USDC at the door; the finish is on the floor, 0.05. 50 MB is about
+50 parts, about 6.2 USDC and roughly an hour. The per-call cap
+(`LADING_MAX_USDC_PER_CALL`) must then apply to the whole put, summed over
+parts, and the shim quotes the total first. The Arweave leg is the binding
+float: the org store spends about 35 ARIO per 1 MiB part
+(`STORE_TURBO_MAX_ARIO_PER_UPLOAD` 40), and refuel tops that key up at most
+30 ARIO a day, so a 50 MB put needs the store key funded ahead (about 1,750
+ARIO), not refilled during. Progress files for objects never assembled should
+be swept after a week.
+
+Open for Drew: build the per-part shape as written, or change the part size at
+the door (bigger parts, fewer payments, longer requests, the 4 MB Caddy cap and
+the ~1.56 MB packet cap both bind). Proving it live costs about 0.6 USDC for a
+4 MiB object through the shim key, over the default cap, so the cap is raised
+for the proof.
+
 ## Why a shim
 
 Claude's own MCP client cannot sign x402 payments. So either a local process
