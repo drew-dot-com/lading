@@ -50,7 +50,10 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "!dist/*.mcpb",
+    "!dist/extension.js",
+    "!dist/extension.js.map"
   ],
   "repository": {
     "type": "git",
