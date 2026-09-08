@@ -74,6 +74,16 @@ const sha256Hex = (b: Uint8Array) => createHash('sha256').update(b).digest('hex'
 const text = (v: unknown) => ({ content: [{ type: 'text' as const, text: typeof v === 'string' ? v : JSON.stringify(v, null, 2) }] });
 const fail = (msg: string) => ({ content: [{ type: 'text' as const, text: msg }], isError: true as const });
 
+/** A non-2xx answer from the gate, with its JSON body (a 409 from /v1/assemble carries `missing`). */
+export class GateError extends Error {
+  constructor(
+    readonly status: number,
+    readonly body: Record<string, unknown>,
+  ) {
+    super(`gate ${status}: ${String(body.error ?? JSON.stringify(body))}`);
+  }
+}
+
 export async function runMcp(o: McpOptions) {
   installLongFetch();
   const gate = o.gate.replace(/\/+$/, '');
@@ -227,15 +237,82 @@ export async function runMcp(o: McpOptions) {
         next: `Call lading_put again with the same input to continue: the gate keeps every part it bought, those are skipped free, and the last call assembles the bill of lading. ${remaining.length} part(s) and the finish remain.`,
       };
     }
-    await prog.tick(slices.length, slices.length + 1, 'assembling: manifest, relay copy, ArNS name');
-    const stopBeat = prog.heartbeat(() => 'assembling');
-    const a = await paid('/v1/assemble', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-object-sha256': sha, 'x-part-count': String(slices.length) },
-      body: JSON.stringify({ sha256: sha, size: bytes.length, partCount: slices.length, partBytes, name: fileName, mime: contentType }),
-    }).finally(stopBeat);
+    const sendSlice = async (index: number) => {
+      const p = slices[index]!;
+      const slice = bytes.subarray(p.offset, p.offset + p.size);
+      return (await paid('/v1/parts', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/octet-stream',
+          'x-object-sha256': sha,
+          'x-object-size': String(bytes.length),
+          'x-part-index': String(p.index),
+          'x-part-count': String(slices.length),
+          'x-part-bytes': String(partBytes),
+          'x-sha256': sha256Hex(slice),
+          'x-file-name': encodeURIComponent(fileName),
+          'x-mime': contentType,
+        },
+        body: slice,
+      })) as { receipts?: Record<string, unknown>; missing?: string[] };
+    };
+    const assemble = async (skip: string[]) => {
+      await prog.tick(slices.length, slices.length + 1, 'assembling: manifest, relay copy, ArNS name');
+      const stopBeat = prog.heartbeat(() => 'assembling');
+      try {
+        return await paid('/v1/assemble', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-object-sha256': sha, 'x-part-count': String(slices.length) },
+          body: JSON.stringify({ sha256: sha, size: bytes.length, partCount: slices.length, partBytes, name: fileName, mime: contentType, ...(skip.length ? { skip } : {}) }),
+        });
+      } finally {
+        stopBeat();
+      }
+    };
+    // A network may hold only some parts (a leg that failed on one slice, or a
+    // leg added after the first slices were bought). Assemble then answers 409
+    // with the gaps; those slices go once more at the floor (Arweave and Walrus
+    // hold them, so the gate buys only what is missing), and a network still
+    // short after that is left off the manifest rather than blocking it.
+    const refilled: number[] = [];
+    let dropped: string[] = [];
+    let a: unknown;
+    try {
+      a = await assemble([]);
+    } catch (e) {
+      const gaps = gapsOf(e);
+      if (!gaps) throw e;
+      const indexes = [...new Set(Object.values(gaps).flat())].sort((x, y) => x - y);
+      log(`assemble: parts missing on ${Object.entries(gaps).map(([n, v]) => `${n} ${v.join(',')}`).join('; ')}; sending ${indexes.length} slice(s) again to fill them`);
+      for (const index of indexes) {
+        const t0 = Date.now();
+        const r = await sendSlice(index);
+        refilled.push(index);
+        log(`refill part ${index + 1}/${slices.length}: ${Object.keys(r.receipts ?? {}).join('+') || 'nothing'}${r.missing?.length ? ` (still missing ${r.missing.join(',')})` : ''} ${Date.now() - t0} ms`);
+      }
+      try {
+        a = await assemble([]);
+      } catch (e2) {
+        const again = gapsOf(e2);
+        if (!again) throw e2;
+        dropped = Object.keys(again).filter((n) => n !== 'arweave' && n !== 'walrus');
+        if (dropped.length !== Object.keys(again).length) throw e2;
+        log(`assemble: ${dropped.join(', ')} still short after the refill; finishing without ${dropped.length === 1 ? 'it' : 'them'}`);
+        a = await assemble(dropped);
+      }
+    }
     await prog.tick(slices.length + 1, slices.length + 1, 'done');
-    return { ...(a as object), multipart: { parts: slices.length, partBytes, sent, skipped, quotedTotalUsdc: q.total.usdc } };
+    return { ...(a as object), multipart: { parts: slices.length, partBytes, sent, skipped, refilled, ...(dropped.length ? { droppedNetworks: dropped } : {}), quotedTotalUsdc: q.total.usdc } };
+  }
+
+  /** The gaps a 409 from /v1/assemble names, or undefined for any other error. */
+  function gapsOf(e: unknown): Record<string, number[]> | undefined {
+    const m = e instanceof GateError ? e.body : undefined;
+    const missing = (m as { missing?: unknown } | undefined)?.missing;
+    if (!missing || typeof missing !== 'object') return undefined;
+    const out: Record<string, number[]> = {};
+    for (const [k, v] of Object.entries(missing as Record<string, unknown>)) if (Array.isArray(v) && v.length) out[k] = v.map(Number);
+    return Object.keys(out).length ? out : undefined;
   }
 
   /** The bill of lading the gate already holds for these bytes, or undefined. Free. */
@@ -275,7 +352,7 @@ export async function runMcp(o: McpOptions) {
       const amount = typeof pr === 'object' && pr?.accepts?.[0]?.amount ? ` (asked ${Number(pr.accepts[0].amount) / 1e6} USDC on Base from ${payer})` : '';
       throw new Error(`payment not accepted: ${why}${amount}. ${payer ? fundingNote(payer) : 'The payer needs USDC on Base; no ETH is needed.'}`);
     }
-    if (!r.ok) throw new Error(`gate ${r.status}: ${String(body.error ?? JSON.stringify(body))}`);
+    if (!r.ok) throw new GateError(r.status, body);
     const receipt = r.headers.get('payment-response') ?? r.headers.get('x-payment-response');
     return receipt ? { ...body, x402: decodeReceipt(receipt) } : body;
   }

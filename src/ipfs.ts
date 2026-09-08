@@ -80,7 +80,10 @@ const withTimeout = (ms: number) => AbortSignal.timeout(ms);
  * take a while to be found by other gateways, so a miss there is recorded,
  * not fatal; the pinner's own answer is what FULFILL requires.
  */
-export async function readBack(cid: string, expectedSha256: string, gateways = IPFS_GATEWAYS, attempts = 3): Promise<{ checks: string[]; strong: boolean; readUrl?: string; publicUrl?: string }> {
+/** Tries on the pinner's own gateway before giving up: with 3 s × n backoff, 10 tries wait about 165 s plus fetch time. A 1 MiB dag-pb CID took over two minutes to appear on 2026-09-08. */
+export const PINNER_READBACK_ATTEMPTS = Number(process.env.LADING_IPFS_READBACK_ATTEMPTS ?? 10);
+
+export async function readBack(cid: string, expectedSha256: string, gateways = IPFS_GATEWAYS, attempts = PINNER_READBACK_ATTEMPTS): Promise<{ checks: string[]; strong: boolean; readUrl?: string; publicUrl?: string }> {
   const checks: string[] = [];
   const cidSha = rawCidSha256(cid);
   checks.push(cidSha === expectedSha256 ? 'cid-digest=sha256' : cidSha ? `cid-digest-mismatch(${cidSha.slice(0, 12)})` : 'cid-not-raw');
@@ -91,7 +94,7 @@ export async function readBack(cid: string, expectedSha256: string, gateways = I
     const tries = i === 0 ? attempts : 1;
     for (let t = 0; t < tries; t++) {
       try {
-        const r = await fetch(url, { cache: 'no-store', signal: withTimeout(i === 0 ? 60_000 : 20_000), headers: { accept: 'application/octet-stream' } });
+        const r = await fetch(url, { cache: 'no-store', signal: withTimeout(i === 0 ? 60_000 : 30_000), headers: { accept: 'application/octet-stream' } });
         if (r.ok) {
           const ok = sha256Hex(new Uint8Array(await r.arrayBuffer())) === expectedSha256;
           checks.push(`${host}:${ok ? 'sha256-match' : 'sha256-mismatch'}`);
