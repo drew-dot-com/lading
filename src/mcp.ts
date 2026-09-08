@@ -286,7 +286,9 @@ export async function runMcp(o: McpOptions) {
       log(`assemble: parts missing on ${Object.entries(gaps).map(([n, v]) => `${n} ${v.join(',')}`).join('; ')}; sending ${indexes.length} slice(s) again to fill them`);
       for (const index of indexes) {
         const t0 = Date.now();
-        const r = await sendSlice(index);
+        await prog.tick(slices.length, slices.length + 1, `refill part ${index + 1}/${slices.length}: sending ${slices[index]!.size} bytes for ${Object.entries(gaps).filter(([, v]) => v.includes(index)).map(([n]) => n).join('+')}`);
+        const stopBeat = prog.heartbeat(() => `refill part ${index + 1}/${slices.length}: legs running, ${Math.round((Date.now() - t0) / 1000)} s`);
+        const r = await sendSlice(index).finally(stopBeat);
         refilled.push(index);
         log(`refill part ${index + 1}/${slices.length}: ${Object.keys(r.receipts ?? {}).join('+') || 'nothing'}${r.missing?.length ? ` (still missing ${r.missing.join(',')})` : ''} ${Date.now() - t0} ms`);
       }

@@ -103,11 +103,12 @@ export async function readBack(cid: string, expectedSha256: string, gateways = I
           break;
         }
         checks.push(`${host}:${r.status}`);
-        if (r.status !== 404 && r.status !== 504) break;
+        // Not there yet (404), rate limited (429, Pinata's public gateway does this under load), or a gateway hiccup (5xx): wait and ask again. Anything else is an answer.
+        if (r.status !== 404 && r.status !== 429 && r.status < 500) break;
       } catch (e) {
         checks.push(`${host}:${(e as Error).name === 'TimeoutError' ? 'timeout' : (e as Error).message.slice(0, 30)}`);
       }
-      if (t < tries - 1) await new Promise((d) => setTimeout(d, 3000 * (t + 1)));
+      if (t < tries - 1) await new Promise((d) => setTimeout(d, 3000 * (t + 1) + (i === 0 ? 5000 : 0)));
     }
     if (publicUrl) break;
   }
