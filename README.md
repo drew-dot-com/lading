@@ -164,6 +164,15 @@ bytes with that sha256; and the public Walrus aggregator must serve the blob,
 which is a CARv1 archive wrapping the raw block, so the check is containment
 of the file bytes. `lading verify` re-runs the gateway check.
 
+Reading back never depends on one AR.IO gateway. A raw txid is content
+addressed, so `verify` and the manifest fetch try `LADING_READ_GATEWAYS` in
+order (default `permagate.io, arweave.net, ardrive.net`) and the row says which
+one answered. An ArNS name may only fall back to gateways that resolve from the
+same registry as the primary: `LADING_ARNS_GATEWAYS` (default `ardrive.net,
+vilenarios.com`, `programIds` on `/ar-io/info` checked equal 2026-09-08). Diff
+`programIds` before adding one; `arweave.net` is not an AR.IO gateway and never
+resolves names. Receipts and manifests still print only the primary gateway.
+
 Filecoin verification: the receipt carries the PieceCID, the on-chain data
 set and piece ids, the provider id and the provider's `/piece/<PieceCID>`
 URL, plus the add-pieces transaction hash when the SDK reports one. The door

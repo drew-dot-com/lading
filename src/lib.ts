@@ -22,6 +22,7 @@ import { dueWithin, fmtDate, walrusRecords, type RenewalRow, type SavedPut, type
 import { daysLeft } from './ledger.js';
 import { buildManifest, parseManifest, type ManifestContent } from './manifest.js';
 import { undernameFor } from './arns.js';
+import { ARWEAVE_TXID_RE, DEFAULT_ARNS_GATEWAYS, arnsReadUrls, arweaveReadUrls, readFirst, readGateways, viaNote } from './read.js';
 
 export interface Routes {
   ario: string;
@@ -40,8 +41,12 @@ export interface LadingOptions {
   /** The edge connector the payer opens its channel with. */
   edge: string;
   routes: Routes;
-  /** AR.IO gateway used to read Arweave and resolve ArNS. */
+  /** AR.IO gateway used to resolve ArNS names and to print read URLs. */
   gateway: string;
+  /** Gateways tried in order for raw Arweave txid reads; `gateway` always goes first. */
+  readGateways: string[];
+  /** Gateways an ArNS name may fall back to; must resolve from the same registry as `gateway` (see read.ts). */
+  arnsGateways: string[];
   lighthouseX402: string;
   walrusAggregator: string;
   /** Where saved manifests, progress files and (by default) the payer's Nostr key live. */
@@ -80,6 +85,8 @@ export function optionsFromEnv(overrides: Partial<LadingOptions> = {}): LadingOp
       relay: env('LADING_ROUTE_RELAY', 'g.drew.relay'),
     },
     gateway: env('LADING_ARNS_GATEWAY', 'permagate.io'),
+    readGateways: readGateways(env('LADING_ARNS_GATEWAY', 'permagate.io'), process.env.LADING_READ_GATEWAYS),
+    arnsGateways: readGateways(env('LADING_ARNS_GATEWAY', 'permagate.io'), process.env.LADING_ARNS_GATEWAYS, DEFAULT_ARNS_GATEWAYS),
     lighthouseX402: env('LIGHTHOUSE_X402_URL', 'https://x402-walrus.lighthouse.storage'),
     walrusAggregator: env('WALRUS_AGGREGATOR_URL', 'https://aggregator.walrus-mainnet.walrus.space'),
     home,
@@ -200,6 +207,8 @@ export interface VerifyResult {
   rows: VerifyLegRow[];
   ok: boolean;
   manifest: ManifestContent;
+  /** Where the manifest was read from, with any gateways that failed first. */
+  source: string;
 }
 
 export interface RenewResult {
@@ -723,18 +732,42 @@ export class Lading {
 
   /** A manifest by ArNS name, Arweave txid, URL, or path to a saved file. */
   async fetchManifest(ref: string): Promise<NostrEvent> {
+    return (await this.fetchManifestFrom(ref)).event;
+  }
+
+  /** The manifest plus where it was read from ("local file", or "ardrive.net (permagate.io 502)"). */
+  async fetchManifestFrom(ref: string): Promise<{ event: NostrEvent; source: string }> {
     if (existsSync(ref)) {
       const j = JSON.parse(readFileSync(ref, 'utf8'));
-      return (j.manifest ?? j) as NostrEvent;
+      return { event: (j.manifest ?? j) as NostrEvent, source: 'local file' };
     }
-    const url = /^[A-Za-z0-9_-]{43}$/.test(ref)
-      ? `https://${this.opts.gateway}/${ref}`
+    const urls = ARWEAVE_TXID_RE.test(ref)
+      ? arweaveReadUrls(ref, this.readGateways())
       : ref.startsWith('http')
-        ? ref
-        : `https://${ref}.${this.opts.gateway}/`;
-    const r = await fetch(url);
-    if (!r.ok) throw new Error(`${url}: ${r.status}`);
-    return (await r.json()) as NostrEvent;
+        ? [ref]
+        : arnsReadUrls(ref, this.arnsGateways());
+    const r = await readFirst(urls);
+    if (!r.bytes) throw new Error(`${urls[0]}: ${r.tried.join(', ')}`);
+    const host = r.url.replace(/^https?:\/\//, '').split('/')[0];
+    const source = r.tried.length > 1 ? `${host} (${r.tried.slice(0, -1).join(', ')})` : host;
+    return { event: JSON.parse(new TextDecoder().decode(r.bytes)) as NostrEvent, source };
+  }
+
+  /** The gateways a raw txid may be read from, the ArNS gateway first. */
+  readGateways(): string[] {
+    return readGateways(this.opts.gateway, this.opts.readGateways.join(','));
+  }
+
+  /** The gateways an ArNS name may be resolved from, the configured one first. */
+  arnsGateways(): string[] {
+    return readGateways(this.opts.gateway, this.opts.arnsGateways.join(','), DEFAULT_ARNS_GATEWAYS);
+  }
+
+  /** Every URL a leg's bytes may be read from: several for Arweave, one otherwise. */
+  readUrlsFor(network: string, id: string, proof?: Record<string, string | number | undefined>): string[] {
+    if (network === 'arweave') return arweaveReadUrls(id, this.readGateways());
+    const u = this.readUrlFor(network, id, proof);
+    return u === undefined ? [] : [u];
   }
 
   /** Where a network serves one id from, given what the receipt recorded. */
@@ -746,23 +779,23 @@ export class Lading {
 
   /** Re-fetch every leg named in a manifest and compare sha256. */
   async verify(ref: string): Promise<VerifyResult> {
-    const event = await this.fetchManifest(ref);
+    const { event, source } = await this.fetchManifestFrom(ref);
     const m = parseManifest(event);
     const rows: VerifyLegRow[] = [];
     let ok = true;
     for (const leg of m.legs) {
       if (!leg.parts) {
-        const url = this.readUrlFor(leg.network, leg.id, leg.proof);
-        if (!url) {
+        const urls = this.readUrlsFor(leg.network, leg.id, leg.proof);
+        if (urls.length === 0) {
           rows.push({ label: leg.network, id: leg.id, ok: false, detail: 'no read url' });
           ok = false;
           continue;
         }
-        const r = await fetchBytes(url);
+        const r = await readFirst(urls);
         const got = r.bytes ? sha256(r.bytes) : undefined;
         const match = got === m.sha256;
         ok &&= match;
-        rows.push({ label: leg.network, id: leg.id, ok: match, detail: match ? 'sha256 match' : `${r.status}${got ? ` got ${got.slice(0, 12)}` : ''}` });
+        rows.push({ label: leg.network, id: leg.id, ok: match, detail: match ? `sha256 match${viaNote(r)}` : `${r.tried.join(', ')}${got ? ` got ${got.slice(0, 12)}` : ''}` });
         continue;
       }
       // A chunked leg: every part must come back with its own sha256, and the
@@ -770,12 +803,12 @@ export class Lading {
       const fetched: Array<{ index: number; sha256: string; bytes: Uint8Array }> = [];
       let legOk = true;
       for (const part of leg.parts) {
-        const url = this.readUrlFor(leg.network, part.id, part.proof);
-        const r = url ? await fetchBytes(url) : { status: 0 };
+        const urls = this.readUrlsFor(leg.network, part.id, part.proof);
+        const r = urls.length ? await readFirst(urls) : { status: 0, url: '', tried: [] as string[] };
         const got = r.bytes ? sha256(r.bytes) : undefined;
         const match = got === part.sha256;
         legOk &&= match;
-        rows.push({ label: `${leg.network}#${part.index + 1}`, id: part.id, ok: match, detail: match ? 'part sha256 match' : `${url ? r.status : 'no read url'}${got ? ` got ${got.slice(0, 12)}` : ''}` });
+        rows.push({ label: `${leg.network}#${part.index + 1}`, id: part.id, ok: match, detail: match ? `part sha256 match${viaNote(r)}` : `${urls.length ? r.tried.join(', ') : 'no read url'}${got ? ` got ${got.slice(0, 12)}` : ''}` });
         if (match && r.bytes) fetched.push({ index: part.index, sha256: part.sha256, bytes: r.bytes });
       }
       let whole: string | undefined;
@@ -791,7 +824,7 @@ export class Lading {
       ok &&= match;
       rows.push({ label: leg.network, id: `${leg.parts.length} parts reassembled`, ok: match, detail: match ? 'sha256 match' : assembly || (whole ? `got ${whole.slice(0, 12)}` : 'parts missing') });
     }
-    return { pubkey: event.pubkey, sha256: m.sha256, size: m.size, legs: m.legs.length, rows, ok, manifest: m };
+    return { pubkey: event.pubkey, sha256: m.sha256, size: m.size, legs: m.legs.length, rows, ok, manifest: m, source };
   }
 
   // ---- renewals ----
@@ -926,11 +959,6 @@ export class Lading {
     const total = rows.reduce((a, r) => a + (r.price ?? 0n), 0n);
     return { sha256: sha, size: bytes.length, parts: n, largestPart: largest, rows, total, quotesPaid: (wq.price ?? 0n) + (fq.price ?? 0n) + (nq.price ?? 0n) };
   }
-}
-
-async function fetchBytes(url: string): Promise<{ status: number; bytes?: Uint8Array }> {
-  const r = await fetch(url);
-  return r.ok ? { status: r.status, bytes: new Uint8Array(await r.arrayBuffer()) } : { status: r.status };
 }
 
 export const partLabel = (r: RenewalRow) => (r.part < 0 ? '' : `#${r.part + 1}/${r.parts}`);

@@ -67,7 +67,7 @@ async function put(file: string) {
 
 async function verify(ref: string) {
   const v = await lading.verify(ref);
-  console.log(`manifest by ${v.pubkey} for sha256 ${v.sha256} (${v.size} bytes), ${v.legs} legs`);
+  console.log(`manifest by ${v.pubkey} for sha256 ${v.sha256} (${v.size} bytes), ${v.legs} legs, read from ${v.source}`);
   for (const row of v.rows) console.log(`  ${row.label.padEnd(8)} ${row.id}  ${row.ok ? '✓' : '✗'} ${row.detail}`);
   console.log(v.ok ? 'ALL LEGS VERIFIED' : 'VERIFICATION FAILED');
   process.exitCode = v.ok ? 0 : 1;

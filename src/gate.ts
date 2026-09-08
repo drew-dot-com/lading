@@ -183,6 +183,7 @@ app.get('/v1/describe', async (_req, res, next) => {
       what: 'Archive broker on TOON: one call, three storage networks, a signed bill of lading named on ArNS. Pay this door with USDC on Base over x402; every hop behind it is ILP.',
       door: { url: PUBLIC_URL, network: NETWORK, payTo: PAY_TO ?? null, facilitator: FREE ? null : FACILITATOR, free: FREE, margin: pricing.margin, floorUsdc: pricing.floorUsdc, maxBodyBytes: MAX_BODY_BYTES },
       edge: lading.opts.edge,
+      read: { arns: lading.opts.gateway, arnsFallback: lading.arnsGateways(), txid: lading.readGateways() },
       payer: { nostrPubkey: lading.payerPubkey() },
       routes: routes.map((r) => ({ key: r.key, route: r.route, units: r.price?.toString() ?? null })),
       install: `claude mcp add lading -e LADING_X402_KEY=0x… -- npx -y lading mcp --gate ${PUBLIC_URL}`,
@@ -220,7 +221,7 @@ app.get('/v1/verify', async (req, res, next) => {
     const ref = String(req.query.ref ?? '');
     if (!ref || ref.includes('/') && !ref.startsWith('http')) throw new HttpError(400, 'ref must be an ArNS name, a manifest txid, or a manifest URL');
     const v = await lading.verify(ref);
-    res.json({ ok: v.ok, pubkey: v.pubkey, sha256: v.sha256, size: v.size, legs: v.legs, rows: v.rows, manifest: v.manifest });
+    res.json({ ok: v.ok, pubkey: v.pubkey, sha256: v.sha256, size: v.size, legs: v.legs, rows: v.rows, manifest: v.manifest, source: v.source });
   } catch (e) {
     next(e);
   }

@@ -18,6 +18,8 @@ services:
       LADING_ANT_ID: ${LADING_ANT_ID}                          # ANT the undernames live on
       LADING_ARNS_BASE_NAME: ${LADING_ARNS_BASE_NAME}          # e.g. boughtviatoonnode
       LADING_ARNS_GATEWAY: ${LADING_ARNS_GATEWAY:-permagate.io}
+      LADING_READ_GATEWAYS: ${LADING_READ_GATEWAYS:-permagate.io,arweave.net,ardrive.net}
+      LADING_ARNS_GATEWAYS: ${LADING_ARNS_GATEWAYS:-ardrive.net,vilenarios.com}
       LADING_SOLANA_KEYPAIR: ${LADING_SOLANA_KEYPAIR}          # JSON array; the ANT owner's key
       SOLANA_RPC: ${SOLANA_RPC:-https://api.mainnet-beta.solana.com}
       LADING_NODE_SECRET: ${LADING_NODE_SECRET:-}
@@ -53,6 +55,8 @@ services:
       LADING_NOSTR_KEY: ${LADING_GATE_NOSTR_KEY:-}             # hex; unset = generated once under /data/gate
       LADING_HOME: /data/gate                                  # channel store, saved manifests, progress files, nostr key
       LADING_ARNS_GATEWAY: ${LADING_ARNS_GATEWAY:-permagate.io}
+      LADING_READ_GATEWAYS: ${LADING_READ_GATEWAYS:-permagate.io,arweave.net,ardrive.net}
+      LADING_ARNS_GATEWAYS: ${LADING_ARNS_GATEWAYS:-ardrive.net,vilenarios.com}
     volumes: [lading_gate_data:/data]
     networks: [relay_deploy_net]
 volumes:
