@@ -54,23 +54,36 @@ export interface ReadResult {
 
 export type FetchLike = (url: string) => Promise<{ ok: boolean; status: number; arrayBuffer(): Promise<ArrayBuffer> }>;
 
-/** Try each URL in order; the first 2xx wins. A thrown fetch counts as status 0 and moves on. */
-export async function readFirst(urls: string[], fetchImpl: FetchLike = fetch as FetchLike): Promise<ReadResult> {
+/** Statuses worth one more try after a pause: rate limited, or a gateway hiccup. */
+const RETRY_STATUSES = new Set([429, 500, 502, 503, 504]);
+
+/**
+ * Try each URL in order; the first 2xx wins. A thrown fetch counts as status 0
+ * and moves on. A 429 or 5xx gets `retries` more tries on the same URL after a
+ * pause (public IPFS gateways rate-limit a verifier that reads several parts
+ * in a row), then the next URL.
+ */
+export async function readFirst(urls: string[], fetchImpl: FetchLike = fetch as FetchLike, retries = 2, pauseMs = 4000): Promise<ReadResult> {
   const tried: string[] = [];
   let last = { status: 0, url: urls[0] ?? '' };
   for (const url of urls) {
     const host = url.replace(/^https?:\/\//, '').split('/')[0];
-    try {
-      const r = await fetchImpl(url);
-      if (r.ok) {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const r = await fetchImpl(url);
+        if (r.ok) {
+          tried.push(`${host} ${r.status}`);
+          return { status: r.status, bytes: new Uint8Array(await r.arrayBuffer()), url, tried };
+        }
         tried.push(`${host} ${r.status}`);
-        return { status: r.status, bytes: new Uint8Array(await r.arrayBuffer()), url, tried };
+        last = { status: r.status, url };
+        if (!RETRY_STATUSES.has(r.status)) break;
+      } catch (e) {
+        tried.push(`${host} ${(e as Error).message.slice(0, 40)}`);
+        last = { status: 0, url };
+        break;
       }
-      tried.push(`${host} ${r.status}`);
-      last = { status: r.status, url };
-    } catch (e) {
-      tried.push(`${host} ${(e as Error).message.slice(0, 40)}`);
-      last = { status: 0, url };
+      if (attempt < retries) await new Promise((d) => setTimeout(d, pauseMs * (attempt + 1)));
     }
   }
   return { ...last, tried };
