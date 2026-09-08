@@ -235,7 +235,7 @@ src/mcp.ts       the MCP shim Claude runs locally: pays the gate per tool call w
 src/walrus.ts    Lighthouse x402 upload (USDC on Base), blobId lookup, aggregator read-back
 src/walrus-native.ts  native Walrus writer: Sui key, WAL + SUI, Mysten upload relay, aggregator read-back
 src/filecoin.ts  Filecoin Onchain Cloud upload (Synapse SDK, USDFC in Filecoin Pay), provider read-back
-src/ipfs.ts      Pinata x402 pin (USDC on Base), read-back from the pinner's gateway and one it does not run
+src/ipfs.ts      Pinata x402 pin (USDC on Base) + our own kubo copy, read-back from our gateway, the pinner's, and one neither runs
 src/filecoin-fund.ts  operator tool: deposit USDFC and approve warm storage, once
 src/quote.ts     the pure deliverability decisions behind the quote doors
 src/arns.ts      ANT undername write, owner or controller
@@ -347,6 +347,19 @@ proves the pin, one it does not run (`ipfs.filebase.io`, then `ipfs.io`;
 raw sha256 CID is checked offline as well. Pinata sells no renewal; a pin
 that runs out is bought again with the same bytes (same CID). `LADING_IPFS=off`
 turns the door off.
+
+Lading also runs its own kubo (`lading-kubo` in the compose project, image
+pinned, `deploy/kubo-init.sh` for its config): every pinned object is added
+there too with Pinata's UnixFS layout, so both name it by the same CID (the
+receipt's `proof.kubo` says `pinned` or names the mismatch), the node
+reprovides what it pins to the DHT so other gateways can find fresh content,
+and `ipfs.<ip>.sslip.io` (Caddy to kubo's gateway, `deploy/Caddyfile.ipfs`)
+is a read path of our own that never rate-limits a read-back. It serves only
+what it pins (`Gateway.NoFetch`), so it is not a public proxy. Port 4001 (TCP
+and UDP) must be open at the host's firewall for other nodes to dial in;
+until it is, kubo reaches the network through a relay circuit. A pin on
+Pinata is still the durability promise; kubo is a second copy on one box.
+`LADING_KUBO_API` (default `http://lading-kubo:5001`) empty skips it.
 
 ## Run it
 
