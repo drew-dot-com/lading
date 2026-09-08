@@ -15,6 +15,13 @@
  *   POST /v1/put                  octet-stream body, x-file-name, x-mime, x-sha256; x402 priced per request.
  *                                 A declared sha this gate already archived is answered from the saved
  *                                 record at the floor price, no leg re-bought (idempotent put).
+ *   GET  /v1/quote/parts?size=N   the multipart bill: the plan, a price per part, the finish price, the total; free
+ *   GET  /v1/parts?sha=<hex>      which parts of an object this gate already bought, per network; free
+ *   POST /v1/parts                one slice (x-object-sha256, x-object-size, x-part-index, x-part-count,
+ *                                 x-part-bytes, x-sha256); x402 priced on the slice; a slice already bought
+ *                                 on arweave and walrus is answered at the floor
+ *   POST /v1/assemble             JSON {sha256, size, partCount, partBytes, name, mime, skip}; x402 priced on
+ *                                 the finish (relay, manifest, name); 409 lists parts still missing
  *   GET  /v1/renew/quote?id=      the door price for one more year on a Lighthouse record; free
  *   POST /v1/renew                JSON {lighthouseId}; x402, flat
  *   GET  /v1/verify?ref=          re-fetch every leg of a manifest and compare sha256; free
@@ -34,10 +41,10 @@ import { decodePaymentSignatureHeader } from '@x402/core/http';
 import { privateKeyToAccount } from 'viem/accounts';
 import { existsSync, readFileSync } from 'node:fs';
 import { createKeyPairSignerFromBytes } from '@solana/kit';
-import { Lading, optionsFromEnv, sha256, type Estimate, type PutResult } from './lib.js';
+import { InputError, Lading, PartsMissingError, optionsFromEnv, sha256, type Estimate, type PutResult } from './lib.js';
 import { judge, lamportsToSol, microToDecimal, report, solanaHoldings, type FloatRow, type FloatsReport } from './floats.js';
 import { cached } from './quote.js';
-import { DEFAULT_PART_BYTES } from './parts.js';
+import { DEFAULT_PART_BYTES, planParts } from './parts.js';
 import { gatePriceMicro, gatePriceUsdc, microToUsdc, pricingFromEnv, usdcToMicro } from './gate-price.js';
 
 import { VERSION } from './version.js';
@@ -57,6 +64,8 @@ const BROKER_URL = process.env.LADING_BROKER_URL;
 /** The payer must hold a channel deposit's worth of USDC so the client can open the next channel, and enough SOL for its rent and fees. */
 const GATE_LOW_USDC = process.env.LADING_GATE_LOW_USDC ?? microToDecimal(BigInt(process.env.LADING_CHANNEL_DEPOSIT ?? '2000000'));
 const GATE_LOW_SOL = process.env.LADING_GATE_LOW_SOL ?? '0.01';
+/** Progress files for objects whose parts were bought but never assembled are dropped after this long. */
+const PROGRESS_MAX_AGE_MS = Number(process.env.LADING_PROGRESS_MAX_AGE_DAYS ?? 7) * 86_400_000;
 
 if (!FREE && !PAY_TO) {
   console.error('gate: set LADING_GATE_PAYTO (Base address for revenue) or LADING_EVM_PRIVATE_KEY, or GATE_FREE=1 for a free door');
@@ -77,11 +86,16 @@ function serialize<T>(fn: () => Promise<T>): Promise<T> {
   return p;
 }
 
-/** The gate's TOON payer address, once. */
-const payerAddress = (async () => {
-  const secret = lading.opts.solanaSecret ?? Uint8Array.from(JSON.parse(readFileSync(lading.opts.solanaKeypair, 'utf8')) as number[]);
-  return (await createKeyPairSignerFromBytes(secret)).address;
-})();
+/** The gate's TOON payer address, derived once on first use (a bad key then fails the doors that need it, not the boot). */
+let payerAddressOnce: Promise<string> | undefined;
+const payerAddress = () =>
+  (payerAddressOnce ??= (async () => {
+    const secret = lading.opts.solanaSecret ?? Uint8Array.from(JSON.parse(readFileSync(lading.opts.solanaKeypair, 'utf8')) as number[]);
+    return (await createKeyPairSignerFromBytes(secret)).address;
+  })().catch((e: Error) => {
+    payerAddressOnce = undefined;
+    throw e;
+  }));
 
 /** The open channel as the client's store records it: headroom is what is left of the deposit before the next channel has to open. */
 function channelHeadroom(): Record<string, string | number | null> {
@@ -100,7 +114,7 @@ function channelHeadroom(): Record<string, string | number | null> {
 
 /** The gate's own two floats, read together and cached: one RPC round per 30 s however often describe is hit. */
 const payerFloats = cached(30_000, async (): Promise<FloatRow[]> => {
-  const owner = await payerAddress;
+  const owner = await payerAddress();
   const h = await solanaHoldings(lading.opts.solanaRpc, owner);
   return [
     judge({
@@ -227,6 +241,63 @@ function putBody(r: PutResult, extra: Record<string, unknown> = {}) {
   };
 }
 
+/** The door price for a bill: margin and floor. */
+const doorPrice = (est: Estimate, what: string) => {
+  if (est.unpriced.length) throw new HttpError(503, `edge did not price ${est.unpriced.join(', ')} (${what})`);
+  return microToUsdc(gatePriceMicro(est.total, pricing));
+};
+const priceBlock = (usdc: string) => ({ usdc, network: NETWORK, payTo: PAY_TO ?? null, margin: pricing.margin, floorUsdc: pricing.floorUsdc });
+const toonBlock = (est: Estimate) => ({ units: est.total.toString(), usdc: microToUsdc(est.total), rows: est.rows.map((r) => ({ leg: r.leg, route: r.route, units: r.price?.toString() ?? null, note: r.note })) });
+
+/** One slice: the three legs and their quote doors for that many bytes. Known on arweave and walrus already: the floor. */
+async function quotePart(size: number, known: boolean) {
+  if (!Number.isInteger(size) || size <= 0) throw new HttpError(400, 'size must be a positive integer');
+  if (size > MAX_BODY_BYTES) throw new HttpError(413, `part over the ${MAX_BODY_BYTES} byte ceiling`);
+  if (known) return { size, reused: true, toon: { units: '0', usdc: microToUsdc(0n), rows: [] }, price: priceBlock(floorUsdc()) };
+  const est = await lading.estimatePart(size);
+  return { size, reused: false, toon: toonBlock(est), price: priceBlock(doorPrice(est, 'part')) };
+}
+
+/** The finish of an object in `n` parts: relay copy, manifest, name. Already archived: the floor. */
+async function quoteFinish(n: number, sha?: string) {
+  if (!Number.isInteger(n) || n <= 0) throw new HttpError(400, 'part count must be a positive integer');
+  if (sha && lading.archived(sha)) return { parts: n, reused: true, toon: { units: '0', usdc: microToUsdc(0n), rows: [] }, price: priceBlock(floorUsdc()) };
+  const est = await lading.estimateFinish(n);
+  return { parts: n, reused: false, toon: toonBlock(est), price: priceBlock(doorPrice(est, 'finish')) };
+}
+
+/** The whole multipart bill for an object of `size` bytes: the plan, a price per part, the finish, the sum. */
+async function quoteParts(size: number, partBytes: number, sha?: string) {
+  if (!Number.isInteger(size) || size <= 0) throw new HttpError(400, 'size must be a positive integer');
+  const plan = planParts(size, partBytes);
+  const status = sha ? lading.partsStatus(sha) : undefined;
+  const parts = [];
+  let total = 0n;
+  for (const p of plan) {
+    // Known here means: the status says both required networks hold this index (the door checks the slice's own hash when it arrives).
+    const known = !!status && (status.archived || (['arweave', 'walrus'] as const).every((n) => status.networks[n]?.indexes.includes(p.index)));
+    const q = await quotePart(p.size, known);
+    parts.push({ index: p.index, size: p.size, reused: q.reused, price: q.price.usdc, toonUnits: q.toon.units });
+    total += usdcToMicro(q.price.usdc);
+  }
+  const finish = await quoteFinish(plan.length, sha);
+  total += usdcToMicro(finish.price.usdc);
+  return {
+    size,
+    partBytes,
+    parts: plan.length,
+    plan: parts,
+    finish: { reused: finish.reused, price: finish.price.usdc, toonUnits: finish.toon.units },
+    total: { usdc: microToUsdc(total), network: NETWORK, payTo: PAY_TO ?? null, payments: plan.length + 1 },
+    ...(status ? { status } : {}),
+  };
+}
+
+const intHeader = (raw: string | undefined, what: string) => {
+  if (raw === undefined || !/^\d+$/.test(raw)) throw new HttpError(400, `${what} must be a non-negative integer`);
+  return Number(raw);
+};
+
 /** The bill for one renewal: the renew route and its quote door, nothing size-dependent. */
 async function quoteRenew() {
   const R = lading.opts.routes;
@@ -262,6 +333,14 @@ app.post('/v1/put', (req, res, next) => {
   return next();
 });
 
+app.post('/v1/parts', (req, res, next) => {
+  const len = req.get('content-length');
+  if (!len || !/^\d+$/.test(len)) return res.status(411).json({ error: 'content-length required: the door is priced on it' });
+  if (Number(len) > MAX_BODY_BYTES) return res.status(413).json({ error: `part over the ${MAX_BODY_BYTES} byte ceiling` });
+  if (Number(len) === 0) return res.status(400).json({ error: 'empty body' });
+  return next();
+});
+
 if (!FREE) {
   const facilitator = new HTTPFacilitatorClient({ url: FACILITATOR });
   const server = new x402ResourceServer(facilitator).register(NETWORK, new ExactEvmScheme());
@@ -281,6 +360,41 @@ if (!FREE) {
             },
           },
           description: 'Lading put: the bytes onto Arweave, Walrus and Filecoin, a signed bill of lading on Arweave, named on ArNS. Priced on content-length; a declared x-sha256 this gate already archived is answered from the record at the floor price.',
+          mimeType: 'application/json',
+          serviceName: 'lading',
+        },
+        'POST /v1/parts': {
+          accepts: {
+            scheme: 'exact',
+            network: NETWORK,
+            payTo: PAY_TO!,
+            maxTimeoutSeconds: 900,
+            price: async (ctx) => {
+              const size = Number(ctx.adapter.getHeader('content-length'));
+              const sha = declaredSha(ctx.adapter.getHeader('x-object-sha256') || undefined);
+              const partSha = declaredSha(ctx.adapter.getHeader('x-sha256') || undefined);
+              const index = ctx.adapter.getHeader('x-part-index');
+              const known = !!sha && !!partSha && index !== undefined && lading.partKnown(sha, Number(index), partSha);
+              return (await quotePart(size, known)).price.usdc;
+            },
+          },
+          description: 'Lading part: one slice of a larger object onto Arweave, Walrus and Filecoin, held until POST /v1/assemble. Priced on the slice; a slice this gate already bought is answered at the floor.',
+          mimeType: 'application/json',
+          serviceName: 'lading',
+        },
+        'POST /v1/assemble': {
+          accepts: {
+            scheme: 'exact',
+            network: NETWORK,
+            payTo: PAY_TO!,
+            maxTimeoutSeconds: 600,
+            price: async (ctx) => {
+              const n = Number(ctx.adapter.getHeader('x-part-count') || 1);
+              const sha = declaredSha(ctx.adapter.getHeader('x-object-sha256') || undefined);
+              return (await quoteFinish(n, sha)).price.usdc;
+            },
+          },
+          description: 'Lading assemble: seal the parts of an object into one bill of lading on Arweave, named on ArNS. Priced on the finish (relay copy, manifest, name).',
           mimeType: 'application/json',
           serviceName: 'lading',
         },
@@ -326,11 +440,13 @@ app.get('/v1/describe', async (_req, res, next) => {
       door: { url: PUBLIC_URL, network: NETWORK, payTo: PAY_TO ?? null, facilitator: FREE ? null : FACILITATOR, free: FREE, margin: pricing.margin, floorUsdc: pricing.floorUsdc, maxBodyBytes: MAX_BODY_BYTES },
       edge: lading.opts.edge,
       read: { arns: lading.opts.gateway, arnsFallback: lading.arnsGateways(), txid: lading.readGateways() },
-      payer: { nostrPubkey: lading.payerPubkey(), solana: await payerAddress },
+      payer: { nostrPubkey: lading.payerPubkey(), solana: await payerAddress().catch(() => null) },
       health: h,
       routes: routes.map((r) => ({ key: r.key, route: r.route, units: r.price?.toString() ?? null })),
       install: `claude mcp add lading -e LADING_X402_KEY=0x… -- npx -y lading mcp --gate ${PUBLIC_URL}`,
-      endpoints: ['GET /v1/quote?size=N[&sha=]', 'GET /v1/manifest?sha=', 'POST /v1/put', 'GET /v1/renew/quote?id=', 'POST /v1/renew', 'GET /v1/verify?ref=', 'GET /v1/floats'],
+      endpoints: ['GET /v1/quote?size=N[&sha=]', 'GET /v1/manifest?sha=', 'POST /v1/put', 'GET /v1/quote/parts?size=N[&sha=]', 'GET /v1/parts?sha=', 'POST /v1/parts', 'POST /v1/assemble', 'GET /v1/renew/quote?id=', 'POST /v1/renew', 'GET /v1/verify?ref=', 'GET /v1/floats'],
+      multipart: `Objects over ${MAX_BODY_BYTES} bytes go as parts of ${DEFAULT_PART_BYTES} bytes: one paid POST /v1/parts per slice (short request, small payment, settles on its own 2xx), then one paid POST /v1/assemble for the manifest and name. A slice already bought is answered at the floor; nothing is held in escrow.`,
+      partBytes: DEFAULT_PART_BYTES,
       idempotent: 'POST /v1/put with x-sha256 set to a hash this gate already archived answers from the saved bill of lading at the floor price and buys no leg; GET /v1/manifest?sha= reads it free.',
     });
   } catch (e) {
@@ -357,6 +473,24 @@ app.get('/v1/renew/quote', async (req, res, next) => {
     res.json({ lighthouseId: id, ...q, record: record === undefined ? { error: `lighthouse ${r.status}` } : record });
   } catch (e) {
     next(e);
+  }
+});
+
+app.get('/v1/quote/parts', async (req, res, next) => {
+  try {
+    res.json(await quoteParts(Number(req.query.size), partBytesOf(req.query['part-bytes']), declaredSha(req.query.sha === undefined ? undefined : String(req.query.sha))));
+  } catch (e) {
+    next(e);
+  }
+});
+
+app.get('/v1/parts', (req, res, next) => {
+  try {
+    const sha = declaredSha(String(req.query.sha ?? ''));
+    if (!sha) throw new HttpError(400, 'sha required');
+    return res.json(lading.partsStatus(sha));
+  } catch (e) {
+    return next(e);
   }
 });
 
@@ -438,6 +572,75 @@ app.post('/v1/put', express.raw({ type: () => true, limit: MAX_BODY_BYTES }), as
   }
 });
 
+app.post('/v1/parts', express.raw({ type: () => true, limit: MAX_BODY_BYTES }), async (req, res, next) => {
+  try {
+    const bytes = new Uint8Array(req.body as Buffer);
+    if (bytes.length === 0) throw new HttpError(400, 'empty body');
+    const sha = declaredSha(req.get('x-object-sha256') || undefined);
+    if (!sha) throw new HttpError(400, 'x-object-sha256 required: the sha256 of the whole object');
+    const size = intHeader(req.get('x-object-size') || undefined, 'x-object-size');
+    const index = intHeader(req.get('x-part-index') || undefined, 'x-part-index');
+    const count = intHeader(req.get('x-part-count') || undefined, 'x-part-count');
+    const partBytes = partBytesOf(req.get('x-part-bytes') || undefined);
+    const partSha = sha256(bytes);
+    const declared = declaredSha(req.get('x-sha256') || undefined);
+    // The door was priced on the declared slice hash; the body has to be that slice. Nothing settles on a 4xx.
+    if (declared && declared !== partSha) throw new HttpError(400, `x-sha256 ${declared.slice(0, 12)}… does not match the body (${partSha.slice(0, 12)}…)`);
+    const rawName = req.get('x-file-name');
+    const name = rawName ? basename(decodeURIComponent(rawName)).slice(0, 200) || `object-${sha.slice(0, 12)}` : `object-${sha.slice(0, 12)}`;
+    const mime = req.get('x-mime') || undefined;
+    const payer = payerOf(req);
+    const known = !!declared && lading.partKnown(sha, index, declared);
+    const quoted = await quotePart(bytes.length, known);
+    log(`part ${sha.slice(0, 12)} ${index + 1}/${count} ${bytes.length} B "${name}" payer=${payer ?? (FREE ? 'free' : '?')} price=${quoted.price.usdc} USDC${known ? ' (already bought: reuse)' : ''}`);
+    const r = await serialize(() => lading.putPart(bytes, { sha256: sha, size, index, count, partBytes, partSha256: partSha, name, mime: mime === 'application/octet-stream' ? undefined : mime }));
+    log(`part ${sha.slice(0, 12)} ${index + 1}/${count} done: ${Object.keys(r.receipts).join('+') || 'nothing'}${r.missing.length ? ` missing ${r.missing.join(',')}` : ''} paid=${r.total}${r.archived ? ' (object already archived)' : ''}`);
+    return res.json({
+      sha256: r.sha256,
+      size: r.size,
+      index: r.index,
+      count: r.count,
+      part: r.part,
+      archived: r.archived ?? false,
+      receipts: r.receipts,
+      missing: r.missing,
+      paid: r.paid.map((p) => ({ leg: p.leg, route: p.route, units: p.price?.toString() ?? null })),
+      toon: { units: r.total.toString(), usdc: microToUsdc(r.total) },
+      price: quoted.price,
+      status: lading.partsStatus(sha),
+      via: { door: 'x402', network: NETWORK, payer: payer ?? null },
+    });
+  } catch (e) {
+    return next(e);
+  }
+});
+
+app.post('/v1/assemble', express.json({ limit: '16kb' }), async (req, res, next) => {
+  try {
+    const b = (req.body ?? {}) as { sha256?: unknown; size?: unknown; partCount?: unknown; partBytes?: unknown; name?: unknown; mime?: unknown; skip?: unknown };
+    const sha = declaredSha(typeof b.sha256 === 'string' ? b.sha256 : undefined);
+    if (!sha) throw new HttpError(400, 'sha256 required');
+    const size = Number(b.size);
+    const count = Number(b.partCount);
+    if (!Number.isInteger(size) || size <= 0) throw new HttpError(400, 'size must be a positive integer');
+    if (!Number.isInteger(count) || count <= 0) throw new HttpError(400, 'partCount must be a positive integer');
+    const partBytes = partBytesOf(b.partBytes === undefined ? undefined : b.partBytes);
+    const name = typeof b.name === 'string' && b.name ? basename(b.name).slice(0, 200) : `object-${sha.slice(0, 12)}`;
+    const mime = typeof b.mime === 'string' && b.mime && b.mime !== 'application/octet-stream' ? b.mime : undefined;
+    const skipList = Array.isArray(b.skip) ? (b.skip as unknown[]).filter((x): x is 'filecoin' | 'walrus' => x === 'filecoin' || x === 'walrus') : [];
+    const skip = Object.fromEntries(skipList.map((k) => [k, true])) as Partial<Record<'filecoin' | 'walrus', boolean>>;
+    const payer = payerOf(req);
+    const quoted = await quoteFinish(count, sha);
+    log(`assemble ${sha.slice(0, 12)} ${size} B in ${count} parts "${name}" payer=${payer ?? (FREE ? 'free' : '?')} price=${quoted.price.usdc} USDC${skipList.length ? ` skip=${skipList.join(',')}` : ''}`);
+    const r = await serialize(() => lading.finish({ sha256: sha, size, count, partBytes, name, mime, skip, via: { door: 'x402', network: NETWORK, ...(payer ? { payer } : {}) } }));
+    log(`assemble ${sha.slice(0, 12)} ${r.reused ? 'reused' : 'done'}: ${r.legs.map((l) => l.network).join('+')} manifest=${r.manifestTxId ?? '-'} name=${r.name?.name ?? '-'} paid=${r.reused ? 0 : r.total}`);
+    return res.json(putBody(r, { price: quoted.price, via: r.reused ? parseVia(r) : { door: 'x402', network: NETWORK, payer: payer ?? null } }));
+  } catch (e) {
+    if (e instanceof PartsMissingError) return res.status(409).json({ error: e.message, sha256: e.sha256, missing: e.missing, status: lading.partsStatus(e.sha256) });
+    return next(e);
+  }
+});
+
 app.post('/v1/renew', express.json({ limit: '4kb' }), async (req, res, next) => {
   try {
     const id = String((req.body as { lighthouseId?: unknown })?.lighthouseId ?? '');
@@ -456,11 +659,22 @@ app.post('/v1/renew', express.json({ limit: '4kb' }), async (req, res, next) => 
 
 app.use((_req, res) => res.status(404).json({ error: 'no such door' }));
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
-  const status = err instanceof HttpError ? err.status : (err as { status?: number; statusCode?: number })?.status ?? (err as { statusCode?: number })?.statusCode ?? 502;
+  const status = err instanceof HttpError ? err.status : err instanceof InputError ? 400 : (err as { status?: number; statusCode?: number })?.status ?? (err as { statusCode?: number })?.statusCode ?? 502;
   const message = (err as Error)?.message ?? String(err);
   if (status >= 500) log(`error ${status}: ${message}`);
   res.status(status).json({ error: message });
 });
+
+const sweep = () => {
+  try {
+    const gone = lading.sweepProgress(PROGRESS_MAX_AGE_MS);
+    if (gone.length) log(`swept ${gone.length} stale progress file(s): ${gone.map((f) => f.slice(0, 12)).join(', ')}`);
+  } catch (e) {
+    log(`sweep failed: ${(e as Error).message}`);
+  }
+};
+sweep();
+setInterval(sweep, 86_400_000).unref();
 
 const server = app.listen(PORT, () => {
   log(`lading gate ${VERSION} on :${PORT}${FREE ? ' FREE (no x402)' : ` x402 ${NETWORK} payTo=${PAY_TO} facilitator=${FACILITATOR}`} edge=${lading.opts.edge} margin=${pricing.margin} floor=${pricing.floorUsdc} maxBody=${MAX_BODY_BYTES}`);

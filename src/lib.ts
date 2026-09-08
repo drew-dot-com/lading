@@ -9,14 +9,14 @@
  * app follows (a handler is a leaf), and it keeps the broker unable to spend
  * on the payer's behalf beyond the one leg it was paid for.
  */
-import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, readdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import { ToonClient, buildJobEvent, sendJob, chargeFor } from '@toon-protocol/client';
 import { getPublicKey, type Event as NostrEvent } from 'nostr-tools/pure';
 import { LEG_KIND, type FilecoinReceipt, type LegReceipt, type NameReceipt, type PartReceipt, type WalrusReceipt, type WalrusRenewReceipt } from './kinds.js';
-import { assembleParts, DEFAULT_PART_BYTES, partName, planParts, splitParts, type Part } from './parts.js';
+import { assembleParts, DEFAULT_PART_BYTES, partName, planParts, splitParts, type Part, type PartPlan } from './parts.js';
 import type { FilecoinQuote, NameQuote, WalrusQuote, WalrusRenewQuote } from './quote.js';
 import { dueWithin, fmtDate, walrusRecords, type RenewalRow, type SavedPut, type SavedRenewal } from './renewals.js';
 import { daysLeft } from './ledger.js';
@@ -170,6 +170,73 @@ export interface PutResult {
   reused?: boolean;
   /** Unix seconds the manifest was signed. */
   archivedAt: number;
+}
+
+export interface PartPutOptions {
+  /** The whole object's sha256 and size; the plan is recomputed from them. */
+  sha256: string;
+  size: number;
+  index: number;
+  count: number;
+  partBytes?: number;
+  /** The slice's own sha256 when the caller declared one; checked against the bytes. */
+  partSha256?: string;
+  name: string;
+  mime?: string;
+  quote?: boolean;
+  skip?: PutOptions['skip'];
+}
+
+export interface PartResult {
+  sha256: string;
+  size: number;
+  index: number;
+  count: number;
+  part: { sha256: string; size: number };
+  /** The receipt each network handed back for this slice, sealed or not. */
+  receipts: Partial<Record<Network, PartReceipt>>;
+  /** Networks that did not buy this slice (a refused quote). */
+  missing: Network[];
+  paid: PaidRow[];
+  total: bigint;
+  /** The object already has a bill of lading; nothing was bought. */
+  archived?: boolean;
+}
+
+export interface FinishOptions {
+  sha256: string;
+  size: number;
+  count: number;
+  partBytes?: number;
+  name: string;
+  mime?: string;
+  undername?: string;
+  quote?: boolean;
+  skip?: PutOptions['skip'];
+  via?: ManifestContent['via'];
+  force?: boolean;
+}
+
+export interface PartsStatus {
+  sha256: string;
+  archived: boolean;
+  manifestTxId?: string;
+  name?: string;
+  networks: Partial<Record<Network, { indexes: number[]; sealed: boolean }>>;
+  paidUnits: string;
+}
+
+/** A caller's mistake (a plan that does not match, a hash that does not match the bytes, nothing bought yet): a door answers 400, never 5xx. */
+export class InputError extends Error {}
+
+/** A finish that cannot seal: which indexes each network still lacks. */
+export class PartsMissingError extends Error {
+  constructor(
+    readonly sha256: string,
+    readonly missing: Partial<Record<Network, number[]>>,
+  ) {
+    super(`parts missing: ${Object.entries(missing).map(([k, v]) => `${k} ${v.join(',')}`).join('; ')}; send them to /v1/parts again, or skip that network`);
+  }
 }
 
 export interface QuoteRow {
@@ -424,6 +491,33 @@ export class Lading {
   /** A manifest with three legs, plus part receipts, before signing. */
   private manifestGuess = (n: number) => 1200 + 3 * 400 + (n > 1 ? 3 * n * 400 : 0);
 
+  /** The bill for one slice of `size` bytes on the three networks, each quote door asked once: what the gate charges per `POST /v1/parts`. Free. */
+  async estimatePart(size: number): Promise<Estimate> {
+    const R = this.opts.routes;
+    const rows: QuoteRow[] = [
+      { leg: 'arweave', route: R.ario, price: await this.charge(R.ario, this.eventBytes({}, size)), note: 'schedule on the payload' },
+      { leg: 'walrus-quote', route: R.walrusQuote, price: await this.charge(R.walrusQuote, 0), note: 'quote door' },
+      { leg: 'walrus', route: R.walrus, price: await this.charge(R.walrus, 0), note: 'flat' },
+      { leg: 'filecoin-quote', route: R.filecoinQuote, price: await this.charge(R.filecoinQuote, 0), note: 'quote door' },
+      { leg: 'filecoin', route: R.filecoin, price: await this.charge(R.filecoin, 0), note: 'flat' },
+    ];
+    const unpriced = [...new Set(rows.filter((r) => r.price === null).map((r) => r.route))];
+    return { size, parts: 1, rows, total: rows.reduce((a, r) => a + (r.price ?? 0n), 0n), unpriced };
+  }
+
+  /** The bill for the finish of an object in `n` parts: relay copy, manifest on Arweave, name quote, name. Free. */
+  async estimateFinish(n: number): Promise<Estimate> {
+    const R = this.opts.routes;
+    const rows: QuoteRow[] = [
+      { leg: 'relay', route: R.relay, price: await this.charge(R.relay, this.manifestGuess(n)), note: 'manifest copy' },
+      { leg: 'manifest', route: R.ario, price: await this.charge(R.ario, this.manifestGuess(n)), note: 'manifest on Arweave, estimate' },
+      { leg: 'name-quote', route: R.nameQuote, price: await this.charge(R.nameQuote, 0), note: 'quote door' },
+      { leg: 'name', route: R.name, price: await this.charge(R.name, 0), note: 'flat' },
+    ];
+    const unpriced = [...new Set(rows.filter((r) => r.price === null).map((r) => r.route))];
+    return { size: 0, parts: n, rows, total: rows.reduce((a, r) => a + (r.price ?? 0n), 0n), unpriced };
+  }
+
   /**
    * The bill from route prices alone, every leg assumed deliverable and every
    * quote door asked once. Costs nothing: the edge's price endpoint is free.
@@ -468,72 +562,99 @@ export class Lading {
 
   // ---- legs ----
 
+  /** The job that buys one part on one network, and how its outcome prints. */
+  private legSender(network: Network, o: { name: string; mime?: string }): { send: (part: Part, name: string) => Promise<PartOutcome>; line: (out: PartOutcome) => string } {
+    const R = this.opts.routes;
+    const blobEvent = (kind: number, params: Record<string, string>, part: Part, extra: string[][] = []) =>
+      buildJobEvent({ kind, params, tags: [['i', Buffer.from(part.bytes).toString('base64'), 'blob'], ...extra] });
+    // Arweave, through the org store. The store FULFILLs on the txId.
+    if (network === 'arweave')
+      return {
+        send: async (part) => {
+          const ev = blobEvent(5094, {}, part, [['bid', '100000', 'usdc'], ['output', o.mime ?? 'application/octet-stream']]);
+          const r = await this.job<{ txId?: string }>(R.ario, ev as never);
+          const txId = r.receipt.txId;
+          if (!txId) throw new Error(`arweave leg accepted without a txId: ${JSON.stringify(r.receipt)}`);
+          return { id: txId, proof: { readUrl: `https://${this.opts.gateway}/${txId}` }, retention: 'permanent', provider: 'toon-store', route: r.route, price: r.price };
+        },
+        line: (out) => out.id,
+      };
+    // Walrus, through Lading's door. Lading FULFILLs on the blobId.
+    if (network === 'walrus')
+      return {
+        send: async (part, pname) => {
+          const r = await this.job<WalrusReceipt>(R.walrus, blobEvent(LEG_KIND, { op: 'walrus', name: pname || o.name }, part) as never, 240_000);
+          return { id: r.receipt.id, sha256: r.receipt.sha256, proof: r.receipt.proof, retention: r.receipt.retention, provider: r.receipt.provider, route: r.route, price: r.price };
+        },
+        line: (out) => `${out.id}  readback=${out.proof?.readback}`,
+      };
+    // Filecoin Onchain Cloud, through Lading's door. Lading FULFILLs on the PieceCID once the provider committed the piece and served it back.
+    return {
+      send: async (part, pname) => {
+        const r = await this.job<FilecoinReceipt>(R.filecoin, blobEvent(LEG_KIND, { op: 'filecoin', name: pname || o.name }, part) as never, 300_000);
+        return { id: r.receipt.id, sha256: r.receipt.sha256, proof: r.receipt.proof, retention: r.receipt.retention, provider: r.receipt.provider, route: r.route, price: r.price };
+      },
+      line: (out) => `${out.id}  dataSet=${out.proof?.dataSetId} copies=${out.proof?.copies} readback=${out.proof?.readback}`,
+    };
+  }
+
   /**
-   * Run one network's leg over every part: reuse parts already bought, pay for
-   * the rest one job at a time, save after each. A single part gives the same
-   * leg shape as before chunking existed; several give a leg with `parts`.
+   * Buy the given parts on one network: reuse any already in the progress
+   * file, pay for the rest one job at a time, save after each. `count` is the
+   * whole object's part count, for the log tag and the part names. Nothing is
+   * sealed here; sealLeg does that once every part of the object is in.
    */
-  private async runLeg(o: {
-    network: Network;
-    sha: string;
-    size: number;
-    parts: Part[];
-    prog: Progress;
-    paid: PaidRow[];
-    t0: number;
-    baseName: string;
-    send: (part: Part, name: string) => Promise<PartOutcome>;
-    line: (o: PartOutcome) => string;
-  }): Promise<LegReceipt> {
-    const { network, parts, prog } = o;
-    const done = prog.legs[network];
-    if (done) {
-      this.log(`${network.padEnd(8)} ✓ ${done.id}${done.parts ? ` (${done.parts.length} parts)` : ''}  resumed, already bought`);
-      return done;
-    }
+  private async buyParts(o: { network: Network; sha: string; count: number; parts: Part[]; prog: Progress; paid: PaidRow[]; t0: number; baseName: string; mime?: string }): Promise<void> {
+    const { network, prog, count } = o;
+    if (prog.legs[network]) return;
     const have = (prog.parts[network] ??= []);
-    const outcomes: Array<{ part: Part; outcome: PartOutcome }> = [];
-    let retention = '';
-    let provider = '';
-    let total = 0n;
-    let known = true;
-    for (const part of parts) {
-      const tag = parts.length === 1 ? network.padEnd(8) : `${network}#${part.index + 1}/${parts.length}`.padEnd(8);
+    const { send, line } = this.legSender(network, { name: o.baseName, mime: o.mime });
+    for (const part of o.parts) {
+      const tag = count === 1 ? network.padEnd(8) : `${network}#${part.index + 1}/${count}`.padEnd(8);
       const prior = have.find((r) => r.index === part.index);
       if (prior) {
         if (prior.sha256 !== part.sha256) throw new Error(`${network} part ${part.index} was bought for a different slice (${prior.sha256.slice(0, 12)}); pass --part-bytes as before, or delete ${this.progressPath(o.sha)}`);
-        const { retention: pr, provider: pp, ...pproof } = prior.proof ?? {};
-        retention ||= String(pr ?? '');
-        provider ||= String(pp ?? '');
-        if (prior.paid) total += BigInt(prior.paid);
-        else known = false;
         this.log(`${tag} ✓ ${prior.id}  resumed, already bought`);
-        outcomes.push({ part, outcome: { id: prior.id, sha256: prior.sha256, proof: pproof, retention: String(pr ?? ''), provider: String(pp ?? ''), route: '', price: prior.paid ? BigInt(prior.paid) : null } });
         continue;
       }
-      const out = await o.send(part, partName(o.baseName, part.index, parts.length));
+      const out = await send(part, partName(o.baseName, part.index, count));
       if (out.sha256 !== undefined && out.sha256 !== part.sha256) throw new Error(`${network} receipt is for sha ${out.sha256}, not ${part.sha256}`);
-      retention = out.retention;
-      provider = out.provider;
-      if (out.price === null) known = false;
-      else total += out.price;
-      const legLabel = parts.length === 1 ? network : `${network}#${part.index + 1}`;
+      const legLabel = count === 1 ? network : `${network}#${part.index + 1}`;
       o.paid.push({ leg: legLabel, route: out.route, price: out.price });
       prog.paid.push({ leg: legLabel, route: out.route, price: out.price?.toString() ?? null });
       have.push({ index: part.index, id: out.id, sha256: part.sha256, size: part.size, proof: { ...out.proof, retention: out.retention, provider: out.provider }, ...(out.price !== null ? { paid: out.price.toString() } : {}) });
       this.saveProgress(o.sha, prog);
-      outcomes.push({ part, outcome: out });
-      this.log(`${tag} ✓ ${o.line(out)}  (${Date.now() - o.t0} ms)`);
+      this.log(`${tag} ✓ ${line(out)}  (${Date.now() - o.t0} ms)`);
     }
-    outcomes.sort((a, b) => a.part.index - b.part.index);
-    const first = outcomes[0]!.outcome;
-    retention ||= first.retention;
-    provider ||= first.provider;
+  }
+
+  /**
+   * The leg receipt for one network once every part of the plan is in the
+   * progress file: a single part gives the same leg shape as before chunking
+   * existed, several give a leg with `parts`. Otherwise the indexes still missing.
+   */
+  private sealLeg(o: { network: Network; sha: string; size: number; plan: PartPlan[]; prog: Progress }): { leg?: LegReceipt; missing: number[] } {
+    const { network, prog } = o;
+    const done = prog.legs[network];
+    if (done) {
+      this.log(`${network.padEnd(8)} ✓ ${done.id}${done.parts ? ` (${done.parts.length} parts)` : ''}  resumed, already bought`);
+      return { leg: done, missing: [] };
+    }
+    const have = prog.parts[network] ?? [];
+    const rows = o.plan.map((p) => have.find((r) => r.index === p.index));
+    const missing = o.plan.filter((_, i) => !rows[i]).map((p) => p.index);
+    if (missing.length) return { missing };
+    const receipts = rows as PartReceipt[];
+    const first = receipts[0]!;
+    const { retention: fr, provider: fp, ...firstProof } = first.proof ?? {};
+    const known = receipts.every((r) => r.paid !== undefined);
+    const paidStr = known ? receipts.reduce((a, r) => a + BigInt(r.paid!), 0n).toString() : undefined;
     const at = Math.floor(Date.now() / 1000);
-    const paidStr = known ? total.toString() : undefined;
+    const retention = String(fr ?? '');
+    const provider = String(fp ?? '');
     const leg: LegReceipt =
-      parts.length === 1
-        ? { network, id: first.id, sha256: o.sha, size: o.size, retention, provider, proof: first.proof, ...(paidStr ? { paid: paidStr } : {}), at }
+      receipts.length === 1
+        ? { network, id: first.id, sha256: o.sha, size: o.size, retention, provider, proof: firstProof, ...(paidStr ? { paid: paidStr } : {}), at }
         : {
             network,
             id: first.id,
@@ -543,146 +664,102 @@ export class Lading {
             provider,
             ...(paidStr ? { paid: paidStr } : {}),
             at,
-            parts: outcomes.map(({ part, outcome }) => {
-              const { retention: _r, provider: _p, ...proof } = outcome.proof ?? {};
-              return { index: part.index, id: outcome.id, sha256: part.sha256, size: part.size, ...(Object.keys(proof).length ? { proof } : {}), ...(outcome.price !== null ? { paid: outcome.price.toString() } : {}) };
+            parts: receipts.map((r) => {
+              const { retention: _r, provider: _p, ...proof } = r.proof ?? {};
+              return { index: r.index, id: r.id, sha256: r.sha256, size: r.size, ...(Object.keys(proof).length ? { proof } : {}), ...(r.paid !== undefined ? { paid: r.paid } : {}) };
             }),
           };
     prog.legs[network] = leg;
     this.saveProgress(o.sha, prog);
-    return leg;
+    return { leg, missing: [] };
+  }
+
+  /** Seal every network that bought anything. A network with no parts at all was refused by its quote and is simply absent. */
+  private sealAll(o: { sha: string; size: number; plan: PartPlan[]; prog: Progress; skip: PutOptions['skip'] }): { legs: LegReceipt[]; incomplete: Partial<Record<Network, number[]>> } {
+    const legs: LegReceipt[] = [];
+    const incomplete: Partial<Record<Network, number[]>> = {};
+    for (const network of ['arweave', 'walrus', 'filecoin'] as const) {
+      if (o.skip?.[network]) continue;
+      if (!o.prog.legs[network] && !o.prog.parts[network]?.length) continue;
+      const r = this.sealLeg({ network, sha: o.sha, size: o.size, plan: o.plan, prog: o.prog });
+      if (r.leg) legs.push(r.leg);
+      else incomplete[network] = r.missing;
+    }
+    return { legs, incomplete };
   }
 
   /**
-   * Archive: arweave leg → walrus leg → filecoin leg → sign the bill of lading
-   * → publish to relay → write it to Arweave → name it on ArNS. Each leg is
-   * one paid job per part; a part that fails buys nothing downstream, and the
-   * parts already bought are saved so a re-run resumes, not re-buys.
+   * The three legs over the given parts (all of them for a put, one for a
+   * part call). Walrus and Filecoin are quoted first for the largest part: a
+   * leg the broker cannot deliver still costs its route price, and with
+   * several parts the float must cover them all. A refused Walrus quote
+   * throws (nothing paid); a refused Filecoin quote skips that network.
    */
-  async put(bytes: Uint8Array, po: PutOptions): Promise<PutResult> {
-    const R = this.opts.routes;
-    const skip = po.skip ?? {};
-    const doQuote = po.quote !== false;
-    const sha = sha256(bytes);
-    const name = po.name;
-    const parts = splitParts(bytes, po.partBytes ?? DEFAULT_PART_BYTES);
-    const n = parts.length;
-    const sk = this.nostrSecret();
-    const payerPubkey = getPublicKey(sk);
-    this.log(`${name}: ${bytes.length} bytes, sha256 ${sha}${n > 1 ? `, ${n} parts of up to ${Math.max(...parts.map((q) => q.size))} bytes` : ''}\npayer nostr pubkey ${payerPubkey}\nedge ${this.opts.edge}`);
-    // Same bytes, same home: the bill of lading already exists, so hand it back
-    // rather than buying every leg again. A saved put that never got its name
-    // gets the name leg now, which is the one thing still owed.
-    if (!po.force) {
-      const prior = this.archived(sha);
-      if (prior) {
-        this.log(`already archived ${fmtDate(prior.archivedAt * 1000)}: manifest ${prior.manifestTxId}${prior.name ? `, named ${prior.name.name}` : ', not yet named'}; nothing re-bought (force to archive again)`);
-        if (!prior.name && !skip.name) await this.nameOnly(sha, { undername: po.undername, quote: doQuote, skipRelay: skip.relay });
-        return this.archived(sha)!;
+  private async runLegs(o: { sha: string; size: number; count: number; parts: Part[]; prog: Progress; paid: PaidRow[]; t0: number; name: string; mime?: string; skip: NonNullable<PutOptions['skip']>; quote: boolean }): Promise<void> {
+    const { prog, paid, t0, skip } = o;
+    const largest = Math.max(...o.parts.map((x) => x.size));
+    const left = (network: Network) => o.parts.filter((p) => !prog.parts[network]?.some((r) => r.index === p.index)).length;
+    const common = { sha: o.sha, count: o.count, parts: o.parts, prog, paid, t0, baseName: o.name, mime: o.mime };
+
+    if (!skip.arweave) await this.buyParts({ ...common, network: 'arweave' });
+
+    if (!skip.walrus && !prog.legs.walrus) {
+      const n = left('walrus');
+      if (o.quote && n > 0) {
+        const q = await this.quoteWalrus(largest, o.name);
+        paid.push({ leg: 'walrus-quote', route: q.route, price: q.price });
+        const need = timesMicro(q.receipt.downstream.amountUsdc, n);
+        const short = q.receipt.deliverable && n > 1 && micro(q.receipt.float.balance) < micro(need);
+        this.log(`walrus   quote ${fmtQuote(q.receipt)}${n > 1 ? `, ${n} parts need ${need} USDC` : ''}  (${Date.now() - t0} ms)`);
+        if (!q.receipt.deliverable || short) throw new Error(`walrus leg would not go through; nothing paid for it. Re-run with --skip-walrus to archive without it. (${short ? `float ${q.receipt.float.balance} USDC is under the ${need} USDC that ${n} parts cost` : q.receipt.reason})`);
       }
-    }
-    const c = await this.client();
-    const legs: LegReceipt[] = [];
-    const paid: PaidRow[] = [];
-    const prog = this.loadProgress(sha);
-    if (Object.keys(prog.legs).length || Object.keys(prog.parts).length) {
-      for (const row of prog.paid) paid.push({ ...row, price: row.price === null ? null : BigInt(row.price) });
-      this.log(`resuming: ${Object.keys(prog.legs).join(',') || 'no'} legs and ${Object.entries(prog.parts).map(([k, v]) => `${k}=${v?.length ?? 0}`).join(' ') || 'no'} parts already bought`);
-    }
-    const t0 = Date.now();
-    const blobEvent = (kind: number, params: Record<string, string>, part: Part, extra: string[][] = []) =>
-      buildJobEvent({ kind, params, tags: [['i', Buffer.from(part.bytes).toString('base64'), 'blob'], ...extra] });
-    const common = { sha, size: bytes.length, parts, prog, paid, t0, baseName: name };
-
-    // Leg 1: Arweave, through the org store. The store FULFILLs on the txId.
-    if (!skip.arweave) {
-      legs.push(
-        await this.runLeg({
-          ...common,
-          network: 'arweave',
-          send: async (part) => {
-            const ev = blobEvent(5094, {}, part, [['bid', '100000', 'usdc'], ['output', po.mime ?? 'application/octet-stream']]);
-            const r = await this.job<{ txId?: string }>(R.ario, ev as never);
-            const txId = r.receipt.txId;
-            if (!txId) throw new Error(`arweave leg accepted without a txId: ${JSON.stringify(r.receipt)}`);
-            return { id: txId, proof: { readUrl: `https://${this.opts.gateway}/${txId}` }, retention: 'permanent', provider: 'toon-store', route: r.route, price: r.price };
-          },
-          line: (o) => o.id,
-        }),
-      );
+      await this.buyParts({ ...common, network: 'walrus' });
     }
 
-    // Leg 2: Walrus, through Lading's door. Lading FULFILLs on the blobId.
-    // Quoted first for the largest part: a leg the broker cannot deliver still
-    // costs its route price. With several parts the float must cover them all.
-    if (!skip.walrus && !prog.legs.walrus && doQuote) {
-      const q = await this.quoteWalrus(Math.max(...parts.map((x) => x.size)), name);
-      paid.push({ leg: 'walrus-quote', route: q.route, price: q.price });
-      const left = n - (prog.parts.walrus?.length ?? 0);
-      const need = timesMicro(q.receipt.downstream.amountUsdc, left);
-      const short = q.receipt.deliverable && left > 1 && micro(q.receipt.float.balance) < micro(need);
-      this.log(`walrus   quote ${fmtQuote(q.receipt)}${left > 1 ? `, ${left} parts need ${need} USDC` : ''}  (${Date.now() - t0} ms)`);
-      if (!q.receipt.deliverable || short) throw new Error(`walrus leg would not go through; nothing paid for it. Re-run with --skip-walrus to archive without it. (${short ? `float ${q.receipt.float.balance} USDC is under the ${need} USDC that ${left} parts cost` : q.receipt.reason})`);
-    }
-    if (!skip.walrus) {
-      legs.push(
-        await this.runLeg({
-          ...common,
-          network: 'walrus',
-          send: async (part, pname) => {
-            const r = await this.job<WalrusReceipt>(R.walrus, blobEvent(LEG_KIND, { op: 'walrus', name: pname || name }, part) as never, 240_000);
-            return { id: r.receipt.id, sha256: r.receipt.sha256, proof: r.receipt.proof, retention: r.receipt.retention, provider: r.receipt.provider, route: r.route, price: r.price };
-          },
-          line: (o) => `${o.id}  readback=${o.proof?.readback}`,
-        }),
-      );
-    }
-
-    // Leg 2b: Filecoin Onchain Cloud, through Lading's door. Lading FULFILLs on
-    // the PieceCID once the provider has committed the piece and served it back.
-    if (!skip.filecoin) {
+    if (!skip.filecoin && !prog.legs.filecoin) {
+      const n = left('filecoin');
       let go = true;
-      if (doQuote && !prog.legs.filecoin) {
-        const q = await this.quoteFilecoin(Math.max(...parts.map((x) => x.size)), name);
+      if (o.quote && n > 0) {
+        const q = await this.quoteFilecoin(largest, o.name);
         paid.push({ leg: 'filecoin-quote', route: q.route, price: q.price });
-        const left = n - (prog.parts.filecoin?.length ?? 0);
-        const need = timesMicro(q.receipt.downstream.addPieceFeeUsdfc, left);
-        const short = q.receipt.deliverable && left > 1 && micro(q.receipt.float.available) < micro(need);
-        this.log(`filecoin quote ${fmtQuote(q.receipt)}${left > 1 ? `, ${left} parts need ${need} USDFC in fees` : ''}  (${Date.now() - t0} ms)`);
+        const need = timesMicro(q.receipt.downstream.addPieceFeeUsdfc, n);
+        const short = q.receipt.deliverable && n > 1 && micro(q.receipt.float.available) < micro(need);
+        this.log(`filecoin quote ${fmtQuote(q.receipt)}${n > 1 ? `, ${n} parts need ${need} USDFC in fees` : ''}  (${Date.now() - t0} ms)`);
         if (!q.receipt.deliverable || short) {
           go = false;
-          this.log(`filecoin SKIPPED, nothing paid for it: ${short ? `available ${q.receipt.float.available} USDFC is under the ${need} USDFC that ${left} parts cost` : q.receipt.reason}`);
+          this.log(`filecoin SKIPPED, nothing paid for it: ${short ? `available ${q.receipt.float.available} USDFC is under the ${need} USDFC that ${n} parts cost` : q.receipt.reason}`);
         }
       }
-      if (go) {
-        legs.push(
-          await this.runLeg({
-            ...common,
-            network: 'filecoin',
-            send: async (part, pname) => {
-              const r = await this.job<FilecoinReceipt>(R.filecoin, blobEvent(LEG_KIND, { op: 'filecoin', name: pname || name }, part) as never, 300_000);
-              return { id: r.receipt.id, sha256: r.receipt.sha256, proof: r.receipt.proof, retention: r.receipt.retention, provider: r.receipt.provider, route: r.route, price: r.price };
-            },
-            line: (o) => `${o.id}  dataSet=${o.proof?.dataSetId} copies=${o.proof?.copies} readback=${o.proof?.readback}`,
-          }),
-        );
-      }
+      if (go) await this.buyParts({ ...common, network: 'filecoin' });
     }
+  }
 
+  /**
+   * The tail every archive shares once its legs are sealed: sign the bill of
+   * lading, publish it to the relay, write it to Arweave, name it on ArNS.
+   * Saves the record as soon as the manifest is on Arweave and clears the
+   * progress file, so a failed name leg is resumable with `lading name`.
+   */
+  private async attest(o: { sha: string; size: number; count: number; mime?: string; legs: LegReceipt[]; paid: PaidRow[]; t0: number; po: Pick<PutOptions, 'via' | 'undername' | 'quote' | 'skip'> }): Promise<PutResult> {
+    const R = this.opts.routes;
+    const { sha, paid, t0, legs } = o;
+    const skip = o.po.skip ?? {};
+    const doQuote = o.po.quote !== false;
     if (legs.length === 0) throw new Error('every leg was skipped; nothing to attest');
+    const sk = this.nostrSecret();
+    const c = await this.client();
 
-    // The bill of lading, signed by the payer.
     const content: ManifestContent = {
       sha256: sha,
-      size: bytes.length,
-      mime: po.mime,
+      size: o.size,
+      mime: o.mime,
       legs,
-      ...(po.via ? { via: po.via } : {}),
+      ...(o.po.via ? { via: o.po.via } : {}),
       created: Math.floor(Date.now() / 1000),
     };
     let manifest = buildManifest(content, sk);
 
-    // Leg 3: publish to the relay (a plain paid write of the signed event).
+    // Publish to the relay (a plain paid write of the signed event).
     if (!skip.relay) {
       const r = await c.send(R.relay, { body: { event: manifest } });
       const price = r.fulfilled ? (r.claim?.amount ?? null) : null;
@@ -691,7 +768,7 @@ export class Lading {
       this.log(`relay    ✓ event ${manifest.id}  (${Date.now() - t0} ms)`);
     }
 
-    // Leg 4: the manifest itself onto Arweave, then named.
+    // The manifest itself onto Arweave, then named.
     let manifestTxId: string | undefined;
     let nameReceipt: NameReceipt | undefined;
     if (!skip.arweave) {
@@ -713,7 +790,7 @@ export class Lading {
       this.clearProgress(sha);
 
       let nameOk = !skip.name;
-      const undername = po.undername ?? undernameFor(sha);
+      const undername = o.po.undername ?? undernameFor(sha);
       if (nameOk && doQuote) {
         const q = await this.quoteName(undername, manifestTxId);
         paid.push({ leg: 'name-quote', route: q.route, price: q.price });
@@ -740,9 +817,9 @@ export class Lading {
     const total = paid.reduce((a, p) => a + (p.price ?? 0n), 0n);
     return {
       sha256: sha,
-      size: bytes.length,
-      parts: n,
-      payerPubkey,
+      size: o.size,
+      parts: o.count,
+      payerPubkey: getPublicKey(sk),
       legs,
       manifest,
       manifestTxId,
@@ -753,6 +830,157 @@ export class Lading {
       manifestUrl: manifestTxId ? `https://${this.opts.gateway}/${manifestTxId}` : undefined,
       archivedAt: manifest.created_at,
     };
+  }
+
+  /** The progress file's paid rows as PaidRows. */
+  private paidFrom(prog: Progress): PaidRow[] {
+    return prog.paid.map((row) => ({ ...row, price: row.price === null ? null : BigInt(row.price) }));
+  }
+
+  /**
+   * Archive: arweave leg → walrus leg → filecoin leg → sign the bill of lading
+   * → publish to relay → write it to Arweave → name it on ArNS. Each leg is
+   * one paid job per part; a part that fails buys nothing downstream, and the
+   * parts already bought are saved so a re-run resumes, not re-buys.
+   */
+  async put(bytes: Uint8Array, po: PutOptions): Promise<PutResult> {
+    const skip = po.skip ?? {};
+    const doQuote = po.quote !== false;
+    const sha = sha256(bytes);
+    const name = po.name;
+    const parts = splitParts(bytes, po.partBytes ?? DEFAULT_PART_BYTES);
+    const n = parts.length;
+    const payerPubkey = getPublicKey(this.nostrSecret());
+    this.log(`${name}: ${bytes.length} bytes, sha256 ${sha}${n > 1 ? `, ${n} parts of up to ${Math.max(...parts.map((q) => q.size))} bytes` : ''}\npayer nostr pubkey ${payerPubkey}\nedge ${this.opts.edge}`);
+    // Same bytes, same home: the bill of lading already exists, so hand it back
+    // rather than buying every leg again. A saved put that never got its name
+    // gets the name leg now, which is the one thing still owed.
+    if (!po.force) {
+      const prior = this.archived(sha);
+      if (prior) {
+        this.log(`already archived ${fmtDate(prior.archivedAt * 1000)}: manifest ${prior.manifestTxId}${prior.name ? `, named ${prior.name.name}` : ', not yet named'}; nothing re-bought (force to archive again)`);
+        if (!prior.name && !skip.name) await this.nameOnly(sha, { undername: po.undername, quote: doQuote, skipRelay: skip.relay });
+        return this.archived(sha)!;
+      }
+    }
+    await this.client();
+    const prog = this.loadProgress(sha);
+    const paid: PaidRow[] = [];
+    if (Object.keys(prog.legs).length || Object.keys(prog.parts).length) {
+      paid.push(...this.paidFrom(prog));
+      this.log(`resuming: ${Object.keys(prog.legs).join(',') || 'no'} legs and ${Object.entries(prog.parts).map(([k, v]) => `${k}=${v?.length ?? 0}`).join(' ') || 'no'} parts already bought`);
+    }
+    const t0 = Date.now();
+    await this.runLegs({ sha, size: bytes.length, count: n, parts, prog, paid, t0, name, mime: po.mime, skip, quote: doQuote });
+    const { legs, incomplete } = this.sealAll({ sha, size: bytes.length, plan: parts, prog, skip });
+    const gaps = Object.entries(incomplete);
+    if (gaps.length) throw new Error(`parts missing after the legs ran: ${gaps.map(([k, v]) => `${k} ${v.join(',')}`).join('; ')}`);
+    return this.attest({ sha, size: bytes.length, count: n, mime: po.mime, legs, paid, t0, po });
+  }
+
+  /**
+   * One slice of an object, bought on every network, into the object's
+   * progress file: what the gate runs per `POST /v1/parts`. The plan is
+   * recomputed from `size` and `partBytes`, so the caller's slice must be the
+   * one the plan gives for `index`. Nothing is sealed or attested here.
+   */
+  async putPart(bytes: Uint8Array, o: PartPutOptions): Promise<PartResult> {
+    const partBytes = o.partBytes ?? DEFAULT_PART_BYTES;
+    const plan = planParts(o.size, partBytes);
+    if (plan.length !== o.count) throw new InputError(`an object of ${o.size} bytes splits into ${plan.length} parts of ${partBytes}, not ${o.count}`);
+    const p = plan[o.index];
+    if (!p) throw new InputError(`part index ${o.index} is out of range for ${plan.length} parts`);
+    if (p.size !== bytes.length) throw new InputError(`part ${o.index} of a ${o.size}-byte object is ${p.size} bytes, got ${bytes.length}`);
+    const part: Part = { ...p, bytes, sha256: sha256(bytes) };
+    if (o.partSha256 && o.partSha256 !== part.sha256) throw new InputError(`part sha256 ${o.partSha256.slice(0, 12)}… does not match the bytes (${part.sha256.slice(0, 12)}…)`);
+    const prior = this.archived(o.sha256);
+    if (prior) {
+      this.log(`part ${o.index + 1}/${o.count}: object already archived as ${prior.manifestTxId}; nothing bought`);
+      return { sha256: o.sha256, size: o.size, index: o.index, count: o.count, part: { sha256: part.sha256, size: part.size }, receipts: {}, missing: [], paid: [], total: 0n, archived: true };
+    }
+    this.log(`${o.name} part ${o.index + 1}/${o.count}: ${bytes.length} bytes, sha256 ${part.sha256}, object ${o.sha256}`);
+    await this.client();
+    const prog = this.loadProgress(o.sha256);
+    const paid: PaidRow[] = [];
+    const t0 = Date.now();
+    await this.runLegs({ sha: o.sha256, size: o.size, count: o.count, parts: [part], prog, paid, t0, name: o.name, mime: o.mime, skip: o.skip ?? {}, quote: o.quote !== false });
+    const receipts: PartResult['receipts'] = {};
+    const missing: Network[] = [];
+    for (const network of ['arweave', 'walrus', 'filecoin'] as const) {
+      if (o.skip?.[network]) continue;
+      const r = prog.parts[network]?.find((x) => x.index === o.index);
+      if (r) receipts[network] = r;
+      else missing.push(network);
+    }
+    return { sha256: o.sha256, size: o.size, index: o.index, count: o.count, part: { sha256: part.sha256, size: part.size }, receipts, missing, paid, total: paid.reduce((a, x) => a + (x.price ?? 0n), 0n) };
+  }
+
+  /**
+   * Seal and attest an object whose parts were bought with putPart. Every
+   * network that bought anything must hold every part, or the missing indexes
+   * are reported (re-send those parts); `skip` drops a network on purpose.
+   */
+  async finish(o: FinishOptions): Promise<PutResult> {
+    const sha = o.sha256;
+    if (!o.force) {
+      const prior = this.archived(sha);
+      if (prior) {
+        this.log(`already archived ${fmtDate(prior.archivedAt * 1000)}: manifest ${prior.manifestTxId}; nothing re-bought`);
+        if (!prior.name && !o.skip?.name) await this.nameOnly(sha, { undername: o.undername, quote: o.quote, skipRelay: o.skip?.relay });
+        return this.archived(sha)!;
+      }
+    }
+    const partBytes = o.partBytes ?? DEFAULT_PART_BYTES;
+    const plan = planParts(o.size, partBytes);
+    if (plan.length !== o.count) throw new InputError(`an object of ${o.size} bytes splits into ${plan.length} parts of ${partBytes}, not ${o.count}`);
+    const prog = this.loadProgress(sha);
+    if (!Object.keys(prog.legs).length && !Object.values(prog.parts).some((v) => v?.length)) throw new InputError(`no parts bought for ${sha}; send them to /v1/parts first`);
+    const skip = o.skip ?? {};
+    const { legs, incomplete } = this.sealAll({ sha, size: o.size, plan, prog, skip });
+    if (!skip.arweave && !legs.some((l) => l.network === 'arweave') && !incomplete.arweave) incomplete.arweave = plan.map((p) => p.index);
+    const gaps = Object.entries(incomplete);
+    if (gaps.length) throw new PartsMissingError(sha, incomplete);
+    await this.client();
+    const paid = this.paidFrom(prog);
+    const t0 = Date.now();
+    this.log(`${o.name}: finishing ${o.size} bytes in ${o.count} parts, legs ${legs.map((l) => l.network).join('+')}`);
+    return this.attest({ sha, size: o.size, count: o.count, mime: o.mime, legs, paid, t0, po: { via: o.via, undername: o.undername, quote: o.quote, skip } });
+  }
+
+  /** What the progress file holds for an object: which indexes each network has, and which legs are sealed. */
+  partsStatus(sha: string): PartsStatus {
+    const prior = this.archived(sha);
+    const prog = this.loadProgress(sha);
+    const networks: PartsStatus['networks'] = {};
+    for (const network of ['arweave', 'walrus', 'filecoin'] as const) {
+      const sealed = prog.legs[network];
+      const idx = sealed ? (sealed.parts ? sealed.parts.map((p) => p.index) : [0]) : (prog.parts[network] ?? []).map((r) => r.index).sort((a, b) => a - b);
+      if (idx.length || sealed) networks[network] = { indexes: idx, sealed: !!sealed };
+    }
+    const paidUnits = prog.paid.reduce((a, p) => a + BigInt(p.price ?? '0'), 0n);
+    return { sha256: sha, archived: !!prior, manifestTxId: prior?.manifestTxId, name: prior?.name?.name, networks, paidUnits: paidUnits.toString() };
+  }
+
+  /** True when this slice is already bought on arweave and walrus, the two legs a finish requires: the gate answers such a part at the floor. */
+  partKnown(sha: string, index: number, partSha: string): boolean {
+    if (this.archived(sha)) return true;
+    const prog = this.loadProgress(sha);
+    return (['arweave', 'walrus'] as const).every((n) => prog.legs[n] !== undefined || prog.parts[n]?.some((r) => r.index === index && r.sha256 === partSha));
+  }
+
+  /** Drop progress files older than `maxAgeMs` (objects whose parts were bought but never finished). Returns what was removed. */
+  sweepProgress(maxAgeMs: number): string[] {
+    const dir = join(this.opts.home, 'progress');
+    if (!existsSync(dir)) return [];
+    const gone: string[] = [];
+    for (const f of readdirSync(dir)) {
+      const p = join(dir, f);
+      if (Date.now() - statSync(p).mtimeMs > maxAgeMs) {
+        rmSync(p);
+        gone.push(f);
+      }
+    }
+    return gone;
   }
 
   /** Retry the ArNS name leg for a saved manifest whose earlier name job failed, without re-uploading. */

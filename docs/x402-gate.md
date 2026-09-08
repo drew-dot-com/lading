@@ -33,7 +33,7 @@ paying anything, so from Claude a repeat put costs nothing. The hash is a
 public fact (the manifest is on Arweave and the relay, kind 30320 `d` tag), so
 the lookup door leaks nothing new.
 
-## Multipart at the door: design pass (2026-09-08, backlog 6, not built)
+## Multipart at the door: design pass (2026-09-08, backlog 6; BUILT as written, 0.9.0)
 
 The question: how does a 50 MB object get through the door from Claude, when the
 door takes one body of at most 3 MiB (`MAX_BODY_BYTES`; Caddy caps the request

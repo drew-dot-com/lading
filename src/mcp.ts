@@ -105,6 +105,86 @@ export async function runMcp(o: McpOptions) {
     return body;
   }
 
+  /** What the door takes in one body and how it slices larger objects, read once from describe. */
+  let doorFacts: Promise<{ maxBodyBytes: number; partBytes: number }> | undefined;
+  const door = () =>
+    (doorFacts ??= getJson('/v1/describe').then((d) => {
+      const x = d as { door?: { maxBodyBytes?: number }; partBytes?: number };
+      return { maxBodyBytes: Number(x.door?.maxBodyBytes ?? 3 * 1024 * 1024), partBytes: Number(x.partBytes ?? 1024 * 1024) };
+    }));
+
+  /** Where the parts of an object fall: the same plan the gate recomputes (parts.ts), so the slices agree. */
+  function plan(size: number, partBytes: number): Array<{ index: number; offset: number; size: number }> {
+    const MIN_TAIL = 127;
+    const out = [];
+    let offset = 0;
+    while (offset < size) {
+      const remaining = size - offset;
+      const take = remaining > partBytes && remaining - partBytes < MIN_TAIL ? remaining : Math.min(partBytes, remaining);
+      out.push({ index: out.length, offset, size: take });
+      offset += take;
+    }
+    return out;
+  }
+
+  /**
+   * A large object through the door as parts: quote the whole bill first
+   * (the cap applies to the sum), skip slices the gate already holds, pay one
+   * POST /v1/parts per slice, then one POST /v1/assemble. Every request is
+   * short and every payment settles on its own answer; a slice that fails is
+   * simply sent again (at the floor once its legs are in).
+   */
+  async function multipartPut(bytes: Uint8Array<ArrayBuffer>, sha: string, fileName: string, contentType: string, partBytes: number): Promise<unknown> {
+    const q = (await getJson(`/v1/quote/parts?size=${bytes.length}&part-bytes=${partBytes}&sha=${sha}`)) as {
+      parts: number;
+      plan: Array<{ index: number; size: number; reused: boolean; price: string }>;
+      finish: { price: string; reused: boolean };
+      total: { usdc: string; payments: number };
+      status?: { archived: boolean; networks: Record<string, { indexes: number[]; sealed: boolean }> };
+    };
+    if (usdcToMicro(q.total.usdc) > maxMicro) throw new Error(`archiving ${bytes.length} bytes as ${q.parts} parts would cost ${q.total.usdc} USDC in ${q.total.payments} payments, over the ${o.maxUsdc} USDC cap (LADING_MAX_USDC_PER_CALL)`);
+    if (q.status?.archived) return archived(sha);
+    const slices = plan(bytes.length, partBytes);
+    if (slices.length !== q.parts) throw new Error(`the door plans ${q.parts} parts, this shim ${slices.length}; part size disagreement`);
+    log(`put ${fileName} ${bytes.length} B as ${q.parts} parts of ${partBytes} B: ${q.total.usdc} USDC over ${q.total.payments} payments`);
+    const sent: number[] = [];
+    const skipped: number[] = [];
+    for (const p of slices) {
+      const held = (['arweave', 'walrus'] as const).every((n) => q.status?.networks[n]?.sealed || q.status?.networks[n]?.indexes.includes(p.index));
+      if (held) {
+        skipped.push(p.index);
+        continue;
+      }
+      const slice = bytes.subarray(p.offset, p.offset + p.size);
+      const partSha = sha256Hex(slice);
+      const t0 = Date.now();
+      const r = (await paid('/v1/parts', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': String(slice.length),
+          'x-object-sha256': sha,
+          'x-object-size': String(bytes.length),
+          'x-part-index': String(p.index),
+          'x-part-count': String(slices.length),
+          'x-part-bytes': String(partBytes),
+          'x-sha256': partSha,
+          'x-file-name': encodeURIComponent(fileName),
+          'x-mime': contentType,
+        },
+        body: slice,
+      })) as { receipts?: Record<string, unknown>; missing?: string[]; toon?: { usdc?: string }; x402?: { transaction?: string } };
+      sent.push(p.index);
+      log(`part ${p.index + 1}/${slices.length} ${slice.length} B: ${Object.keys(r.receipts ?? {}).join('+') || 'nothing'}${r.missing?.length ? ` (missing ${r.missing.join(',')})` : ''} ${Date.now() - t0} ms`);
+    }
+    const a = await paid('/v1/assemble', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-object-sha256': sha, 'x-part-count': String(slices.length) },
+      body: JSON.stringify({ sha256: sha, size: bytes.length, partCount: slices.length, partBytes, name: fileName, mime: contentType }),
+    });
+    return { ...(a as object), multipart: { parts: slices.length, partBytes, sent, skipped, quotedTotalUsdc: q.total.usdc } };
+  }
+
   /** The bill of lading the gate already holds for these bytes, or undefined. Free. */
   async function archived(sha: string): Promise<Record<string, unknown> | undefined> {
     const r = await fetch(`${gate}/v1/manifest?sha=${sha}`);
@@ -197,6 +277,8 @@ export async function runMcp(o: McpOptions) {
         const n = path ? statSync(resolve(path)).size : size;
         if (!n) return fail('give size or path');
         const sha = path ? `&sha=${sha256Hex(new Uint8Array(readFileSync(resolve(path))))}` : '';
+        const facts = await door();
+        if (n > facts.maxBodyBytes) return text(await getJson(`/v1/quote/parts?size=${n}&part-bytes=${facts.partBytes}${sha}`));
         return text(await getJson(`/v1/quote?size=${n}${sha}`));
       } catch (e) {
         return fail((e as Error).message);
@@ -219,7 +301,10 @@ export async function runMcp(o: McpOptions) {
       try {
         const hash = sha ? sha.toLowerCase() : sha256Hex(inputBytes(path, body));
         const hit = await archived(hash);
-        return text(hit ? { archived: true, ...hit } : { archived: false, sha256: hash, note: 'not archived by this gate; lading_put would archive it' });
+        if (hit) return text({ archived: true, ...hit });
+        const status = (await getJson(`/v1/parts?sha=${hash}`)) as { networks?: Record<string, unknown> };
+        const inProgress = Object.keys(status.networks ?? {}).length > 0;
+        return text({ archived: false, sha256: hash, ...(inProgress ? { partsInProgress: status, note: 'parts of this object are already bought; lading_put resumes and finishes it' } : { note: 'not archived by this gate; lading_put would archive it' }) });
       } catch (e) {
         return fail((e as Error).message);
       }
@@ -231,7 +316,7 @@ export async function runMcp(o: McpOptions) {
     {
       title: 'Archive with Lading',
       description:
-        'PAID (USDC on Base, quoted first, refused over the cap). Archives a local file (path) or a text string onto Arweave, Walrus and Filecoin through the TOON mesh, writes a signed bill of lading to Arweave and names it on ArNS. Returns every network receipt, the manifest URL and the ArNS name. Idempotent: bytes the gate already archived come back from the existing record and nothing is paid, unless force is true.',
+        'PAID (USDC on Base, quoted first, refused over the cap). Archives a local file (path) or a text string onto Arweave, Walrus and Filecoin through the TOON mesh, writes a signed bill of lading to Arweave and names it on ArNS. Returns every network receipt, the manifest URL and the ArNS name. Idempotent: bytes the gate already archived come back from the existing record and nothing is paid, unless force is true. Objects over the door\'s single-body limit (3 MiB) go as 1 MiB parts, one small payment each plus one for the finish; the cap applies to the whole bill, and a put that dies resumes where it stopped.',
       inputSchema: {
         path: z.string().optional().describe('local file to archive'),
         text: z.string().optional().describe('text to archive instead of a file'),
@@ -252,6 +337,11 @@ export async function runMcp(o: McpOptions) {
             log(`put ${fileName} ${bytes.length} B already archived as ${String(hit.manifestTxId)}; nothing paid`);
             return text({ ...hit, reused: true, paidThisCall: '0 USDC: the gate already held a bill of lading for these bytes (pass force to archive again)' });
           }
+        }
+        const facts = await door();
+        if (bytes.length > facts.maxBodyBytes) {
+          if (!payFetch) throw new Error('no LADING_X402_KEY: this shim can only call the free tools (wallet, describe, quote, lookup, verify)');
+          return text(await multipartPut(bytes, sha, fileName, contentType, facts.partBytes));
         }
         const { usdc } = await guard(`/v1/quote?size=${bytes.length}${force ? '' : `&sha=${sha}`}`, `archiving ${bytes.length} bytes`);
         log(`put ${fileName} ${bytes.length} B for ${usdc} USDC${force ? ' (forced)' : ''}`);

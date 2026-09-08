@@ -49,8 +49,9 @@ already paid, which is what the margin is for. The manifest a gate put
 produces is signed by the gate's key and records `via: {door: 'x402', payer}`.
 Doors: `GET /v1/describe`, `GET /v1/quote?size=N[&sha=]`,
 `GET /v1/manifest?sha=`, `POST /v1/put`, `GET /v1/renew/quote?id=`,
-`POST /v1/renew`, `GET /v1/verify?ref=`, `GET /v1/floats`. Design notes:
-`docs/x402-gate.md`.
+`POST /v1/renew`, `GET /v1/verify?ref=`, `GET /v1/floats`,
+`GET /v1/quote/parts?size=N`, `GET /v1/parts?sha=`, `POST /v1/parts`,
+`POST /v1/assemble`. Design notes: `docs/x402-gate.md`.
 
 
 ## Claude Desktop extension
@@ -149,6 +150,26 @@ compares sha256. `lading describe` prints route prices.
 The manifest is a Nostr event, so a relay query for kind 30320 by `#d` finds
 every attestation for a given object hash across payers.
 
+## Large objects at the door: parts
+
+The door takes one body of at most 3 MiB and x402 pays one request at a time,
+so a larger object goes through as parts. The shim slices it exactly as the
+lib does (1 MiB, `parts.ts`), asks `GET /v1/quote/parts?size=N` for the whole
+bill (a price per part, the finish, the sum; the cap applies to the sum), then
+pays `POST /v1/parts` once per slice (`x-object-sha256`, `x-object-size`,
+`x-part-index`, `x-part-count`, `x-part-bytes`, `x-sha256` of the slice) and
+`POST /v1/assemble` once for the finish (relay copy, manifest on Arweave, ArNS
+name). Each part runs its three legs into the object's progress file on the
+gate, the same file a CLI put resumes from; assemble seals the legs, and a
+network that holds only some parts makes assemble answer 409 with the missing
+indexes (send those again, or `skip` that network). A slice the gate already
+bought on Arweave and Walrus is priced at the floor; `GET /v1/parts?sha=` shows
+what it holds, free, and the shim skips those. Nothing is held in escrow: every
+payment settles on its own answer. A 1 MiB part is about 0.12 USDC, the finish
+sits on the floor; 50 MB is about 50 payments, 6 USDC and an hour, and needs
+the org store's ARIO funded ahead (about 35 ARIO per part). Progress files
+never assembled are swept after `LADING_PROGRESS_MAX_AGE_DAYS` (7).
+
 ## Floats and alarms
 
 Every hot key behind a put is judged in one place. The broker answers
@@ -198,7 +219,7 @@ default, since one such put runs to several hundred thousand units.
 
 ```
 src/server.ts    the handler: POST /walrus, /filecoin, /name and their /quote doors, GET /describe, GET /health
-src/lib.ts       the client as a library: put, quote, estimate, verify, name, renewals, renew, describe; the CLI and the gate both run this
+src/lib.ts       the client as a library: put, putPart, finish, quote, estimate, verify, name, renewals, renew, describe; the CLI and the gate both run this
 src/cli.ts       the command line, a thin layer over lib.ts
 src/gate.ts      the hosted door: express + x402 (USDC on Base, PayAI facilitator), pays the TOON routes with its own key
 src/gate-price.ts what the door charges for a TOON bill: margin and floor, pure
