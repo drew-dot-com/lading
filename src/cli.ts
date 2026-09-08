@@ -22,8 +22,10 @@
  *   lading renewals         every Walrus record in the saved manifests with its
  *                           paid-through date; --within <days> (default 60) marks
  *                           what is due; --live asks Lighthouse for today's date.
- *   lading renew <sha|id>   buy one more year on Walrus for a saved put's records
- *                           (or one Lighthouse record id) through the renew door,
+ *   lading renew <sha|id>   buy more time on Walrus for a saved put's records (or one
+ *                           Lighthouse record id, or one Sui blob object id): a year
+ *                           through the renew door for a Lighthouse record, --epochs
+ *                           (default 26) through the extend door for a native one;
  *                           quote first; the saved file records the new date.
  *   lading describe         what the node serves.
  *   lading mcp --gate <url> run the MCP shim over stdio: tools for Claude that
@@ -86,17 +88,20 @@ async function renewals() {
     console.log(`no walrus records under ${join(home, 'manifests')}`);
     return;
   }
-  console.log(`${rows.length} walrus records${flag('live') ? ', dates from Lighthouse now' : ', dates as of the last write or renewal'}; due = within ${within} days\n`);
-  console.log(`  ${'due'.padEnd(4)} ${'paid through'.padEnd(12)} ${'days'.padStart(5)}  ${'object'.padEnd(12)} ${'part'.padEnd(6)} ${'blobId'.padEnd(43)} ${'lighthouse record'.padEnd(36)} renewals  name`);
+  console.log(`${rows.length} walrus records${flag('live') ? ', dates from Lighthouse and the chain now' : ', dates as of the last write or renewal'}; due = within ${within} days\n`);
+  console.log(`  ${'due'.padEnd(4)} ${'paid through'.padEnd(12)} ${'days'.padStart(5)}  ${'object'.padEnd(12)} ${'part'.padEnd(6)} ${'blobId'.padEnd(43)} ${'via'.padEnd(10)} ${'record (lighthouse id | sui object id)'.padEnd(66)} ${'epoch'.padStart(5)} renewals  name`);
   for (const r of rows) {
-    const d = Number.isNaN(r.daysLeft) ? 'GONE' : r.daysLeft <= within ? 'DUE' : '';
-    console.log(`  ${d.padEnd(4)} ${fmtDate(r.expiresAt).padEnd(12)} ${String(Number.isNaN(r.daysLeft) ? '-' : r.daysLeft).padStart(5)}  ${r.sha256.slice(0, 12)} ${partLabel(r).padEnd(6)} ${r.blobId.padEnd(43)} ${r.lighthouseId.padEnd(36)} ${String(r.renewals).padStart(8)}  ${r.name ?? ''}`);
+    const d = Number.isNaN(r.daysLeft) ? (r.expiresAt > 0 ? 'GONE' : '?') : r.daysLeft <= within ? 'DUE' : '';
+    console.log(`  ${d.padEnd(4)} ${(r.expiresAt > 0 ? fmtDate(r.expiresAt) : '-').padEnd(12)} ${String(Number.isNaN(r.daysLeft) ? '-' : r.daysLeft).padStart(5)}  ${r.sha256.slice(0, 12)} ${partLabel(r).padEnd(6)} ${r.blobId.padEnd(43)} ${r.provider.padEnd(10)} ${r.handle.padEnd(66)} ${String(r.endEpoch ?? '-').padStart(5)} ${String(r.renewals).padStart(8)}  ${r.name ?? ''}`);
   }
   if (due.length) console.log(`\n${due.length} due: lading renew ${[...new Set(due.map((r) => r.sha256))].map((s) => s.slice(0, 12)).join(' / ')}`);
+  if (rows.some((r) => r.expiresAt === 0)) console.log(`\nrows marked ? carry no date yet (a native write from before 0.14): lading renewals --live reads their epochs from the chain`);
 }
 
 async function renew(ref: string) {
-  const r = await lading.renew(ref, { quote: !flag('no-quote') });
+  const epochs = opt('epochs') === undefined ? undefined : Number(opt('epochs'));
+  if (epochs !== undefined && (!Number.isInteger(epochs) || epochs < 1 || epochs > 53)) throw new Error(`--epochs must be 1..53, got ${opt('epochs')}`);
+  const r = await lading.renew(ref, { quote: !flag('no-quote'), epochs });
   console.log(`\nrenewed ${r.bought} of ${r.targets} records, paid ${r.total} base units`);
 }
 
@@ -159,7 +164,7 @@ if (!run) {
       '       lading name <sha256> [--no-quote]\n' +
       '       lading page <sha256|all> [--no-quote] [--force]   (write the bill of lading page + path manifest, point the name at them; --force re-renders an existing page)\n' +
       '       lading renewals [--within days] [--live]\n' +
-      '       lading renew <sha256|lighthouse-record-id> [--no-quote]\n' +
+      '       lading renew <sha256|lighthouse-record-id|sui-object-id> [--no-quote] [--epochs n]   (Lighthouse records renew a year; native records extend by n epochs, default 26)\n' +
       '       lading describe\n' +
       '       lading mcp --gate <url> [--autokey]          (LADING_X402_KEY pays; LADING_MAX_USDC_PER_CALL caps a call, default 0.50)',
   );

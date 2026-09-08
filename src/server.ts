@@ -8,6 +8,8 @@
  *   POST /walrus/quote   kind:5320, params op=walrus, phase=quote, size → WalrusQuote
  *   POST /walrus/renew   kind:5320, params op=walrus-renew, lighthouseId → WalrusRenewReceipt
  *   POST /walrus/renew/quote kind:5320, params op=walrus-renew, phase=quote, lighthouseId → WalrusRenewQuote
+ *   POST /walrus/extend  kind:5320, params op=walrus-extend, objectId[, epochs] → WalrusExtendReceipt (native records: more epochs on the Sui blob object)
+ *   POST /walrus/extend/quote kind:5320, params op=walrus-extend, phase=quote, objectId[, epochs] → WalrusExtendQuote
  *   GET  /walrus/ledger  every Lighthouse record this broker paid for, soonest expiry first (operator view)
  *   POST /filecoin/quote kind:5320, params op=filecoin, phase=quote, size → FilecoinQuote
  *   POST /ipfs/quote     kind:5320, params op=ipfs, phase=quote, size → IpfsQuote
@@ -32,8 +34,8 @@ import { getPublicKey, verifyEvent, type Event as NostrEvent } from 'nostr-tools
 import { LEG_KIND, MANIFEST_KIND } from './kinds.js';
 import { lighthouseUploader, sha256Hex, LIGHTHOUSE_X402, WALRUS_AGGREGATOR, type WalrusUploader } from './walrus.js';
 import { solanaNamer, undernameFor, UNDERNAME_RE, type Namer } from './arns.js';
-import { cached, decideFilecoin, decideName, decideWalrus, decideWalrusNative, decideWalrusRenew, type FilecoinQuote, type IpfsQuote, type NameQuote, type WalrusQuote, type WalrusRenewQuote } from './quote.js';
-import { nativeWalrusUploader, nineDec, SUI_PER_WRITE, WALRUS_UPLOAD_RELAY, type NativeWalrusUploader } from './walrus-native.js';
+import { cached, decideFilecoin, decideName, decideWalrus, decideWalrusExtend, decideWalrusNative, decideWalrusRenew, type FilecoinQuote, type IpfsQuote, type NameQuote, type WalrusExtendQuote, type WalrusQuote, type WalrusRenewQuote } from './quote.js';
+import { nativeWalrusUploader, nineDec, SUI_OBJECT_ID_RE, SUI_PER_WRITE, WALRUS_UPLOAD_RELAY, type NativeWalrusUploader } from './walrus-native.js';
 import { pinataUploader, IPFS_GATEWAYS, KUBO_API, PINATA_402, PINATA_RETENTION, type IpfsUploader } from './ipfs.js';
 import { daysLeft, openLedger, type Ledger } from './ledger.js';
 import { filecoinChain, synapseUploader, runwayText, FILECOIN_MIN_BYTES, type FilecoinUploader } from './filecoin.js';
@@ -465,6 +467,83 @@ function walrusRenewDoor(uploader: WalrusUploader, ledger: Ledger) {
   };
 }
 
+/** SUI kept for one extend transaction's gas (no relay tip, no storage deposit to speak of). */
+const SUI_PER_EXTEND_MIST = BigInt(Math.round(Number(process.env.LADING_WALRUS_SUI_PER_EXTEND ?? '0.01') * 1e9));
+
+/** The blob object and epoch count an extend job names. */
+function extendTarget(event: NostrEvent, defaultEpochs: number): { objectId?: string; epochs: number; error?: string } {
+  const objectId = paramOf(event, 'objectId') ?? paramOf(event, 'id');
+  const rawEpochs = paramOf(event, 'epochs');
+  const epochs = rawEpochs === undefined ? defaultEpochs : Number(rawEpochs);
+  if (!objectId) return { epochs, error: 'param objectId (the Sui blob object id from the walrus leg proof) is required' };
+  if (!SUI_OBJECT_ID_RE.test(objectId)) return { epochs, error: `param objectId ${objectId} is not a Sui object id` };
+  if (!Number.isInteger(epochs) || epochs < 1 || epochs > 53) return { objectId, epochs, error: `param epochs must be 1..53, got ${rawEpochs}` };
+  return { objectId, epochs };
+}
+
+function walrusExtendQuoteDoor(uploader: NativeWalrusUploader, floats: () => Promise<{ walFrost: bigint; suiMist: bigint; wal: string; sui: string }>) {
+  return async (req: IncomingMessage, res: ServerResponse) => {
+    const job = await openJob(req, res, 'walrus-extend', 'quote');
+    if (!job) return;
+    const { event, meta } = job;
+    const target = extendTarget(event, uploader.epochs);
+    if (!target.objectId) return refuse(res, 422, 'F00', target.error!);
+    const { objectId, epochs } = target;
+    const t0 = Date.now();
+    try {
+      const [q, f] = await Promise.all([uploader.extendQuote(objectId, epochs), floats()]);
+      const s = q.state;
+      const d = decideWalrusExtend({ found: s.found, owned: s.owned, currentEpoch: q.timing.currentEpoch, endEpoch: s.endEpoch ?? 0, epochs, costFrost: q.amountFrost, walFrost: f.walFrost, suiMist: f.suiMist, suiPerTxMist: SUI_PER_EXTEND_MIST, reserveMultiple: WALRUS_RESERVE_MULTIPLE });
+      const currentExpiresAt = s.endEpoch === undefined ? undefined : q.timing.endsAt(s.endEpoch);
+      const quote: WalrusExtendQuote = {
+        op: 'walrus-extend',
+        deliverable: d.deliverable,
+        ...(d.reason ? { reason: d.reason } : {}),
+        objectId,
+        found: s.found,
+        ...(s.blobId ? { blobId: s.blobId } : {}),
+        ...(s.size !== undefined ? { size: s.size } : {}),
+        currentEpoch: q.timing.currentEpoch,
+        ...(s.endEpoch !== undefined ? { endEpoch: s.endEpoch, newEndEpoch: d.newEndEpoch } : {}),
+        ...(currentExpiresAt !== undefined ? { currentExpiresAt, daysLeft: daysLeft(currentExpiresAt) } : {}),
+        epochs,
+        known: s.owned,
+        downstream: { provider: 'walrus-native', amount: q.amountWal, asset: 'WAL', extends: `P${epochs * 14}D` },
+        float: { chain: 'sui', asset: 'WAL', balance: f.wal, reserve: d.reserveWal, sui: f.sui },
+        executeDoor: '/walrus/extend',
+        at: Math.floor(Date.now() / 1000),
+      };
+      console.log(`walrus extend quote ${objectId.slice(0, 10)} epochs=${epochs} deliverable=${d.deliverable} end=${s.endEpoch ?? '-'} now=${q.timing.currentEpoch} downstream=${q.amountWal} WAL float=${f.wal} payer=${meta.payer ?? '-'} ${Date.now() - t0}ms${d.reason ? `: ${d.reason}` : ''}`);
+      return acceptReceipt(res, quote, meta);
+    } catch (e) {
+      const msg = (e as Error).message;
+      console.log(`walrus extend quote REJECT ${objectId.slice(0, 10)} ${Date.now() - t0}ms: ${msg}`);
+      return refuse(res, 502, 'T00', `walrus extend quote failed: ${msg}`);
+    }
+  };
+}
+
+function walrusExtendDoor(uploader: NativeWalrusUploader) {
+  return async (req: IncomingMessage, res: ServerResponse) => {
+    const job = await openJob(req, res, 'walrus-extend');
+    if (!job) return;
+    const { event, meta } = job;
+    const target = extendTarget(event, uploader.epochs);
+    if (!target.objectId) return refuse(res, 422, 'F00', target.error!);
+    const { objectId, epochs } = target;
+    const t0 = Date.now();
+    try {
+      const receipt = await uploader.extend(objectId, epochs);
+      console.log(`walrus extend ok ${objectId.slice(0, 10)} blob=${receipt.blobId} epochs ${receipt.previousEndEpoch} -> ${receipt.endEpoch} (${new Date(receipt.previousExpiresAt).toISOString().slice(0, 10)} -> ${new Date(receipt.expiresAt).toISOString().slice(0, 10)}) ${receipt.proof.amountWal} WAL tx=${receipt.proof.digest} payer=${meta.payer ?? '-'} amount=${meta.amount ?? '-'} ${Date.now() - t0}ms`);
+      return acceptReceipt(res, receipt, meta);
+    } catch (e) {
+      const msg = (e as Error).message;
+      console.log(`walrus extend REJECT ${objectId.slice(0, 10)} payer=${meta.payer ?? '-'} ${Date.now() - t0}ms: ${msg}`);
+      return refuse(res, 502, 'T00', `walrus extension failed, nothing bought downstream: ${msg}`);
+    }
+  };
+}
+
 function filecoinDoor(uploader: FilecoinUploader) {
   return async (req: IncomingMessage, res: ServerResponse) => {
     const job = await openJob(req, res, 'filecoin');
@@ -685,6 +764,20 @@ async function main() {
         fund: `Send SUI to ${uploader.address}.`,
       });
     });
+    doors['/walrus/extend'] = walrusExtendDoor(uploader);
+    doors['/walrus/extend/quote'] = walrusExtendQuoteDoor(uploader, floats);
+    describeDoors.walrusExtendQuote = {
+      path: '/walrus/extend/quote',
+      answers: 'WalrusExtendQuote: deliverable, the blob object\'s current and new end epoch with their instants, downstream WAL price, float',
+      input: 'params op=walrus-extend, phase=quote, objectId (proof.objectId of a walrus-native leg), epochs (default ' + uploader.epochs + ')',
+    };
+    describeDoors.walrusExtend = {
+      path: '/walrus/extend',
+      answers: 'WalrusExtendReceipt: the object\'s previous and new end epoch, the Sui tx digest',
+      owner: uploader.address,
+      note: 'Only the owner of a blob object can extend it, and that is this Sui key for every record walrus-native wrote. Lighthouse records renew at /walrus/renew instead.',
+      input: 'params op=walrus-extend, objectId, epochs (1..53 in total ahead of the current epoch)',
+    };
   }
   if (writers.lighthouse || writers.native) {
     doors['/walrus'] = walrusDoor(writers, ledger);

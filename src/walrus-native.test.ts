@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { decideWalrusNative } from './quote.js';
-import { nineDec } from './walrus-native.js';
+import { epochEndsAt, nineDec, ownerAddress } from './walrus-native.js';
 
 const cost = 153_807_545n; // 1 MiB for 26 epochs, read live 2026-09-08 (0.153807545 WAL)
 
@@ -24,4 +24,15 @@ test('nineDec renders FROST and MIST exactly', () => {
   assert.equal(nineDec(0n), '0.000000000');
   assert.equal(nineDec(cost), '0.153807545');
   assert.equal(nineDec(3_321_257_162n), '3.321257162');
+});
+
+test('epochEndsAt: a period ending at epoch e runs out when epoch e begins; ownerAddress reads every owner shape', () => {
+  const first = 1_742_000_000_000;
+  const dur = 14 * 86_400_000;
+  assert.equal(epochEndsAt(1, first, dur), first);
+  assert.equal(epochEndsAt(65, first, dur), first + 64 * dur);
+  assert.equal(ownerAddress({ AddressOwner: '0xab' }), '0xab');
+  assert.equal(ownerAddress({ $kind: 'AddressOwner', address: '0xcd' }), '0xcd');
+  assert.equal(ownerAddress('0xef'), '0xef');
+  assert.equal(ownerAddress({ Shared: { initial_shared_version: 1 } }), undefined);
 });

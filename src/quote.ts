@@ -51,6 +51,38 @@ export interface WalrusRenewQuote {
   at: number;
 }
 
+/**
+ * What the native extend quote door answers: whether the broker's Sui key can
+ * buy `epochs` more on a blob it owns, what that costs in WAL, and where the
+ * blob's storage period stands now (epochs, and the instants they map to).
+ */
+export interface WalrusExtendQuote {
+  op: 'walrus-extend';
+  deliverable: boolean;
+  reason?: string;
+  /** The Sui blob object the extension is addressed to. */
+  objectId: string;
+  /** Present when the object was read on chain (`found`). */
+  found: boolean;
+  blobId?: string;
+  size?: number;
+  currentEpoch: number;
+  /** The storage period's end epoch as the chain holds it now, and after this extension. */
+  endEpoch?: number;
+  newEndEpoch?: number;
+  /** ms epoch the current period ends, from the staking object's epoch timing. */
+  currentExpiresAt?: number;
+  daysLeft?: number;
+  /** Epochs this quote buys (1..53 ahead of the current epoch in total). */
+  epochs: number;
+  /** Whether this broker's key owns the object; only the owner can extend. */
+  known: boolean;
+  downstream: { provider: 'walrus-native'; amount: string; asset: 'WAL'; extends: string };
+  float: { chain: 'sui'; asset: 'WAL'; balance: string; reserve: string; sui: string };
+  executeDoor: '/walrus/extend';
+  at: number;
+}
+
 export interface FilecoinQuote {
   op: 'filecoin';
   deliverable: boolean;
@@ -175,6 +207,44 @@ export function decideWalrusRenew(input: {
     };
   }
   return { deliverable: true, reserveUsdc };
+}
+
+/** Walrus caps a storage period at this many epochs ahead of the current one (the system's future accounting ring). */
+export const WALRUS_MAX_EPOCHS_AHEAD = 53;
+
+/**
+ * A native extension goes through when the blob object is on chain and owned
+ * by this key, the new end stays inside Walrus's 53-epoch horizon, the WAL
+ * float holds the extension price with the same reserve the write quote uses,
+ * and there is SUI for one transaction's gas. A period that already ended
+ * cannot be extended (Walrus reclaims the storage), so that is a refusal too.
+ */
+export function decideWalrusExtend(input: {
+  found: boolean;
+  owned: boolean;
+  currentEpoch: number;
+  endEpoch: number;
+  epochs: number;
+  costFrost: bigint;
+  walFrost: bigint;
+  suiMist: bigint;
+  suiPerTxMist: bigint;
+  reserveMultiple?: number;
+}): { deliverable: boolean; reason?: string; reserveWal: string; newEndEpoch: number } {
+  const mult = BigInt(input.reserveMultiple ?? 2);
+  const reserve = input.costFrost * mult;
+  const nine = (u: bigint) => `${u / 1_000_000_000n}.${(u % 1_000_000_000n).toString().padStart(9, '0')}`;
+  const reserveWal = nine(reserve);
+  const newEndEpoch = input.endEpoch + input.epochs;
+  const out = (reason: string) => ({ deliverable: false, reason, reserveWal, newEndEpoch });
+  if (!input.found) return out('no blob object with that id on Sui');
+  if (!input.owned) return out('the blob object is not owned by this broker\'s Sui key, and only the owner can extend it');
+  if (!Number.isInteger(input.epochs) || input.epochs < 1) return out(`epochs must be a positive integer, got ${input.epochs}`);
+  if (input.endEpoch <= input.currentEpoch) return out(`the storage period ended at epoch ${input.endEpoch} (current ${input.currentEpoch}); an expired blob cannot be extended, write it again`);
+  if (newEndEpoch > input.currentEpoch + WALRUS_MAX_EPOCHS_AHEAD) return out(`end epoch ${newEndEpoch} would be more than ${WALRUS_MAX_EPOCHS_AHEAD} epochs past the current ${input.currentEpoch}; at most ${input.currentEpoch + WALRUS_MAX_EPOCHS_AHEAD - input.endEpoch} more now`);
+  if (input.walFrost < reserve) return out(`walrus WAL float ${nine(input.walFrost)} on Sui is under the ${reserveWal} WAL reserve for a ${nine(input.costFrost)} WAL extension`);
+  if (input.suiMist < input.suiPerTxMist) return out(`walrus SUI float ${nine(input.suiMist)} is under the ${nine(input.suiPerTxMist)} SUI one transaction needs for gas`);
+  return { deliverable: true, reserveWal, newEndEpoch };
 }
 
 /**

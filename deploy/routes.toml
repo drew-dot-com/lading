@@ -78,3 +78,18 @@ price = 40000
 prefix = "g.drew.lading.walrus.renew.quote"
 handler_url = "http://lading:3600/walrus/renew/quote"
 price = 1000
+
+# Native Walrus extension: more epochs on a blob object the broker's Sui key
+# owns (every record written by walrus-native). One Sui transaction paying
+# WAL for storage only, so cheaper downstream than a write; same flat price
+# as a renewal at the door. The quote door reads the object and the epoch
+# timing on chain.
+[[routes]]
+prefix = "g.drew.lading.walrus.extend"
+handler_url = "http://lading:3600/walrus/extend"
+price = 40000
+
+[[routes]]
+prefix = "g.drew.lading.walrus.extend.quote"
+handler_url = "http://lading:3600/walrus/extend/quote"
+price = 1000

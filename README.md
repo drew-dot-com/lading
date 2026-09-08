@@ -329,9 +329,26 @@ native when its WAL and SUI floats cover the write, Lighthouse otherwise, and
 the quote names which (`downstream.provider`, `downstream.amount` in that
 writer's asset, `alternative` with the other writer's reason). Float rows
 `walrus-wal` (low under `LADING_WALRUS_LOW_WAL`, 0.5) and `walrus-sui` (low
-under `LADING_WALRUS_LOW_SUI`, 0.05) join `GET /floats`. Native records are
-not in the Lighthouse ledger and `lading renew` does not extend them yet; the
-object id in the proof is what a later `extendBlob` door will take.
+under `LADING_WALRUS_LOW_SUI`, 0.05) join `GET /floats`.
+
+A native record is kept alive by extending its blob object on Sui, and only
+the object's owner can, which is the broker's Sui key for everything
+walrus-native wrote. So the broker sells that too: `g.drew.lading.walrus.extend`
+(flat 40,000; `params op=walrus-extend, objectId, epochs` 1..53, default 26)
+runs one `extendBlob` transaction paying WAL for storage only (about 0.135
+WAL for 26 epochs, no write cost, no relay tip) and answers with the previous
+and new end epoch, the instants they map to (from the staking object's epoch
+timing: epoch 1 began at `first_epoch_start`, each lasts `epoch_duration`),
+and the Sui digest. `g.drew.lading.walrus.extend.quote` (1,000) reads the
+object and the timing on chain: found, owned, current and new end epoch,
+days left, price, WAL and SUI floats. Walrus refuses a period more than 53
+epochs past the current one, so the quote says how many more fit right now.
+The chain is the ledger for native records; there is no broker-side file.
+`lading renewals` lists native rows by object id with their end epoch and
+date (writes since 0.14 carry the date in the receipt; older ones show `?`
+until `--live` asks the quote door), and `lading renew <sha256 | object id>
+[--epochs n]` extends every native record of a put through the extend doors,
+Lighthouse records through the renew doors, quoting each first.
 
 Filecoin Onchain Cloud is pay-per-epoch out of a USDFC deposit in Filecoin
 Pay, with one data set per copy per provider (two copies by default). The

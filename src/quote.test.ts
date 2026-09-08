@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cached, decideFilecoin, decideName, decideWalrus, decideWalrusRenew } from './quote.js';
+import { cached, decideFilecoin, decideName, decideWalrus, decideWalrusExtend, decideWalrusRenew } from './quote.js';
 
 test('walrus quote: deliverable only with the reserve on the Base key', () => {
   const base = { size: 5535, maxBytes: 3 * 1024 * 1024, priceUsdc: '0.032500' };
@@ -61,4 +61,22 @@ test('walrus renew quote: the record must exist, then the same reserve rule as a
   assert.equal(short.deliverable, false);
   assert.match(short.reason ?? '', /under the 0.069000 USDC reserve for a 0.034500 USDC renewal/);
   assert.equal(decideWalrusRenew({ found: true, priceUsdc: '0.034500', balanceUsdc: '0.069' }).deliverable, true);
+});
+
+test('walrus extend: deliverable only for an owned, unexpired object inside the 53-epoch horizon with WAL and SUI to pay', () => {
+  const base = { found: true, owned: true, currentEpoch: 39, endEpoch: 65, epochs: 26, costFrost: 135_195_606n, walFrost: 12_000_000_000n, suiMist: 1_000_000_000n, suiPerTxMist: 10_000_000n };
+  const ok = decideWalrusExtend(base);
+  assert.equal(ok.deliverable, true);
+  assert.equal(ok.newEndEpoch, 91);
+  assert.equal(ok.reserveWal, '0.270391212');
+  assert.match(decideWalrusExtend({ ...base, found: false }).reason!, /no blob object/);
+  assert.match(decideWalrusExtend({ ...base, owned: false }).reason!, /not owned/);
+  assert.match(decideWalrusExtend({ ...base, endEpoch: 39 }).reason!, /period ended at epoch 39/);
+  const far = decideWalrusExtend({ ...base, epochs: 28 });
+  assert.equal(far.deliverable, false);
+  assert.match(far.reason!, /more than 53 epochs past the current 39; at most 27 more now/);
+  assert.equal(decideWalrusExtend({ ...base, epochs: 27 }).deliverable, true);
+  assert.match(decideWalrusExtend({ ...base, walFrost: 270_391_211n }).reason!, /under the 0.270391212 WAL reserve for a 0.135195606 WAL extension/);
+  assert.match(decideWalrusExtend({ ...base, suiMist: 9_999_999n }).reason!, /SUI float 0.009999999 is under the 0.010000000 SUI/);
+  assert.match(decideWalrusExtend({ ...base, epochs: 0 }).reason!, /positive integer/);
 });

@@ -101,6 +101,30 @@ export interface NameReceipt {
 }
 
 /**
+ * What the native Walrus extend door answers with: more epochs bought on Sui
+ * for a blob object this broker's key owns. The blob and its id do not change;
+ * the storage period's end epoch moves, and the instants are derived from the
+ * staking object's epoch timing.
+ */
+export interface WalrusExtendReceipt {
+  network: 'walrus';
+  op: 'extend';
+  objectId: string;
+  blobId: string;
+  size: number;
+  previousEndEpoch: number;
+  endEpoch: number;
+  epochs: number;
+  previousExpiresAt: number;
+  expiresAt: number;
+  /** The period added, ISO-8601. */
+  extended: string;
+  provider: 'walrus-native';
+  proof: { digest: string; owner: string; currentEpoch: number; amountWal: string; [k: string]: string | number | undefined };
+  at: number;
+}
+
+/**
  * What the Walrus renew door answers with: one more storage period bought from
  * Lighthouse for a record the broker paid for. The blob and its id do not
  * change; only the paid-through instant moves.

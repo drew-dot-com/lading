@@ -15,9 +15,9 @@ import { join } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import { ToonClient, buildJobEvent, sendJob, chargeFor } from '@toon-protocol/client';
 import { getPublicKey, type Event as NostrEvent } from 'nostr-tools/pure';
-import { LEG_KIND, type FilecoinReceipt, type IpfsReceipt, type LegReceipt, type NameReceipt, type PartReceipt, type WalrusReceipt, type WalrusRenewReceipt } from './kinds.js';
+import { LEG_KIND, type FilecoinReceipt, type IpfsReceipt, type LegReceipt, type NameReceipt, type PartReceipt, type WalrusExtendReceipt, type WalrusReceipt, type WalrusRenewReceipt } from './kinds.js';
 import { assembleParts, DEFAULT_PART_BYTES, partName, planParts, splitParts, type Part, type PartPlan } from './parts.js';
-import type { FilecoinQuote, IpfsQuote, NameQuote, WalrusQuote, WalrusRenewQuote } from './quote.js';
+import type { FilecoinQuote, IpfsQuote, NameQuote, WalrusExtendQuote, WalrusQuote, WalrusRenewQuote } from './quote.js';
 import { dueWithin, fmtDate, walrusRecords, type RenewalRow, type SavedPut, type SavedRenewal } from './renewals.js';
 import { daysLeft } from './ledger.js';
 import { buildManifest, parseManifest, type ManifestContent } from './manifest.js';
@@ -31,6 +31,8 @@ export interface Routes {
   walrusQuote: string;
   walrusRenew: string;
   walrusRenewQuote: string;
+  walrusExtend: string;
+  walrusExtendQuote: string;
   filecoin: string;
   filecoinQuote: string;
   ipfs: string;
@@ -88,6 +90,8 @@ export function optionsFromEnv(overrides: Partial<LadingOptions> = {}): LadingOp
       walrusQuote: env('LADING_ROUTE_WALRUS_QUOTE', 'g.drew.lading.walrus.quote'),
       walrusRenew: env('LADING_ROUTE_WALRUS_RENEW', 'g.drew.lading.walrus.renew'),
       walrusRenewQuote: env('LADING_ROUTE_WALRUS_RENEW_QUOTE', 'g.drew.lading.walrus.renew.quote'),
+      walrusExtend: env('LADING_ROUTE_WALRUS_EXTEND', 'g.drew.lading.walrus.extend'),
+      walrusExtendQuote: env('LADING_ROUTE_WALRUS_EXTEND_QUOTE', 'g.drew.lading.walrus.extend.quote'),
       filecoin: env('LADING_ROUTE_FILECOIN', 'g.drew.lading.filecoin'),
       filecoinQuote: env('LADING_ROUTE_FILECOIN_QUOTE', 'g.drew.lading.filecoin.quote'),
       ipfs: env('LADING_ROUTE_IPFS', 'g.drew.lading.ipfs'),
@@ -339,7 +343,22 @@ export interface VerifyResult {
 }
 
 export interface RenewResult {
-  rows: Array<{ label: string; lighthouseId: string; blobId?: string; previousExpiresAt?: number; expiresAt?: number; baseTx?: string; skipped?: string; recorded: boolean }>;
+  rows: Array<{
+    label: string;
+    provider: 'lighthouse' | 'native';
+    /** The Lighthouse record id or the Sui blob object id. */
+    handle: string;
+    lighthouseId: string;
+    blobId?: string;
+    previousExpiresAt?: number;
+    expiresAt?: number;
+    previousEndEpoch?: number;
+    endEpoch?: number;
+    baseTx?: string;
+    digest?: string;
+    skipped?: string;
+    recorded: boolean;
+  }>;
   bought: number;
   targets: number;
   total: bigint;
@@ -596,6 +615,12 @@ export class Lading {
   quoteWalrusRenew(lighthouseId: string): Promise<Paid<WalrusRenewQuote>> {
     const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'walrus-renew', phase: 'quote', lighthouseId } });
     return this.job<WalrusRenewQuote>(this.opts.routes.walrusRenewQuote, ev as never, 60_000);
+  }
+
+  /** Ask the extend quote door what `epochs` more on a native Walrus blob object costs and where its period stands. 1,000 units, against 40,000 for the extension. */
+  quoteWalrusExtend(objectId: string, epochs?: number): Promise<Paid<WalrusExtendQuote>> {
+    const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'walrus-extend', phase: 'quote', objectId, ...(epochs ? { epochs: String(epochs) } : {}) } });
+    return this.job<WalrusExtendQuote>(this.opts.routes.walrusExtendQuote, ev as never, 60_000);
   }
 
   /** Bytes on the wire for a leg event carrying a blob of `blobLen` bytes (base64 grows it by a third). */
@@ -1351,6 +1376,20 @@ export class Lading {
     const rows = this.savedPuts().flatMap(({ saved }) => walrusRecords(saved));
     if (o.live) {
       for (const r of rows) {
+        if (r.provider === 'native') {
+          // The chain is the ledger for a native record: the extend quote door reads the object and the epoch timing (1,000 units per row).
+          const q = await this.quoteWalrusExtend(r.handle);
+          if (!q.receipt.found) {
+            r.daysLeft = Number.NaN;
+            continue;
+          }
+          if (q.receipt.currentExpiresAt !== undefined) {
+            r.expiresAt = q.receipt.currentExpiresAt;
+            r.daysLeft = daysLeft(q.receipt.currentExpiresAt);
+          }
+          if (q.receipt.endEpoch !== undefined) r.endEpoch = q.receipt.endEpoch;
+          continue;
+        }
         const res = await fetch(`${this.opts.lighthouseX402}/api/renew/price?id=${encodeURIComponent(r.lighthouseId)}`);
         if (res.status === 404) {
           r.daysLeft = Number.NaN;
@@ -1375,21 +1414,23 @@ export class Lading {
    * first and only paid when its quote says deliverable; the saved file records
    * the new paid-through date so `lading renewals` reads it back.
    */
-  async renew(ref: string, o: { quote?: boolean } = {}): Promise<RenewResult> {
+  async renew(ref: string, o: { quote?: boolean; epochs?: number } = {}): Promise<RenewResult> {
     const R = this.opts.routes;
     const isSha = /^[0-9a-f]{64}$/.test(ref);
     const isId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(ref);
-    if (!isSha && !isId) throw new Error('renew wants a saved put sha256 or a Lighthouse record id');
+    const isObject = /^0x[0-9a-fA-F]{64}$/.test(ref);
+    if (!isSha && !isId && !isObject) throw new Error('renew wants a saved put sha256, a Lighthouse record id, or a Sui blob object id');
     const puts = this.savedPuts();
-    const targets: Array<{ lighthouseId: string; blobId?: string; put?: { path: string; saved: SavedPut }; label: string }> = [];
+    type Target = { provider: 'lighthouse' | 'native'; handle: string; blobId?: string; put?: { path: string; saved: SavedPut }; label: string };
+    const targets: Target[] = [];
     if (isSha) {
       const put = puts.find((p) => p.sha === ref);
       if (!put) throw new Error(`no saved manifest for ${ref} under ${join(this.opts.home, 'manifests')}`);
-      for (const r of walrusRecords(put.saved)) targets.push({ lighthouseId: r.lighthouseId, blobId: r.blobId, put, label: `walrus${partLabel(r)}` });
+      for (const r of walrusRecords(put.saved)) targets.push({ provider: r.provider, handle: r.handle, blobId: r.blobId, put, label: `walrus${partLabel(r)}` });
       if (targets.length === 0) throw new Error(`the saved put ${ref.slice(0, 12)} has no walrus records`);
     } else {
-      const put = puts.find((p) => walrusRecords(p.saved).some((r) => r.lighthouseId === ref));
-      targets.push({ lighthouseId: ref, put, label: 'walrus' });
+      const put = puts.find((p) => walrusRecords(p.saved).some((r) => r.handle === ref));
+      targets.push({ provider: isObject ? 'native' : 'lighthouse', handle: ref, put, label: 'walrus' });
     }
     const t0 = Date.now();
     let total = 0n;
@@ -1397,23 +1438,61 @@ export class Lading {
     const rows: RenewResult['rows'] = [];
     for (const t of targets) {
       const tag = t.label.padEnd(9);
+      const row = (extra: Partial<RenewResult['rows'][number]>): RenewResult['rows'][number] => ({ label: t.label, provider: t.provider, handle: t.handle, lighthouseId: t.provider === 'lighthouse' ? t.handle : '', blobId: t.blobId, recorded: false, ...extra });
+      if (t.provider === 'native') {
+        // A native record: more epochs on the Sui blob object, through the extend doors.
+        if (o.quote !== false) {
+          const q = await this.quoteWalrusExtend(t.handle, o.epochs);
+          total += q.price ?? 0n;
+          this.log(`${tag} quote ${fmtExtendQuote(q.receipt)}  (${Date.now() - t0} ms)`);
+          if (!q.receipt.deliverable) {
+            this.log(`${tag} SKIPPED, nothing paid for it`);
+            rows.push(row({ skipped: q.receipt.reason ?? 'not deliverable' }));
+            continue;
+          }
+        }
+        const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'walrus-extend', objectId: t.handle, ...(o.epochs ? { epochs: String(o.epochs) } : {}) } });
+        const r = await this.job<WalrusExtendReceipt>(R.walrusExtend, ev as never, 180_000);
+        total += r.price ?? 0n;
+        bought++;
+        const rec: SavedRenewal = {
+          network: 'walrus',
+          objectId: t.handle,
+          blobId: r.receipt.blobId,
+          previousExpiresAt: r.receipt.previousExpiresAt,
+          expiresAt: r.receipt.expiresAt,
+          previousEndEpoch: r.receipt.previousEndEpoch,
+          endEpoch: r.receipt.endEpoch,
+          route: r.route,
+          price: r.price?.toString() ?? null,
+          digest: r.receipt.proof.digest,
+          at: r.receipt.at,
+        };
+        if (t.put) {
+          t.put.saved.renewals = [...(t.put.saved.renewals ?? []), rec];
+          writeFileSync(t.put.path, JSON.stringify(t.put.saved, null, 2));
+        }
+        this.log(`${tag} ✓ ${r.receipt.blobId}  epoch ${r.receipt.previousEndEpoch} -> ${r.receipt.endEpoch} (${fmtDate(r.receipt.previousExpiresAt)} -> ${fmtDate(r.receipt.expiresAt)})  ${r.receipt.proof.amountWal} WAL  sui tx ${rec.digest}${t.put ? '' : '  (no saved put; not recorded locally)'}  (${Date.now() - t0} ms)`);
+        rows.push(row({ blobId: r.receipt.blobId, previousExpiresAt: r.receipt.previousExpiresAt, expiresAt: r.receipt.expiresAt, previousEndEpoch: r.receipt.previousEndEpoch, endEpoch: r.receipt.endEpoch, digest: rec.digest, recorded: !!t.put }));
+        continue;
+      }
       if (o.quote !== false) {
-        const q = await this.quoteWalrusRenew(t.lighthouseId);
+        const q = await this.quoteWalrusRenew(t.handle);
         total += q.price ?? 0n;
         this.log(`${tag} quote ${fmtRenewQuote(q.receipt)}  (${Date.now() - t0} ms)`);
         if (!q.receipt.deliverable) {
           this.log(`${tag} SKIPPED, nothing paid for it`);
-          rows.push({ label: t.label, lighthouseId: t.lighthouseId, blobId: t.blobId, skipped: q.receipt.reason ?? 'not deliverable', recorded: false });
+          rows.push(row({ skipped: q.receipt.reason ?? 'not deliverable' }));
           continue;
         }
       }
-      const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'walrus-renew', lighthouseId: t.lighthouseId } });
+      const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'walrus-renew', lighthouseId: t.handle } });
       const r = await this.job<WalrusRenewReceipt>(R.walrusRenew, ev as never, 180_000);
       total += r.price ?? 0n;
       bought++;
       const rec: SavedRenewal = {
         network: 'walrus',
-        lighthouseId: t.lighthouseId,
+        lighthouseId: t.handle,
         blobId: r.receipt.blobId,
         previousExpiresAt: r.receipt.previousExpiresAt,
         expiresAt: r.receipt.expiresAt,
@@ -1427,7 +1506,7 @@ export class Lading {
         writeFileSync(t.put.path, JSON.stringify(t.put.saved, null, 2));
       }
       this.log(`${tag} ✓ ${r.receipt.blobId}  ${fmtDate(r.receipt.previousExpiresAt)} -> ${fmtDate(r.receipt.expiresAt)}${rec.baseTx ? `  base tx ${rec.baseTx}` : ''}${t.put ? '' : '  (no saved put; not recorded locally)'}  (${Date.now() - t0} ms)`);
-      rows.push({ label: t.label, lighthouseId: t.lighthouseId, blobId: r.receipt.blobId, previousExpiresAt: r.receipt.previousExpiresAt, expiresAt: r.receipt.expiresAt, baseTx: rec.baseTx, recorded: !!t.put });
+      rows.push(row({ blobId: r.receipt.blobId, previousExpiresAt: r.receipt.previousExpiresAt, expiresAt: r.receipt.expiresAt, baseTx: rec.baseTx, recorded: !!t.put }));
     }
     return { rows, bought, targets: targets.length, total };
   }
@@ -1503,3 +1582,6 @@ export const fmtQuote = (q: WalrusQuote | FilecoinQuote | IpfsQuote | NameQuote)
   if (q.op === 'filecoin') return `${head}, add-piece fee ${q.downstream.addPieceFeeUsdfc} USDFC for ${q.copies} copies, float ${q.float.available} USDFC, runway ${/^\d+$/.test(q.float.runwayDays) ? `${q.float.runwayDays}d` : q.float.runwayDays}${tail}`;
   return `${head}, ${q.name}, float ${(Number(q.float.lamports) / 1e9).toFixed(4)} SOL${tail}`;
 };
+
+export const fmtExtendQuote = (q: WalrusExtendQuote) =>
+  `${q.deliverable ? 'deliverable' : `NOT deliverable (${q.reason})`}, ${q.found ? `end epoch ${q.endEpoch} -> ${q.newEndEpoch} (${q.currentExpiresAt ? `${fmtDate(q.currentExpiresAt)}, ${q.daysLeft} days left` : 'date unknown'})` : 'object not found'}, downstream ${q.downstream.amount} WAL for ${q.epochs} epochs, float ${q.float.balance} WAL (+ ${q.float.sui} SUI)${q.known ? '' : ', NOT owned by the broker'}`;

@@ -25,8 +25,8 @@
 import { createHash } from 'node:crypto';
 import { SuiGrpcClient } from '@mysten/sui/grpc';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
-import { walrus } from '@mysten/walrus';
-import type { WalrusReceipt } from './kinds.js';
+import { walrus, blobIdFromInt } from '@mysten/walrus';
+import type { WalrusExtendReceipt, WalrusReceipt } from './kinds.js';
 
 export const SUI_RPC = process.env.SUI_GRPC_URL ?? 'https://fullnode.mainnet.sui.io:443';
 export const WALRUS_UPLOAD_RELAY = process.env.WALRUS_UPLOAD_RELAY ?? 'https://upload-relay.mainnet.walrus.space';
@@ -44,6 +44,21 @@ export const SUI_PER_WRITE = process.env.LADING_WALRUS_SUI_PER_WRITE ?? '0.03';
 
 const sha256Hex = (b: Uint8Array) => createHash('sha256').update(b).digest('hex');
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * The instant a storage period ending at `endEpoch` runs out: the start of
+ * that epoch. Epoch 0 was genesis; epoch 1 began at `first_epoch_start` and
+ * every epoch since lasts `epoch_duration` (two weeks on mainnet).
+ */
+export const epochEndsAt = (endEpoch: number, firstEpochStartMs: number, epochDurationMs: number) => firstEpochStartMs + (endEpoch - 1) * epochDurationMs;
+
+/** The address out of a Sui object's `owner` field, whatever shape the client hands back. */
+export function ownerAddress(owner: unknown): string | undefined {
+  if (!owner || typeof owner !== 'object') return typeof owner === 'string' ? owner : undefined;
+  const o = owner as Record<string, unknown>;
+  for (const k of ['AddressOwner', 'address', 'Address', 'ObjectOwner']) if (typeof o[k] === 'string') return o[k] as string;
+  return undefined;
+}
 
 /** 9-decimal base units (FROST for WAL, MIST for SUI) as a decimal string. */
 export const nineDec = (u: bigint) => `${u / 1_000_000_000n}.${(u % 1_000_000_000n).toString().padStart(9, '0')}`;
@@ -64,13 +79,55 @@ export interface NativeWalrusFloats {
   suiMist: bigint;
 }
 
+/** Walrus epoch timing from the staking object: epoch `e` runs from `firstEpochStartMs + (e - 1) * epochDurationMs` (epoch 0 was genesis). */
+export interface EpochTiming {
+  currentEpoch: number;
+  epochDurationMs: number;
+  firstEpochStartMs: number;
+  /** ms epoch at which the storage period ending at `endEpoch` runs out (the start of that epoch). */
+  endsAt(endEpoch: number): number;
+}
+
+/** A blob object as this key sees it on chain: what an extension is addressed to. */
+export interface NativeBlobState {
+  found: boolean;
+  owned: boolean;
+  objectId: string;
+  blobId?: string;
+  size?: number;
+  endEpoch?: number;
+  startEpoch?: number;
+  deletable?: boolean;
+  /** Encoded size on the nodes, what storage is billed on. */
+  storageSize?: number;
+}
+
+export interface NativeExtendQuote {
+  state: NativeBlobState;
+  timing: EpochTiming;
+  epochs: number;
+  amountFrost: bigint;
+  amountWal: string;
+}
+
 export interface NativeWalrusUploader {
   readonly address: string;
   readonly epochs: number;
   quote(size: number): Promise<NativeWalrusQuote>;
   floats(): Promise<NativeWalrusFloats>;
   upload(bytes: Uint8Array, fileName: string, log?: (line: string) => void): Promise<WalrusReceipt>;
+  /** Epoch number and timing, read from the chain. */
+  timing(): Promise<EpochTiming>;
+  /** The blob object behind an id, and whether this key owns it. */
+  blobState(objectId: string): Promise<NativeBlobState>;
+  /** What `epochs` more on a blob object costs now (storage only: the bytes are already on the nodes). */
+  extendQuote(objectId: string, epochs?: number): Promise<NativeExtendQuote>;
+  /** Buy `epochs` more on a blob object this key owns: one Sui transaction paying WAL. */
+  extend(objectId: string, epochs?: number): Promise<WalrusExtendReceipt>;
 }
+
+/** Sui object ids: 0x + 64 hex. */
+export const SUI_OBJECT_ID_RE = /^0x[0-9a-fA-F]{64}$/;
 
 export function nativeWalrusUploader(o: { suiSecretKey: string; epochs?: number; rpc?: string; relay?: string; aggregator?: string }): NativeWalrusUploader {
   const keypair = Ed25519Keypair.fromSecretKey(o.suiSecretKey);
@@ -98,6 +155,84 @@ export function nativeWalrusUploader(o: { suiSecretKey: string; epochs?: number;
       const [cost, state] = await Promise.all([client.walrus.storageCost(Math.max(size, 1), epochs), client.walrus.systemState()]);
       const currentEpoch = Number(state.committee?.epoch ?? 0);
       return { amountWal: nineDec(cost.totalCost), amountFrost: cost.totalCost, epochs, currentEpoch, endEpoch: currentEpoch + epochs, raw: { storageCost: cost.storageCost.toString(), writeCost: cost.writeCost.toString(), totalCost: cost.totalCost.toString() } };
+    },
+
+    async timing() {
+      const st = await client.walrus.stakingState();
+      const epochDurationMs = Number(st.epoch_duration);
+      const firstEpochStartMs = Number(st.first_epoch_start);
+      const currentEpoch = Number(st.epoch);
+      return { currentEpoch, epochDurationMs, firstEpochStartMs, endsAt: (e: number) => epochEndsAt(e, firstEpochStartMs, epochDurationMs) };
+    },
+
+    async blobState(objectId) {
+      if (!SUI_OBJECT_ID_RE.test(objectId)) throw new Error(`${objectId} is not a Sui object id`);
+      let owner: string | undefined;
+      try {
+        const r = (await client.core.getObject({ objectId })) as { object?: { owner?: unknown } };
+        owner = ownerAddress(r.object?.owner);
+      } catch (e) {
+        if (/not found|does not exist|NotFound/i.test((e as Error).message)) return { found: false, owned: false, objectId };
+        throw e;
+      }
+      // The SDK memoises objects it has loaded; a quote and a post-extend
+      // read-back must both reflect the chain now, not the object as first seen.
+      client.walrus.reset();
+      const blob = await client.walrus.getBlobObject(objectId).catch((e: Error) => {
+        if (/not found|does not exist|NotFound/i.test(e.message)) return undefined;
+        throw e;
+      });
+      if (!blob) return { found: false, owned: false, objectId };
+      return {
+        found: true,
+        owned: owner === address,
+        objectId,
+        blobId: blobIdFromInt(blob.blob_id),
+        size: Number(blob.size),
+        endEpoch: Number(blob.storage.end_epoch),
+        startEpoch: Number(blob.storage.start_epoch),
+        deletable: blob.deletable,
+        storageSize: Number(blob.storage.storage_size),
+      };
+    },
+
+    async extendQuote(objectId, n = epochs) {
+      const [state, timing] = await Promise.all([this.blobState(objectId), this.timing()]);
+      // Extending pays storage only, on the encoded size the object already occupies; the SDK prices from the unencoded size the same way.
+      const cost = state.found ? (await client.walrus.storageCost(Math.max(state.size ?? 1, 1), n)).storageCost : 0n;
+      return { state, timing, epochs: n, amountFrost: cost, amountWal: nineDec(cost) };
+    },
+
+    async extend(objectId, n = epochs) {
+      const q = await this.extendQuote(objectId, n);
+      if (!q.state.found) throw new Error(`no blob object ${objectId} on Sui`);
+      if (!q.state.owned) throw new Error(`blob object ${objectId} is not owned by ${address}`);
+      const previousEndEpoch = q.state.endEpoch as number;
+      const { digest } = await client.walrus.executeExtendBlobTransaction({ blobObjectId: objectId, epochs: n, signer: keypair });
+      // Read the object back: the receipt reports what the chain holds, not what was asked.
+      let after = await this.blobState(objectId);
+      for (let i = 0; i < 5 && (after.endEpoch ?? 0) < previousEndEpoch + n; i++) {
+        await sleep(2000 * (i + 1));
+        after = await this.blobState(objectId);
+      }
+      const endEpoch = after.endEpoch ?? previousEndEpoch;
+      if (endEpoch < previousEndEpoch + n) throw new Error(`extend tx ${digest} executed but the object still ends at epoch ${endEpoch} (wanted ${previousEndEpoch + n})`);
+      return {
+        network: 'walrus',
+        op: 'extend',
+        objectId,
+        blobId: q.state.blobId as string,
+        size: q.state.size as number,
+        previousEndEpoch,
+        endEpoch,
+        epochs: endEpoch - previousEndEpoch,
+        previousExpiresAt: q.timing.endsAt(previousEndEpoch),
+        expiresAt: q.timing.endsAt(endEpoch),
+        extended: `P${(endEpoch - previousEndEpoch) * EPOCH_DAYS}D`,
+        provider: 'walrus-native',
+        proof: { digest, owner: address, currentEpoch: q.timing.currentEpoch, amountWal: q.amountWal, explorer: `https://suivision.xyz/txblock/${digest}` },
+        at: Math.floor(Date.now() / 1000),
+      };
     },
 
     async upload(bytes, fileName, log = () => {}) {
@@ -130,6 +265,8 @@ export function nativeWalrusUploader(o: { suiSecretKey: string; epochs?: number;
         await sleep(3000 * (i + 1));
       }
       if (!verified) throw new Error(`blob ${blobId} certified (object ${blobObject.id}) but the aggregator did not serve it back: ${readback}`);
+      // The instant the period ends, so renewals can be scheduled without asking the chain again.
+      const expiresAt = await this.timing().then((t) => t.endsAt(Number(blobObject.storage.end_epoch))).catch(() => undefined);
 
       const receipt: WalrusReceipt = {
         network: 'walrus',
@@ -148,6 +285,7 @@ export function nativeWalrusUploader(o: { suiSecretKey: string; epochs?: number;
           endEpoch: blobObject.storage.end_epoch,
           deletable: 'no',
           owner: address,
+          expiresAt,
           readback,
           verified: verified ? 'yes' : 'no',
         },

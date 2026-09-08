@@ -51,3 +51,27 @@ test('walrusRecords: a chunked leg yields one row per part, and a saved renewal 
   assert.deepEqual(dueWithin(rows, 60).map((r) => r.lighthouseId), ['rec-0']);
   assert.deepEqual(dueWithin(rows, 400).map((r) => r.lighthouseId), ['rec-0', 'rec-1']);
 });
+
+test('walrusRecords: a native record is a row keyed by its Sui object id; an extension moves its epoch and date; no date means NaN days', () => {
+  const now = 1_800_000_000_000;
+  const legs: Parameters<typeof buildManifest>[0]['legs'] = [
+    { network: 'walrus', id: 'blobN', sha256: sha, size: 20, retention: 'P364D', provider: 'walrus-native', proof: { blobId: 'blobN', readUrl: 'u', objectId: '0x' + 'a'.repeat(64), endEpoch: 65, expiresAt: now + 30 * DAY }, at: 1 },
+    { network: 'walrus', id: 'blobO', sha256: sha, size: 20, retention: 'P364D', provider: 'walrus-native', proof: { blobId: 'blobO', readUrl: 'u', objectId: '0x' + 'b'.repeat(64), endEpoch: 60 }, at: 1 },
+  ];
+  const rows = walrusRecords(saved(legs), now);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0]!.provider, 'native');
+  assert.equal(rows[0]!.handle, '0x' + 'a'.repeat(64));
+  assert.equal(rows[0]!.lighthouseId, '');
+  assert.equal(rows[0]!.endEpoch, 65);
+  assert.equal(rows[0]!.daysLeft, 30);
+  assert.ok(Number.isNaN(rows[1]!.daysLeft));
+  assert.equal(dueWithin(rows.filter((r) => !Number.isNaN(r.daysLeft)), 60).length, 1);
+  const extended = walrusRecords(
+    saved(legs, [{ network: 'walrus', objectId: '0x' + 'a'.repeat(64), blobId: 'blobN', previousExpiresAt: now + 30 * DAY, expiresAt: now + 394 * DAY, previousEndEpoch: 65, endEpoch: 91, route: 'r', price: '40000', digest: 'D', at: 2 }]),
+    now,
+  );
+  assert.equal(extended[0]!.renewals, 1);
+  assert.equal(extended[0]!.endEpoch, 91);
+  assert.equal(extended[0]!.daysLeft, 394);
+});
