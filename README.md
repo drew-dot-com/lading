@@ -223,6 +223,12 @@ A chunked put that has to open a channel locks `LADING_CHANNEL_DEPOSIT`
 base units (default 2,000,000, 2 USDC) rather than the client's 100,000
 default, since one such put runs to several hundred thousand units.
 
+## Blossom: any Nostr client as a front end
+
+The gate is a [Blossom](https://github.com/hzrd149/blossom) media server at the root of its host (`HEAD`/`PUT /upload`, `PUT /mirror`, `GET /<sha256>.<ext>`). A user adds `https://lading.167-233-221-236.sslip.io` to their kind 10063 server list and every upload from their client (Amethyst, noStrudel, Coracle, Primal) is a Lading put: four networks, a signed bill of lading on Arweave, an ArNS name. The descriptor the client gets back carries the manifest URL and every leg id.
+
+No Nostr client can pay x402, so uploads draw on credit per pubkey: anyone with a Base USDC key pays `POST /v1/credit` (headers `x-pubkey`, `x-usdc`) and that pubkey's uploads are priced exactly like `POST /v1/put` and debited from it. Empty credit answers 402 with an `X-Reason` that names the balance, the price and the fund door, which is the one line a Blossom client shows the user. Design, sources and what is not built yet: [docs/blossom.md](docs/blossom.md).
+
 ## What is where
 
 ```

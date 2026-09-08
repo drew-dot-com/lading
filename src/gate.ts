@@ -25,6 +25,11 @@
  *   GET  /v1/renew/quote?id=      the door price for one more year on a Lighthouse record; free
  *   POST /v1/renew                JSON {lighthouseId}; x402, flat
  *   GET  /v1/verify?ref=          re-fetch every leg of a manifest and compare sha256; free
+ *   GET  /v1/credit?pubkey=       a Nostr pubkey's upload credit; free
+ *   POST /v1/credit               x-pubkey, x-usdc; x402 priced at x-usdc: credit for that pubkey's Blossom uploads
+ *   Blossom (docs/blossom.md), at the root: HEAD/PUT /upload, PUT /mirror, GET/HEAD /<sha256>[.ext], DELETE
+ *                                 (refused); a kind 24242 Authorization; uploads are priced like a put and
+ *                                 paid from the pubkey's credit
  *
  * Settlement runs after the handler answers 2xx (the middleware buffers the
  * response), so a put that fails is not charged to the caller; the gate eats
@@ -49,6 +54,10 @@ import { gatePriceMicro, gatePriceUsdc, microToUsdc, pricingFromEnv, usdcToMicro
 
 import { VERSION } from './version.js';
 import { installLongFetch } from './long-fetch.js';
+import { BlossomError, CreditLedger, blossomErrorHandler, blossomRouter, npubOf, type BlobRecord } from './blossom.js';
+import { parseManifest } from './manifest.js';
+import { readFirst } from './read.js';
+import { join } from 'node:path';
 installLongFetch();
 const PORT = Number(process.env.PORT ?? 3601);
 const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES ?? 3 * 1024 * 1024);
@@ -343,6 +352,27 @@ app.post('/v1/parts', (req, res, next) => {
   return next();
 });
 
+// A credit top-up names the pubkey and the amount in headers so the x402 price is the amount.
+const CREDIT_MIN_USDC = Number(process.env.LADING_CREDIT_MIN_USDC ?? 0.05);
+const CREDIT_MAX_USDC = Number(process.env.LADING_CREDIT_MAX_USDC ?? 50);
+const creditRequest = (get: (h: string) => string | undefined) => {
+  const pubkey = (get('x-pubkey') ?? '').toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(pubkey)) throw new HttpError(400, 'x-pubkey header required: the hex Nostr pubkey to credit');
+  const raw = get('x-usdc') ?? '';
+  if (!/^\d+(\.\d{1,6})?$/.test(raw)) throw new HttpError(400, 'x-usdc header required: the amount to credit, up to 6 decimals');
+  const usdc = Number(raw);
+  if (usdc < CREDIT_MIN_USDC || usdc > CREDIT_MAX_USDC) throw new HttpError(400, `x-usdc must be between ${CREDIT_MIN_USDC} and ${CREDIT_MAX_USDC}`);
+  return { pubkey, usdc: usdc.toFixed(6), micro: usdcToMicro(usdc.toFixed(6)) };
+};
+app.post('/v1/credit', (req, res, next) => {
+  try {
+    creditRequest((h) => req.get(h));
+    return next();
+  } catch (e) {
+    return next(e);
+  }
+});
+
 if (!FREE) {
   const facilitator = new HTTPFacilitatorClient({ url: FACILITATOR });
   const server = new x402ResourceServer(facilitator).register(NETWORK, new ExactEvmScheme());
@@ -412,6 +442,18 @@ if (!FREE) {
           mimeType: 'application/json',
           serviceName: 'lading',
         },
+        'POST /v1/credit': {
+          accepts: {
+            scheme: 'exact',
+            network: NETWORK,
+            payTo: PAY_TO!,
+            maxTimeoutSeconds: 300,
+            price: async (ctx) => creditRequest((h) => ctx.adapter.getHeader(h) || undefined).usdc,
+          },
+          description: 'Lading credit: x-usdc of upload credit for the Nostr pubkey in x-pubkey. Blossom uploads (PUT /upload) from that key are priced like POST /v1/put and paid from it.',
+          mimeType: 'application/json',
+          serviceName: 'lading',
+        },
       },
       server,
     ),
@@ -440,6 +482,7 @@ app.get('/v1/describe', async (_req, res, next) => {
       version: VERSION,
       what: 'Archive broker on TOON: one call, four storage networks (Arweave, Walrus, Filecoin, IPFS), a signed bill of lading named on ArNS. Pay this door with USDC on Base over x402; every hop behind it is ILP.',
       door: { url: PUBLIC_URL, network: NETWORK, payTo: PAY_TO ?? null, facilitator: FREE ? null : FACILITATOR, free: FREE, margin: pricing.margin, floorUsdc: pricing.floorUsdc, maxBodyBytes: MAX_BODY_BYTES },
+      blossom: { server: PUBLIC_URL, upload: 'PUT /upload', preflight: 'HEAD /upload', mirror: 'PUT /mirror', read: 'GET /<sha256>.<ext>', credit: { read: 'GET /v1/credit?pubkey=', fund: 'POST /v1/credit (x-pubkey, x-usdc)', minUsdc: CREDIT_MIN_USDC, maxUsdc: CREDIT_MAX_USDC }, doc: 'https://github.com/drew-dot-com/lading/blob/main/docs/blossom.md' },
       edge: lading.opts.edge,
       read: { arns: lading.opts.gateway, arnsFallback: lading.arnsGateways(), txid: lading.readGateways() },
       payer: { nostrPubkey: lading.payerPubkey(), solana: await payerAddress().catch(() => null) },
@@ -660,8 +703,66 @@ app.post('/v1/renew', express.json({ limit: '4kb' }), async (req, res, next) => 
 });
 
 app.use((_req, res) => res.status(404).json({ error: 'no such door' }));
+// ---------------------------------------------------------------------------
+// Blossom: credit per Nostr pubkey, and the BUD doors at the root of the host (docs/blossom.md).
+
+const credit = new CreditLedger(join(lading.opts.home, 'blossom-credit.jsonl'));
+
+/** A Lading record in the shape the Blossom doors describe and serve. */
+function blobRecord(r: PutResult): BlobRecord {
+  let mime: string | undefined;
+  try {
+    mime = parseManifest(r.manifest).mime;
+  } catch {
+    mime = undefined;
+  }
+  return { sha256: r.sha256, size: r.size, mime, archivedAt: r.archivedAt, legs: r.legs, manifestUrl: r.manifestUrl, name: r.name?.name };
+}
+
+app.get('/v1/credit', (req, res, next) => {
+  try {
+    const pubkey = String(req.query.pubkey ?? '').toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(pubkey)) throw new HttpError(400, 'pubkey (hex) required');
+    const micro = credit.balance(pubkey);
+    return res.json({ pubkey, npub: npubOf(pubkey), credit: { usdc: microToUsdc(micro), micro: micro.toString() }, fund: { door: 'POST /v1/credit', headers: ['x-pubkey', 'x-usdc'], network: NETWORK, min: CREDIT_MIN_USDC, max: CREDIT_MAX_USDC }, history: credit.history(pubkey).slice(-20) });
+  } catch (e) {
+    return next(e);
+  }
+});
+
+app.post('/v1/credit', (req, res, next) => {
+  try {
+    const { pubkey, usdc, micro } = creditRequest((h) => req.get(h));
+    const payer = payerOf(req);
+    const balance = credit.topUp(pubkey, micro, payer ?? (FREE ? 'free' : 'x402'));
+    log(`credit ${npubOf(pubkey).slice(0, 16)}… +${usdc} USDC from ${payer ?? (FREE ? 'free' : '?')} → ${microToUsdc(balance)}`);
+    return res.json({ pubkey, npub: npubOf(pubkey), credited: { usdc, micro: micro.toString() }, credit: { usdc: microToUsdc(balance), micro: balance.toString() }, payer: payer ?? null, blossom: { server: PUBLIC_URL, upload: 'PUT /upload', preflight: 'HEAD /upload' } });
+  } catch (e) {
+    return next(e);
+  }
+});
+
+app.use(
+  blossomRouter({
+    baseUrl: PUBLIC_URL,
+    maxBytes: MAX_BODY_BYTES,
+    credit,
+    price: async (size) => usdcToMicro((await quotePut(size, DEFAULT_PART_BYTES, undefined)).price.usdc),
+    archived: (sha) => {
+      const r = lading.archived(sha);
+      return r ? blobRecord(r) : undefined;
+    },
+    put: async (bytes, o) => blobRecord(await serialize(() => lading.put(bytes, { name: o.name, mime: o.mime, partBytes: DEFAULT_PART_BYTES, via: { door: 'blossom', network: 'nostr', payer: o.pubkey } }))),
+    readUrls: (leg) => lading.readUrlsFor(leg.network, leg.id, leg.proof),
+    readFirst: (urls) => readFirst(urls),
+    sha256,
+    log,
+  }),
+);
+app.use(blossomErrorHandler);
+
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
-  const status = err instanceof HttpError ? err.status : err instanceof InputError ? 400 : (err as { status?: number; statusCode?: number })?.status ?? (err as { statusCode?: number })?.statusCode ?? 502;
+  const status = err instanceof HttpError ? err.status : err instanceof BlossomError ? err.status : err instanceof InputError ? 400 : (err as { status?: number; statusCode?: number })?.status ?? (err as { statusCode?: number })?.statusCode ?? 502;
   const message = (err as Error)?.message ?? String(err);
   if (status >= 500) log(`error ${status}: ${message}`);
   res.status(status).json({ error: message });
