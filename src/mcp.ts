@@ -53,7 +53,14 @@ export interface McpOptions {
 
 /** The shim's key: explicit hex first, then the key file, generating one when asked. Returns undefined when none. */
 export function resolveKey(o: Pick<McpOptions, 'key' | 'keyFile' | 'autoKey'>, log: (...a: unknown[]) => void): { key?: `0x${string}`; from: string } {
-  if (o.key?.trim()) return { key: o.key.trim() as `0x${string}`, from: 'env' };
+  const given = o.key?.trim();
+  if (given) {
+    if (/^0x[0-9a-fA-F]{64}$/.test(given)) return { key: given as `0x${string}`, from: 'env' };
+    // Claude Desktop hands an extension the literal `${user_config.key}` when the optional field was left empty
+    // (seen 2026-09-08: the server died on "invalid private key" before answering initialize). Anything that is
+    // not a key is treated as no key, said once, and the key file takes over.
+    log(`LADING_X402_KEY ignored: ${/^\$\{.*\}$/.test(given) ? 'the extension field was left empty' : 'not a 0x 32-byte hex key'}; using the key file`);
+  }
   if (!o.keyFile) return { from: 'none' };
   if (existsSync(o.keyFile)) {
     const k = readFileSync(o.keyFile, 'utf8').trim();

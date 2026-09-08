@@ -1,6 +1,6 @@
 {
   "name": "lading",
-  "version": "0.12.0",
+  "version": "0.12.1",
   "description": "Archive broker for agents on TOON. One channel, several storage networks (Arweave, Walrus, Filecoin), every leg answers with the network's own receipt or buys nothing, and a signed bill of lading named on ArNS. Hosted behind an x402 door with an MCP shim for Claude.",
   "type": "module",
   "license": "MIT",
