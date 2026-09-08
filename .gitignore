@@ -6,3 +6,4 @@ channel-store*.json
 extension/server/
 extension/package.json
 *.mcpb
+*.tmp.ts
