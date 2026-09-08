@@ -32,7 +32,7 @@ import { Lading, optionsFromEnv, sha256, type Estimate } from './lib.js';
 import { DEFAULT_PART_BYTES } from './parts.js';
 import { gatePriceMicro, gatePriceUsdc, microToUsdc, pricingFromEnv } from './gate-price.js';
 
-const VERSION = '0.6.0';
+import { VERSION } from './version.js';
 const PORT = Number(process.env.PORT ?? 3601);
 const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES ?? 3 * 1024 * 1024);
 const FREE = process.env.GATE_FREE === '1';

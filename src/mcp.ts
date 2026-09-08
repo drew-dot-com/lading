@@ -27,7 +27,7 @@ import { createPublicClient, erc20Abi, formatUnits, http } from 'viem';
 import { base } from 'viem/chains';
 import { usdcToMicro } from './gate-price.js';
 
-export const MCP_VERSION = '0.7.0';
+export const MCP_VERSION = process.env.LADING_BUNDLED_VERSION ?? '0.7.0';
 /** USDC on Base mainnet, 6 decimals. */
 export const BASE_USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' as const;
 

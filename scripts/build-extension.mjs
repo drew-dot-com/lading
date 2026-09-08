@@ -17,6 +17,7 @@ await build({
   format: 'esm',
   outfile: 'extension/server/index.js',
   banner: { js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);" },
+  define: { 'process.env.LADING_BUNDLED_VERSION': JSON.stringify(pkg.version) },
   legalComments: 'none',
   logLevel: 'info',
 });
