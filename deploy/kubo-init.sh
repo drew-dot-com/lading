@@ -12,8 +12,8 @@ ipfs config Addresses.Gateway /ip4/0.0.0.0/tcp/8080
 ipfs config Addresses.API /ip4/0.0.0.0/tcp/5001
 # Tell the DHT where we really are (docker publishes 4001 on the host).
 ipfs config --json Addresses.AppendAnnounce "[\"/ip4/$IP/tcp/4001\",\"/ip4/$IP/udp/4001/quic-v1\"]"
-# Re-announce what we pin, and only that.
-ipfs config Reprovider.Strategy pinned
+# Re-announce what we pin, and only that (kubo >= 0.43 calls this Provide; Reprovider is refused).
+ipfs config Provide.Strategy pinned
 # A 4 GB box shared with the node stack: keep the swarm and memory modest.
 ipfs config --json Swarm.ConnMgr '{"Type":"basic","LowWater":64,"HighWater":192,"GracePeriod":"30s"}'
 ipfs config --json Swarm.ResourceMgr '{"Enabled":true,"MaxMemory":"512MiB"}'
