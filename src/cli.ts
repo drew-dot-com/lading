@@ -2,7 +2,7 @@
 /**
  * The Lading command line, a thin layer over lib.ts.
  *
- *   lading put <file>       archive: arweave leg → walrus leg → filecoin leg →
+ *   lading put <file>       archive: arweave leg → walrus leg → filecoin leg → ipfs leg →
  *                           sign the bill of lading → publish to relay → write
  *                           it to Arweave → name it on ArNS. Each leg is one paid job per
  *                           part (an object over one packet travels as parts, see
@@ -56,7 +56,7 @@ async function put(file: string) {
     partBytes: partBytes(),
     quote: !flag('no-quote'),
     force: flag('force'),
-    skip: { arweave: flag('skip-arweave'), walrus: flag('skip-walrus'), filecoin: flag('skip-filecoin'), relay: flag('skip-relay'), name: flag('skip-name') },
+    skip: { arweave: flag('skip-arweave'), walrus: flag('skip-walrus'), filecoin: flag('skip-filecoin'), ipfs: flag('skip-ipfs'), relay: flag('skip-relay'), name: flag('skip-name') },
   });
   console.log(r.reused ? `\nBILL OF LADING (already archived ${new Date(r.archivedAt * 1000).toISOString().slice(0, 10)}, nothing bought; --force archives again)` : '\nBILL OF LADING');
   for (const l of r.legs) console.log(`  ${l.network.padEnd(8)} ${l.id}  ${l.retention}${l.parts ? `  (${l.parts.length} parts)` : ''}`);
@@ -129,7 +129,7 @@ const run =
   : null;
 if (!run) {
   console.log(
-    'usage: lading put <file> [--name n] [--mime m] [--undername u] [--part-bytes n] [--no-quote] [--force] [--skip-arweave|--skip-walrus|--skip-filecoin|--skip-relay|--skip-name]\n' +
+    'usage: lading put <file> [--name n] [--mime m] [--undername u] [--part-bytes n] [--no-quote] [--force] [--skip-arweave|--skip-walrus|--skip-filecoin|--skip-ipfs|--skip-relay|--skip-name]\n' +
       '       lading quote <file> [--part-bytes n]\n' +
       '       lading verify <arns-name|manifest-txid|saved.json>\n' +
       '       lading name <sha256> [--no-quote]\n' +

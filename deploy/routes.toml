@@ -19,6 +19,15 @@ prefix = "g.drew.lading.filecoin"
 handler_url = "http://lading:3600/filecoin"
 price = 30000
 
+# IPFS leg. Pinata's x402 door prices a pin at 0.10 USDC per GiB for twelve
+# months, floored at 0.001 USDC, so every part up to the packet cap costs the
+# broker 0.001 to 0.004 USDC. 5,000 base units = $0.005, a thin margin over the
+# per-part ceiling.
+[[routes]]
+prefix = "g.drew.lading.ipfs"
+handler_url = "http://lading:3600/ipfs"
+price = 5000
+
 # Name leg. One Solana transaction on the broker's ANT per job. 5,000 = $0.005.
 [[routes]]
 prefix = "g.drew.lading.name"
@@ -47,6 +56,11 @@ price = 1000
 [[routes]]
 prefix = "g.drew.lading.name.quote"
 handler_url = "http://lading:3600/name/quote"
+price = 1000
+
+[[routes]]
+prefix = "g.drew.lading.ipfs.quote"
+handler_url = "http://lading:3600/ipfs/quote"
 price = 1000
 
 # Walrus renewal: one more year on a record the broker paid Lighthouse for.

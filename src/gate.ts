@@ -249,7 +249,7 @@ const doorPrice = (est: Estimate, what: string) => {
 const priceBlock = (usdc: string) => ({ usdc, network: NETWORK, payTo: PAY_TO ?? null, margin: pricing.margin, floorUsdc: pricing.floorUsdc });
 const toonBlock = (est: Estimate) => ({ units: est.total.toString(), usdc: microToUsdc(est.total), rows: est.rows.map((r) => ({ leg: r.leg, route: r.route, units: r.price?.toString() ?? null, note: r.note })) });
 
-/** One slice: the three legs and their quote doors for that many bytes. Known on arweave and walrus already: the floor. */
+/** One slice: the four legs and their quote doors for that many bytes. Known on arweave and walrus already: the floor. */
 async function quotePart(size: number, known: boolean) {
   if (!Number.isInteger(size) || size <= 0) throw new HttpError(400, 'size must be a positive integer');
   if (size > MAX_BODY_BYTES) throw new HttpError(413, `part over the ${MAX_BODY_BYTES} byte ceiling`);
@@ -436,7 +436,7 @@ app.get('/v1/describe', async (_req, res, next) => {
     res.json({
       service: 'lading',
       version: VERSION,
-      what: 'Archive broker on TOON: one call, three storage networks, a signed bill of lading named on ArNS. Pay this door with USDC on Base over x402; every hop behind it is ILP.',
+      what: 'Archive broker on TOON: one call, four storage networks (Arweave, Walrus, Filecoin, IPFS), a signed bill of lading named on ArNS. Pay this door with USDC on Base over x402; every hop behind it is ILP.',
       door: { url: PUBLIC_URL, network: NETWORK, payTo: PAY_TO ?? null, facilitator: FREE ? null : FACILITATOR, free: FREE, margin: pricing.margin, floorUsdc: pricing.floorUsdc, maxBodyBytes: MAX_BODY_BYTES },
       edge: lading.opts.edge,
       read: { arns: lading.opts.gateway, arnsFallback: lading.arnsGateways(), txid: lading.readGateways() },
@@ -627,8 +627,8 @@ app.post('/v1/assemble', express.json({ limit: '16kb' }), async (req, res, next)
     const partBytes = partBytesOf(b.partBytes === undefined ? undefined : b.partBytes);
     const name = typeof b.name === 'string' && b.name ? basename(b.name).slice(0, 200) : `object-${sha.slice(0, 12)}`;
     const mime = typeof b.mime === 'string' && b.mime && b.mime !== 'application/octet-stream' ? b.mime : undefined;
-    const skipList = Array.isArray(b.skip) ? (b.skip as unknown[]).filter((x): x is 'filecoin' | 'walrus' => x === 'filecoin' || x === 'walrus') : [];
-    const skip = Object.fromEntries(skipList.map((k) => [k, true])) as Partial<Record<'filecoin' | 'walrus', boolean>>;
+    const skipList = Array.isArray(b.skip) ? (b.skip as unknown[]).filter((x): x is 'filecoin' | 'walrus' | 'ipfs' => x === 'filecoin' || x === 'walrus' || x === 'ipfs') : [];
+    const skip = Object.fromEntries(skipList.map((k) => [k, true])) as Partial<Record<'filecoin' | 'walrus' | 'ipfs', boolean>>;
     const payer = payerOf(req);
     const quoted = await quoteFinish(count, sha);
     log(`assemble ${sha.slice(0, 12)} ${size} B in ${count} parts "${name}" payer=${payer ?? (FREE ? 'free' : '?')} price=${quoted.price.usdc} USDC${skipList.length ? ` skip=${skipList.join(',')}` : ''}`);

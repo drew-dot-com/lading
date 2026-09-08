@@ -303,7 +303,7 @@ export async function runMcp(o: McpOptions) {
     'lading_describe',
     {
       title: 'Describe the Lading gate',
-      description: 'What the hosted Lading gate sells (Arweave + Walrus + Filecoin archive with a signed bill of lading named on ArNS), its prices, the x402 network and payTo, and this shim\'s payer and cap.',
+      description: 'What the hosted Lading gate sells (Arweave + Walrus + Filecoin + IPFS archive with a signed bill of lading named on ArNS), its prices, the x402 network and payTo, and this shim\'s payer and cap.',
       inputSchema: {},
     },
     async () => {
@@ -368,7 +368,7 @@ export async function runMcp(o: McpOptions) {
     {
       title: 'Archive with Lading',
       description:
-        'PAID (USDC on Base, quoted first, refused over the cap). Archives a local file (path) or a text string onto Arweave, Walrus and Filecoin through the TOON mesh, writes a signed bill of lading to Arweave and names it on ArNS. Returns every network receipt, the manifest URL and the ArNS name. Idempotent: bytes the gate already archived come back from the existing record and nothing is paid, unless force is true. Objects over the door\'s single-body limit (3 MiB) go as 1 MiB parts, one small payment each plus one for the finish; the cap applies to the whole bill, and a put that dies resumes where it stopped.',
+        'PAID (USDC on Base, quoted first, refused over the cap). Archives a local file (path) or a text string onto Arweave, Walrus, Filecoin and IPFS through the TOON mesh, writes a signed bill of lading to Arweave and names it on ArNS. Returns every network receipt, the manifest URL and the ArNS name. Idempotent: bytes the gate already archived come back from the existing record and nothing is paid, unless force is true. Objects over the door\'s single-body limit (3 MiB) go as 1 MiB parts, one small payment each plus one for the finish; the cap applies to the whole bill, and a put that dies resumes where it stopped.',
       inputSchema: {
         path: z.string().optional().describe('local file to archive'),
         text: z.string().optional().describe('text to archive instead of a file'),

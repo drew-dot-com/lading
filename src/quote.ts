@@ -57,6 +57,18 @@ export interface FilecoinQuote {
   at: number;
 }
 
+export interface IpfsQuote {
+  op: 'ipfs';
+  deliverable: boolean;
+  reason?: string;
+  size: number;
+  maxBytes: number;
+  downstream: { provider: 'pinata-x402'; amountUsdc: string; retention: 'P365D' };
+  float: { chain: 'base'; asset: 'USDC'; balance: string; reserve: string };
+  executeDoor: '/ipfs';
+  at: number;
+}
+
 export interface NameQuote {
   op: 'name';
   deliverable: boolean;
@@ -86,7 +98,10 @@ export function decideWalrus(input: {
   priceUsdc: string;
   balanceUsdc: string;
   reserveMultiple?: number;
+  /** Which leg the reason names; the IPFS door shares this decision and the same Base key. */
+  label?: 'walrus' | 'ipfs';
 }): { deliverable: boolean; reason?: string; reserveUsdc: string } {
+  const label = input.label ?? 'walrus';
   const mult = BigInt(input.reserveMultiple ?? 2);
   const reserve = micro(input.priceUsdc) * mult;
   const reserveUsdc = (Number(reserve) / 1e6).toFixed(6);
@@ -95,7 +110,7 @@ export function decideWalrus(input: {
   if (micro(input.balanceUsdc) < reserve) {
     return {
       deliverable: false,
-      reason: `walrus float ${input.balanceUsdc} USDC on Base is under the ${reserveUsdc} USDC reserve for a ${input.priceUsdc} USDC upload`,
+      reason: `${label} float ${input.balanceUsdc} USDC on Base is under the ${reserveUsdc} USDC reserve for a ${input.priceUsdc} USDC upload`,
       reserveUsdc,
     };
   }

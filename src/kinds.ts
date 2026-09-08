@@ -9,8 +9,8 @@ export const MANIFEST_KIND = 30320;
 
 /** A leg receipt: what one storage network handed back for one object. */
 export interface LegReceipt {
-  network: 'arweave' | 'walrus' | 'filecoin';
-  /** The network's own id for the bytes: Arweave txId, Walrus blobId, Filecoin CID. */
+  network: 'arweave' | 'walrus' | 'filecoin' | 'ipfs';
+  /** The network's own id for the bytes: Arweave txId, Walrus blobId, Filecoin PieceCID, IPFS CID. */
   id: string;
   /** sha256 of the object, hex, computed by whoever wrote the receipt. */
   sha256: string;
@@ -19,7 +19,7 @@ export interface LegReceipt {
   retention: string;
   /** Anything a third party can check: a Sui object id, a deal id, a gateway URL. */
   proof?: Record<string, string | number | undefined>;
-  /** Who executed the leg: 'toon-store', 'lighthouse-x402', 'filecoin-onchain-cloud', 'walrus-native'. */
+  /** Who executed the leg: 'toon-store', 'lighthouse-x402', 'filecoin-onchain-cloud', 'pinata-x402', 'walrus-native'. */
   provider: string;
   /** Base units the payer sent on the TOON route for this leg, when known. Summed over parts for a chunked leg. */
   paid?: string;
@@ -63,6 +63,28 @@ export interface FilecoinReceipt extends LegReceipt {
     readback?: string;
     txHash?: string;
     runwayDays?: string;
+    [k: string]: string | number | undefined;
+  };
+}
+
+/** What the IPFS door answers with. `id` is the CID; the proof says which gateways served it back. */
+export interface IpfsReceipt extends LegReceipt {
+  network: 'ipfs';
+  retention: 'P365D';
+  provider: 'pinata-x402';
+  proof: {
+    cid: string;
+    /** The first gateway that served the bytes back with a matching sha256. */
+    readUrl: string;
+    /** A gateway the pinner does not run that served them too, when one did in time. */
+    publicUrl?: string;
+    pinataId?: string;
+    /** ms epoch the paid twelve months run out. */
+    expiresAt: number;
+    baseTx?: string;
+    payer?: string;
+    readback?: string;
+    verified?: string;
     [k: string]: string | number | undefined;
   };
 }

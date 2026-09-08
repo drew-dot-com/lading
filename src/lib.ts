@@ -15,14 +15,14 @@ import { join } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import { ToonClient, buildJobEvent, sendJob, chargeFor } from '@toon-protocol/client';
 import { getPublicKey, type Event as NostrEvent } from 'nostr-tools/pure';
-import { LEG_KIND, type FilecoinReceipt, type LegReceipt, type NameReceipt, type PartReceipt, type WalrusReceipt, type WalrusRenewReceipt } from './kinds.js';
+import { LEG_KIND, type FilecoinReceipt, type IpfsReceipt, type LegReceipt, type NameReceipt, type PartReceipt, type WalrusReceipt, type WalrusRenewReceipt } from './kinds.js';
 import { assembleParts, DEFAULT_PART_BYTES, partName, planParts, splitParts, type Part, type PartPlan } from './parts.js';
-import type { FilecoinQuote, NameQuote, WalrusQuote, WalrusRenewQuote } from './quote.js';
+import type { FilecoinQuote, IpfsQuote, NameQuote, WalrusQuote, WalrusRenewQuote } from './quote.js';
 import { dueWithin, fmtDate, walrusRecords, type RenewalRow, type SavedPut, type SavedRenewal } from './renewals.js';
 import { daysLeft } from './ledger.js';
 import { buildManifest, parseManifest, type ManifestContent } from './manifest.js';
 import { undernameFor } from './arns.js';
-import { ARWEAVE_TXID_RE, DEFAULT_ARNS_GATEWAYS, arnsReadUrls, arweaveReadUrls, readFirst, readGateways, viaNote } from './read.js';
+import { ARWEAVE_TXID_RE, DEFAULT_ARNS_GATEWAYS, DEFAULT_IPFS_GATEWAYS, arnsReadUrls, arweaveReadUrls, ipfsReadUrls, readFirst, readGateways, viaNote } from './read.js';
 
 export interface Routes {
   ario: string;
@@ -32,6 +32,8 @@ export interface Routes {
   walrusRenewQuote: string;
   filecoin: string;
   filecoinQuote: string;
+  ipfs: string;
+  ipfsQuote: string;
   name: string;
   nameQuote: string;
   relay: string;
@@ -49,6 +51,8 @@ export interface LadingOptions {
   arnsGateways: string[];
   lighthouseX402: string;
   walrusAggregator: string;
+  /** IPFS gateways a CID is read back from, the pinner's own first. */
+  ipfsGateways: string[];
   /** Where saved manifests, progress files and (by default) the payer's Nostr key live. */
   home: string;
   /** Path to a Solana keypair JSON array: the TOON payer. Ignored when `solanaSecret` is set. */
@@ -80,6 +84,8 @@ export function optionsFromEnv(overrides: Partial<LadingOptions> = {}): LadingOp
       walrusRenewQuote: env('LADING_ROUTE_WALRUS_RENEW_QUOTE', 'g.drew.lading.walrus.renew.quote'),
       filecoin: env('LADING_ROUTE_FILECOIN', 'g.drew.lading.filecoin'),
       filecoinQuote: env('LADING_ROUTE_FILECOIN_QUOTE', 'g.drew.lading.filecoin.quote'),
+      ipfs: env('LADING_ROUTE_IPFS', 'g.drew.lading.ipfs'),
+      ipfsQuote: env('LADING_ROUTE_IPFS_QUOTE', 'g.drew.lading.ipfs.quote'),
       name: env('LADING_ROUTE_NAME', 'g.drew.lading.name'),
       nameQuote: env('LADING_ROUTE_NAME_QUOTE', 'g.drew.lading.name.quote'),
       relay: env('LADING_ROUTE_RELAY', 'g.drew.relay'),
@@ -89,6 +95,7 @@ export function optionsFromEnv(overrides: Partial<LadingOptions> = {}): LadingOp
     arnsGateways: readGateways(env('LADING_ARNS_GATEWAY', 'permagate.io'), process.env.LADING_ARNS_GATEWAYS, DEFAULT_ARNS_GATEWAYS),
     lighthouseX402: env('LIGHTHOUSE_X402_URL', 'https://x402-walrus.lighthouse.storage'),
     walrusAggregator: env('WALRUS_AGGREGATOR_URL', 'https://aggregator.walrus-mainnet.walrus.space'),
+    ipfsGateways: readGateways('gateway.pinata.cloud', process.env.LADING_IPFS_GATEWAYS, DEFAULT_IPFS_GATEWAYS),
     home,
     solanaKeypair: env('SOLANA_KEYPAIR', join(homedir(), '.config/solana/id.json')),
     solanaSecret: process.env.SOLANA_KEYPAIR_JSON ? Uint8Array.from(JSON.parse(process.env.SOLANA_KEYPAIR_JSON) as number[]) : undefined,
@@ -111,7 +118,9 @@ export const micro = (v: string): bigint => {
 const timesMicro = (v: string, n: number) => (Number(micro(v) * BigInt(n)) / 1e6).toFixed(6);
 
 export type Paid<T> = { receipt: T; route: string; price: bigint | null };
-export type Network = 'arweave' | 'walrus' | 'filecoin';
+export type Network = 'arweave' | 'walrus' | 'filecoin' | 'ipfs';
+/** Every storage network a put buys, in the order the legs run. Arweave and Walrus are required for a finish; Filecoin and IPFS are skipped when their quote refuses. */
+export const NETWORKS = ['arweave', 'walrus', 'filecoin', 'ipfs'] as const;
 export interface PaidRow {
   leg: string;
   route: string;
@@ -145,7 +154,7 @@ export interface PutOptions {
   partBytes?: number;
   /** Quote each broker leg before paying it (default true). */
   quote?: boolean;
-  skip?: Partial<Record<'arweave' | 'walrus' | 'filecoin' | 'relay' | 'name', boolean>>;
+  skip?: Partial<Record<'arweave' | 'walrus' | 'filecoin' | 'ipfs' | 'relay' | 'name', boolean>>;
   /** Recorded on the manifest when the put came through a door other than the CLI. */
   via?: ManifestContent['via'];
   /** Archive again even when this home already holds a manifest for the same bytes (default false: the saved record is returned, nothing re-bought). */
@@ -471,6 +480,12 @@ export class Lading {
     return this.job<FilecoinQuote>(this.opts.routes.filecoinQuote, ev as never, 60_000);
   }
 
+  /** Ask the ipfs quote door what Pinata charges for a pin of this size and whether the Base key covers it. 1,000 units, against 5,000 for the leg. */
+  quoteIpfs(size: number, name: string): Promise<Paid<IpfsQuote>> {
+    const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'ipfs', phase: 'quote', size: String(size), name } });
+    return this.job<IpfsQuote>(this.opts.routes.ipfsQuote, ev as never, 60_000);
+  }
+
   /** Ask the name quote door whether the broker can write this undername right now. 1,000 units, against 5,000 for the leg. */
   quoteName(undername: string, txid?: string): Promise<Paid<NameQuote>> {
     const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'name', phase: 'quote', undername, ...(txid ? { txid } : {}) } });
@@ -488,10 +503,10 @@ export class Lading {
     return Buffer.byteLength(JSON.stringify({ event: buildJobEvent({ kind: LEG_KIND, params, tags: blobLen ? [['i', 'A'.repeat(Math.ceil(blobLen / 3) * 4), 'blob']] : [] }) }));
   }
 
-  /** A manifest with three legs, plus part receipts, before signing. */
-  private manifestGuess = (n: number) => 1200 + 3 * 400 + (n > 1 ? 3 * n * 400 : 0);
+  /** A manifest with four legs, plus part receipts, before signing. */
+  private manifestGuess = (n: number) => 1200 + 4 * 400 + (n > 1 ? 4 * n * 400 : 0);
 
-  /** The bill for one slice of `size` bytes on the three networks, each quote door asked once: what the gate charges per `POST /v1/parts`. Free. */
+  /** The bill for one slice of `size` bytes on the four networks, each quote door asked once: what the gate charges per `POST /v1/parts`. Free. */
   async estimatePart(size: number): Promise<Estimate> {
     const R = this.opts.routes;
     const rows: QuoteRow[] = [
@@ -500,6 +515,8 @@ export class Lading {
       { leg: 'walrus', route: R.walrus, price: await this.charge(R.walrus, 0), note: 'flat' },
       { leg: 'filecoin-quote', route: R.filecoinQuote, price: await this.charge(R.filecoinQuote, 0), note: 'quote door' },
       { leg: 'filecoin', route: R.filecoin, price: await this.charge(R.filecoin, 0), note: 'flat' },
+      { leg: 'ipfs-quote', route: R.ipfsQuote, price: await this.charge(R.ipfsQuote, 0), note: 'quote door' },
+      { leg: 'ipfs', route: R.ipfs, price: await this.charge(R.ipfs, 0), note: 'flat' },
     ];
     const unpriced = [...new Set(rows.filter((r) => r.price === null).map((r) => r.route))];
     return { size, parts: 1, rows, total: rows.reduce((a, r) => a + (r.price ?? 0n), 0n), unpriced };
@@ -550,6 +567,8 @@ export class Lading {
       { leg: 'walrus', route: R.walrus, price: await flat(R.walrus), note: `flat${partsNote}` },
       { leg: 'filecoin-quote', route: R.filecoinQuote, price: await quote(R.filecoinQuote), note: 'quote door' },
       { leg: 'filecoin', route: R.filecoin, price: await flat(R.filecoin), note: `flat${partsNote}` },
+      { leg: 'ipfs-quote', route: R.ipfsQuote, price: await quote(R.ipfsQuote), note: 'quote door' },
+      { leg: 'ipfs', route: R.ipfs, price: await flat(R.ipfs), note: `flat${partsNote}` },
       { leg: 'relay', route: R.relay, price: await this.charge(R.relay, this.manifestGuess(n)), note: 'manifest copy' },
       { leg: 'manifest', route: R.ario, price: await this.charge(R.ario, this.manifestGuess(n)), note: 'manifest on Arweave, estimate' },
       { leg: 'name-quote', route: R.nameQuote, price: await quote(R.nameQuote), note: 'quote door' },
@@ -584,6 +603,15 @@ export class Lading {
       return {
         send: async (part, pname) => {
           const r = await this.job<WalrusReceipt>(R.walrus, blobEvent(LEG_KIND, { op: 'walrus', name: pname || o.name }, part) as never, 240_000);
+          return { id: r.receipt.id, sha256: r.receipt.sha256, proof: r.receipt.proof, retention: r.receipt.retention, provider: r.receipt.provider, route: r.route, price: r.price };
+        },
+        line: (out) => `${out.id}  readback=${out.proof?.readback}`,
+      };
+    // IPFS, through Lading's door. Lading FULFILLs on the CID once a gateway served the bytes back.
+    if (network === 'ipfs')
+      return {
+        send: async (part, pname) => {
+          const r = await this.job<IpfsReceipt>(R.ipfs, blobEvent(LEG_KIND, { op: 'ipfs', name: pname || o.name }, part) as never, 300_000);
           return { id: r.receipt.id, sha256: r.receipt.sha256, proof: r.receipt.proof, retention: r.receipt.retention, provider: r.receipt.provider, route: r.route, price: r.price };
         },
         line: (out) => `${out.id}  readback=${out.proof?.readback}`,
@@ -678,7 +706,7 @@ export class Lading {
   private sealAll(o: { sha: string; size: number; plan: PartPlan[]; prog: Progress; skip: PutOptions['skip'] }): { legs: LegReceipt[]; incomplete: Partial<Record<Network, number[]>> } {
     const legs: LegReceipt[] = [];
     const incomplete: Partial<Record<Network, number[]>> = {};
-    for (const network of ['arweave', 'walrus', 'filecoin'] as const) {
+    for (const network of NETWORKS) {
       if (o.skip?.[network]) continue;
       if (!o.prog.legs[network] && !o.prog.parts[network]?.length) continue;
       const r = this.sealLeg({ network, sha: o.sha, size: o.size, plan: o.plan, prog: o.prog });
@@ -689,11 +717,11 @@ export class Lading {
   }
 
   /**
-   * The three legs over the given parts (all of them for a put, one for a
-   * part call). Walrus and Filecoin are quoted first for the largest part: a
-   * leg the broker cannot deliver still costs its route price, and with
-   * several parts the float must cover them all. A refused Walrus quote
-   * throws (nothing paid); a refused Filecoin quote skips that network.
+   * The four legs over the given parts (all of them for a put, one for a
+   * part call). Walrus, Filecoin and IPFS are quoted first for the largest
+   * part: a leg the broker cannot deliver still costs its route price, and
+   * with several parts the float must cover them all. A refused Walrus quote
+   * throws (nothing paid); a refused Filecoin or IPFS quote skips that network.
    */
   private async runLegs(o: { sha: string; size: number; count: number; parts: Part[]; prog: Progress; paid: PaidRow[]; t0: number; name: string; mime?: string; skip: NonNullable<PutOptions['skip']>; quote: boolean }): Promise<void> {
     const { prog, paid, t0, skip } = o;
@@ -731,6 +759,23 @@ export class Lading {
         }
       }
       if (go) await this.buyParts({ ...common, network: 'filecoin' });
+    }
+
+    if (!skip.ipfs && !prog.legs.ipfs) {
+      const n = left('ipfs');
+      let go = true;
+      if (o.quote && n > 0) {
+        const q = await this.quoteIpfs(largest, o.name);
+        paid.push({ leg: 'ipfs-quote', route: q.route, price: q.price });
+        const need = timesMicro(q.receipt.downstream.amountUsdc, n);
+        const short = q.receipt.deliverable && n > 1 && micro(q.receipt.float.balance) < micro(need);
+        this.log(`ipfs     quote ${fmtQuote(q.receipt)}${n > 1 ? `, ${n} parts need ${need} USDC` : ''}  (${Date.now() - t0} ms)`);
+        if (!q.receipt.deliverable || short) {
+          go = false;
+          this.log(`ipfs     SKIPPED, nothing paid for it: ${short ? `float ${q.receipt.float.balance} USDC is under the ${need} USDC that ${n} parts cost` : q.receipt.reason}`);
+        }
+      }
+      if (go) await this.buyParts({ ...common, network: 'ipfs' });
     }
   }
 
@@ -906,7 +951,7 @@ export class Lading {
     await this.runLegs({ sha: o.sha256, size: o.size, count: o.count, parts: [part], prog, paid, t0, name: o.name, mime: o.mime, skip: o.skip ?? {}, quote: o.quote !== false });
     const receipts: PartResult['receipts'] = {};
     const missing: Network[] = [];
-    for (const network of ['arweave', 'walrus', 'filecoin'] as const) {
+    for (const network of NETWORKS) {
       if (o.skip?.[network]) continue;
       const r = prog.parts[network]?.find((x) => x.index === o.index);
       if (r) receipts[network] = r;
@@ -952,7 +997,7 @@ export class Lading {
     const prior = this.archived(sha);
     const prog = this.loadProgress(sha);
     const networks: PartsStatus['networks'] = {};
-    for (const network of ['arweave', 'walrus', 'filecoin'] as const) {
+    for (const network of NETWORKS) {
       const sealed = prog.legs[network];
       const idx = sealed ? (sealed.parts ? sealed.parts.map((p) => p.index) : [0]) : (prog.parts[network] ?? []).map((r) => r.index).sort((a, b) => a - b);
       if (idx.length || sealed) networks[network] = { indexes: idx, sealed: !!sealed };
@@ -1050,9 +1095,10 @@ export class Lading {
     return readGateways(this.opts.gateway, this.opts.arnsGateways.join(','), DEFAULT_ARNS_GATEWAYS);
   }
 
-  /** Every URL a leg's bytes may be read from: several for Arweave, one otherwise. */
+  /** Every URL a leg's bytes may be read from: several for Arweave and IPFS, one otherwise. */
   readUrlsFor(network: string, id: string, proof?: Record<string, string | number | undefined>): string[] {
     if (network === 'arweave') return arweaveReadUrls(id, this.readGateways());
+    if (network === 'ipfs') return ipfsReadUrls(id, this.opts.ipfsGateways);
     const u = this.readUrlFor(network, id, proof);
     return u === undefined ? [] : [u];
   }
@@ -1061,6 +1107,7 @@ export class Lading {
   readUrlFor(network: string, id: string, proof?: Record<string, string | number | undefined>): string | undefined {
     if (network === 'arweave') return `https://${this.opts.gateway}/${id}`;
     if (network === 'walrus') return String(proof?.ipfsUrl ?? `${this.opts.walrusAggregator}/v1/blobs/${id}`);
+    if (network === 'ipfs') return ipfsReadUrls(id, this.opts.ipfsGateways)[0];
     return proof?.readUrl === undefined ? undefined : String(proof.readUrl);
   }
 
@@ -1238,13 +1285,19 @@ export class Lading {
     const fGo = fq.receipt.deliverable && !fShort;
     rows.push({ leg: 'filecoin-quote', route: fq.route, price: fq.price, note: fmtQuote(fq.receipt) + (n > 1 ? `, ${n} parts need ${fNeed} USDFC in fees${fShort ? ' (SHORT)' : ''}` : '') });
     rows.push({ leg: 'filecoin', route: R.filecoin, price: fGo ? row('filecoin').price : 0n, note: fGo ? row('filecoin').note : 'would be skipped' });
+    const iq = await this.quoteIpfs(largest, o.name);
+    const iNeed = timesMicro(iq.receipt.downstream.amountUsdc, n);
+    const iShort = iq.receipt.deliverable && n > 1 && micro(iq.receipt.float.balance) < micro(iNeed);
+    const iGo = iq.receipt.deliverable && !iShort;
+    rows.push({ leg: 'ipfs-quote', route: iq.route, price: iq.price, note: fmtQuote(iq.receipt) + (n > 1 ? `, ${n} parts need ${iNeed} USDC${iShort ? ' (SHORT)' : ''}` : '') });
+    rows.push({ leg: 'ipfs', route: R.ipfs, price: iGo ? row('ipfs').price : 0n, note: iGo ? row('ipfs').note : 'would be skipped' });
     rows.push(row('relay'));
     rows.push(row('manifest'));
     const nq = await this.quoteName(undername);
     rows.push({ leg: 'name-quote', route: nq.route, price: nq.price, note: fmtQuote(nq.receipt) });
     rows.push({ leg: 'name', route: R.name, price: nq.receipt.deliverable ? row('name').price : 0n, note: nq.receipt.deliverable ? 'flat' : 'would be skipped' });
     const total = rows.reduce((a, r) => a + (r.price ?? 0n), 0n);
-    return { sha256: sha, size: bytes.length, parts: n, largestPart: largest, rows, total, quotesPaid: (wq.price ?? 0n) + (fq.price ?? 0n) + (nq.price ?? 0n) };
+    return { sha256: sha, size: bytes.length, parts: n, largestPart: largest, rows, total, quotesPaid: (wq.price ?? 0n) + (fq.price ?? 0n) + (iq.price ?? 0n) + (nq.price ?? 0n) };
   }
 }
 
@@ -1256,10 +1309,10 @@ export const fmtRenewQuote = (q: WalrusRenewQuote) =>
   (q.known ? '' : ', record not in the broker ledger') +
   (q.reason ? `: ${q.reason}` : '');
 
-export const fmtQuote = (q: WalrusQuote | FilecoinQuote | NameQuote) => {
+export const fmtQuote = (q: WalrusQuote | FilecoinQuote | IpfsQuote | NameQuote) => {
   const head = q.deliverable ? 'deliverable' : 'NOT deliverable';
   const tail = q.reason ? `: ${q.reason}` : '';
-  if (q.op === 'walrus') return `${head}, downstream ${q.downstream.amountUsdc} USDC, float ${q.float.balance} USDC on Base${tail}`;
+  if (q.op === 'walrus' || q.op === 'ipfs') return `${head}, downstream ${q.downstream.amountUsdc} USDC, float ${q.float.balance} USDC on Base${tail}`;
   if (q.op === 'filecoin') return `${head}, add-piece fee ${q.downstream.addPieceFeeUsdfc} USDFC for ${q.copies} copies, float ${q.float.available} USDFC, runway ${/^\d+$/.test(q.float.runwayDays) ? `${q.float.runwayDays}d` : q.float.runwayDays}${tail}`;
   return `${head}, ${q.name}, float ${(Number(q.float.lamports) / 1e9).toFixed(4)} SOL${tail}`;
 };

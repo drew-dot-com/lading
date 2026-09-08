@@ -11,7 +11,7 @@ archived on several storage networks, paying per object per network, and
 each leg hands back the network's own identifier and proof. Every copy is
 then listed in a signed manifest that lives on Arweave under an ArNS name.
 
-Status: v0.6.0, Arweave, Walrus and Filecoin legs, ArNS naming, relay copy,
+Status: v0.10.0, Arweave, Walrus, Filecoin and IPFS legs, ArNS naming, relay copy,
 a quote door in front of each broker leg, objects over one packet travelling
 as parts, Walrus renewals, and a hosted x402 gate with an MCP shim so Claude
 can archive through it. Runs against Drew's mainnet node today.
@@ -124,17 +124,19 @@ lading put report.pdf
 | 3. Walrus leg | `g.drew.lading.walrus` (kind 5320) | Lading, on the Walrus blobId after an aggregator read-back | 40,000 flat |
 | 4. Filecoin quote | `g.drew.lading.filecoin.quote` (kind 5320, `phase=quote`) | Lading: deliverable, add-piece fee, USDFC float, runway | 1,000 |
 | 5. Filecoin leg | `g.drew.lading.filecoin` (kind 5320) | Lading, on the PieceCID once the provider committed it on chain and served it back | 30,000 flat |
-| 6. bill of lading | signed locally by the payer's Nostr key | kind 30320, `d` = sha256 | free |
-| 7. relay copy | `g.drew.relay` | the node relay | 1,000 |
-| 8. manifest to Arweave | `g.drew.ario` | the org store, on the txId | schedule |
-| 9. name quote | `g.drew.lading.name.quote` (kind 5320, `phase=quote`) | Lading: deliverable, undername, lamports float | 1,000 |
-| 10. ArNS name | `g.drew.lading.name` (kind 5320) | Lading, on the ANT record write | 5,000 |
+| 6. IPFS quote | `g.drew.lading.ipfs.quote` (kind 5320, `phase=quote`) | Lading: deliverable, Pinata's price for the size, float | 1,000 |
+| 7. IPFS leg | `g.drew.lading.ipfs` (kind 5320) | Lading, on the CID once a gateway served the bytes back | 5,000 flat |
+| 8. bill of lading | signed locally by the payer's Nostr key | kind 30320, `d` = sha256 | free |
+| 9. relay copy | `g.drew.relay` | the node relay | 1,000 |
+| 10. manifest to Arweave | `g.drew.ario` | the org store, on the txId | schedule |
+| 11. name quote | `g.drew.lading.name.quote` (kind 5320, `phase=quote`) | Lading: deliverable, undername, lamports float | 1,000 |
+| 12. ArNS name | `g.drew.lading.name` (kind 5320) | Lading, on the ANT record write | 5,000 |
 
 A leg that fails answers `accept: false`, buys nothing downstream, and costs
 the route price. Steps are skippable (`--skip-walrus`, `--skip-filecoin`,
-`--skip-name`, `--skip-relay`, `--skip-arweave`). A Filecoin quote that says
-not deliverable skips that leg and carries on; the manifest then simply lists
-fewer legs. The local record is written as soon as the
+`--skip-ipfs`, `--skip-name`, `--skip-relay`, `--skip-arweave`). A Filecoin or
+IPFS quote that says not deliverable skips that leg and carries on; the
+manifest then simply lists fewer legs. The local record is written as soon as the
 manifest is on Arweave, so a failed name leg is resumable with
 `lading name <sha256>` without re-uploading anything.
 
@@ -143,7 +145,7 @@ The same bytes put twice from the same home buy nothing the second time:
 buying only a name leg that is still owed; `--force` archives again.
 
 `lading quote <file>` prints the whole bill before paying it (route prices from
-the edge plus the three quotes; costs the three quotes). `lading verify <arns-name |
+the edge plus the four quotes; costs the four quotes). `lading verify <arns-name |
 manifest-txid | saved.json>` re-fetches every leg from its network and
 compares sha256. `lading describe` prints route prices.
 
@@ -159,7 +161,7 @@ bill (a price per part, the finish, the sum; the cap applies to the sum), then
 pays `POST /v1/parts` once per slice (`x-object-sha256`, `x-object-size`,
 `x-part-index`, `x-part-count`, `x-part-bytes`, `x-sha256` of the slice) and
 `POST /v1/assemble` once for the finish (relay copy, manifest on Arweave, ArNS
-name). Each part runs its three legs into the object's progress file on the
+name). Each part runs its four legs into the object's progress file on the
 gate, the same file a CLI put resumes from; assemble seals the legs, and a
 network that holds only some parts makes assemble answer 409 with the missing
 indexes (send those again, or `skip` that network). A slice the gate already
@@ -179,8 +181,8 @@ never assembled are swept after `LADING_PROGRESS_MAX_AGE_DAYS` (7).
 ## Floats and alarms
 
 Every hot key behind a put is judged in one place. The broker answers
-`GET /floats` (internal) with a row per key: the Walrus float (USDC on Base,
-low under `LADING_WALRUS_LOW_USDC`, default 1), the Filecoin Pay runway
+`GET /floats` (internal) with a row per key: the Base USDC float that pays
+both Lighthouse and Pinata (low under `LADING_WALRUS_LOW_USDC`, default 1), the Filecoin Pay runway
 (USDFC, not ok under `LADING_FILECOIN_LOW_RUNWAY_DAYS` days, default 30, or
 under `LADING_FILECOIN_LOW_FIL` of gas), and the name key (SOL, low under
 `LADING_NAME_LOW_SOL`, default 0.008). The gate adds its own TOON payer (USDC
@@ -199,7 +201,7 @@ object over that travels as parts (`src/parts.ts`): the client slices it
 (1 MiB per part by default, `--part-bytes n` or `LADING_PART_BYTES` to
 change; a tail under 127 bytes folds into the previous part), and each part
 is its own paid job on each network, at the route's ordinary price. Nothing
-reassembles server-side: the store, the Walrus door and the Filecoin door
+reassembles server-side: the store, the Walrus, Filecoin and IPFS doors
 each see an ordinary object, and the payer's loss bound stays one part.
 
 The manifest records a chunked leg with `parts`: each part's index, the
@@ -211,7 +213,7 @@ whole object's sha256.
 
 Each quote door is asked once per leg for the largest part, and the client
 then checks the quoted float covers every part still to buy (N times the
-downstream price for Walrus, N times the add-piece fee for Filecoin) before
+downstream price for Walrus and IPFS, N times the add-piece fee for Filecoin) before
 paying the first one. Parts already bought are saved under
 `~/.lading/progress/<sha256>.json` after every job, so a put that dies
 half-way resumes where it stopped instead of paying twice; the file is
@@ -232,6 +234,7 @@ src/gate-price.ts what the door charges for a TOON bill: margin and floor, pure
 src/mcp.ts       the MCP shim Claude runs locally: pays the gate per tool call with LADING_X402_KEY
 src/walrus.ts    Lighthouse x402 upload (USDC on Base), blobId lookup, aggregator read-back
 src/filecoin.ts  Filecoin Onchain Cloud upload (Synapse SDK, USDFC in Filecoin Pay), provider read-back
+src/ipfs.ts      Pinata x402 pin (USDC on Base), read-back from the pinner's gateway and one it does not run
 src/filecoin-fund.ts  operator tool: deposit USDFC and approve warm storage, once
 src/quote.ts     the pure deliverability decisions behind the quote doors
 src/arns.ts      ANT undername write, owner or controller
@@ -313,6 +316,18 @@ Why not Lighthouse for Filecoin: its hosted x402 endpoint is the Walrus one
 same PAYMENT-REQUIRED and the same Walrus gateway URL), and its IPFS plus
 Filecoin path is a prepaid API key whose deal shows up hours to a day later.
 
+IPFS is a pin bought from Pinata's x402 door (`402.pinata.cloud`, USDC on
+Base, 0.10 USDC per GiB for twelve months, floored at 0.001 USDC), the one
+pinning service selling per request with no account as of 2026-09 (Storacha
+turned writes off in May 2026; Infura and Fleek closed their IPFS doors;
+Filebase and 4EVERLAND want a subscription). The receipt records the CID, the
+paid-through instant, and which gateways served the bytes back: Pinata's own
+proves the pin, one it does not run (`ipfs.filebase.io`, then `ipfs.io`;
+`LADING_IPFS_GATEWAYS`) proves the content is findable on the network, and a
+raw sha256 CID is checked offline as well. Pinata sells no renewal; a pin
+that runs out is bought again with the same bytes (same CID). `LADING_IPFS=off`
+turns the door off.
+
 ## Run it
 
 ```bash
@@ -355,7 +370,7 @@ watermark, keep it), `LADING_NOSTR_KEY` (payer identity, else generated into
 ## Constraints
 
 - Objects stay under the 2 MiB packet cap; chunking is a later feature.
-- Arweave, Walrus and Filecoin data are public. Encrypt client-side if it matters.
+- Arweave, Walrus, Filecoin and IPFS data are public. Encrypt client-side if it matters.
 - Filecoin pieces start at 127 bytes; smaller objects skip that leg.
 - The Filecoin leg stays stored only while the broker's Filecoin Pay runway lasts; the quote door refuses below the runway floor.
 - AR.IO's sub-100 KiB free tier is a trial allowance; price every write as paid.

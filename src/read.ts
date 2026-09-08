@@ -33,6 +33,13 @@ export function readGateways(primary: string, list: string | undefined, defaults
 }
 
 export const arweaveReadUrls = (txid: string, gateways: string[]) => gateways.map((g) => `https://${g}/${txid}`);
+
+/**
+ * IPFS gateways a CID is read back from, in order: the pinner's own first (the
+ * pin itself), then gateways it does not run (the network). `LADING_IPFS_GATEWAYS`.
+ */
+export const DEFAULT_IPFS_GATEWAYS = 'gateway.pinata.cloud,ipfs.filebase.io,ipfs.io';
+export const ipfsReadUrls = (cid: string, gateways: string[]) => gateways.map((g) => `https://${g}/ipfs/${cid}`);
 export const arnsReadUrls = (name: string, gateways: string[]) => gateways.map((g) => `https://${name}.${g}/`);
 
 export interface ReadResult {

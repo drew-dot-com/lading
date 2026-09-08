@@ -3,12 +3,14 @@
  *
  *   POST /walrus         kind:5320, `['i', base64, 'blob']`  → WalrusReceipt
  *   POST /filecoin       kind:5320, `['i', base64, 'blob']`  → FilecoinReceipt
+ *   POST /ipfs           kind:5320, `['i', base64, 'blob']`  → IpfsReceipt
  *   POST /name           kind:5320, params op=name, txid, undername → NameReceipt
  *   POST /walrus/quote   kind:5320, params op=walrus, phase=quote, size → WalrusQuote
  *   POST /walrus/renew   kind:5320, params op=walrus-renew, lighthouseId → WalrusRenewReceipt
  *   POST /walrus/renew/quote kind:5320, params op=walrus-renew, phase=quote, lighthouseId → WalrusRenewQuote
  *   GET  /walrus/ledger  every Lighthouse record this broker paid for, soonest expiry first (operator view)
  *   POST /filecoin/quote kind:5320, params op=filecoin, phase=quote, size → FilecoinQuote
+ *   POST /ipfs/quote     kind:5320, params op=ipfs, phase=quote, size → IpfsQuote
  *   POST /name/quote     kind:5320, params op=name, phase=quote, undername, txid → NameQuote
  *   GET  /describe what this node serves, derived from what booted
  *   GET  /floats   every hot key this broker spends from, judged against its low-water mark
@@ -30,7 +32,8 @@ import { getPublicKey, verifyEvent, type Event as NostrEvent } from 'nostr-tools
 import { LEG_KIND, MANIFEST_KIND } from './kinds.js';
 import { lighthouseUploader, sha256Hex, LIGHTHOUSE_X402, WALRUS_AGGREGATOR, type WalrusUploader } from './walrus.js';
 import { solanaNamer, undernameFor, UNDERNAME_RE, type Namer } from './arns.js';
-import { cached, decideFilecoin, decideName, decideWalrus, decideWalrusRenew, type FilecoinQuote, type NameQuote, type WalrusQuote, type WalrusRenewQuote } from './quote.js';
+import { cached, decideFilecoin, decideName, decideWalrus, decideWalrusRenew, type FilecoinQuote, type IpfsQuote, type NameQuote, type WalrusQuote, type WalrusRenewQuote } from './quote.js';
+import { pinataUploader, IPFS_GATEWAYS, PINATA_402, PINATA_RETENTION, type IpfsUploader } from './ipfs.js';
 import { daysLeft, openLedger, type Ledger } from './ledger.js';
 import { filecoinChain, synapseUploader, runwayText, FILECOIN_MIN_BYTES, type FilecoinUploader } from './filecoin.js';
 import { createPublicClient, http as viemHttp, erc20Abi, formatUnits } from 'viem';
@@ -221,6 +224,66 @@ function walrusQuoteDoor(uploader: WalrusUploader, float: ReturnType<typeof walr
       const msg = (e as Error).message;
       console.log(`walrus quote REJECT ${size}B ${Date.now() - t0}ms: ${msg}`);
       return refuse(res, 502, 'T00', `walrus quote failed: ${msg}`);
+    }
+  };
+}
+
+function ipfsDoor(uploader: IpfsUploader) {
+  return async (req: IncomingMessage, res: ServerResponse) => {
+    const job = await openJob(req, res, 'ipfs');
+    if (!job) return;
+    const { event, meta } = job;
+    const b64 = inputOf(event, 'blob');
+    if (!b64) return refuse(res, 422, 'F00', "input ['i', base64, 'blob'] is required");
+    const bytes = Buffer.from(b64, 'base64');
+    if (bytes.length === 0) return refuse(res, 422, 'F00', 'blob is empty');
+    const fileName = paramOf(event, 'name') ?? `${sha256Hex(bytes).slice(0, 12)}.bin`;
+    const t0 = Date.now();
+    try {
+      const receipt = await uploader.upload(bytes, fileName);
+      console.log(
+        `ipfs ok ${bytes.length}B sha=${receipt.sha256.slice(0, 12)} cid=${receipt.id} readback=${receipt.proof.readback ?? '?'} ` +
+          `payer=${meta.payer ?? '-'} amount=${meta.amount ?? '-'} chain=${meta.chain ?? '-'} ${Date.now() - t0}ms`,
+      );
+      return acceptReceipt(res, receipt, meta);
+    } catch (e) {
+      const msg = (e as Error).message;
+      console.log(`ipfs REJECT ${bytes.length}B payer=${meta.payer ?? '-'} ${Date.now() - t0}ms: ${msg}`);
+      return refuse(res, 502, 'T00', `ipfs leg failed, nothing charged downstream: ${msg}`);
+    }
+  };
+}
+
+function ipfsQuoteDoor(uploader: IpfsUploader, float: ReturnType<typeof walrusFloat>) {
+  return async (req: IncomingMessage, res: ServerResponse) => {
+    const job = await openJob(req, res, 'ipfs', 'quote');
+    if (!job) return;
+    const { event, meta } = job;
+    const b64 = inputOf(event, 'blob');
+    const sizeParam = paramOf(event, 'size');
+    const size = b64 ? Buffer.from(b64, 'base64').length : Number(sizeParam);
+    if (!Number.isInteger(size) || size < 0) return refuse(res, 422, 'F00', 'param size (bytes) or a blob input is required');
+    const t0 = Date.now();
+    try {
+      const [price, balance] = await Promise.all([uploader.quote(Math.max(size, 1)), float.read()]);
+      const d = decideWalrus({ size, maxBytes: MAX_BODY_BYTES, priceUsdc: price.amountUsdc, balanceUsdc: balance, reserveMultiple: WALRUS_RESERVE_MULTIPLE, label: 'ipfs' });
+      const quote: IpfsQuote = {
+        op: 'ipfs',
+        deliverable: d.deliverable,
+        ...(d.reason ? { reason: d.reason } : {}),
+        size,
+        maxBytes: MAX_BODY_BYTES,
+        downstream: { provider: 'pinata-x402', amountUsdc: price.amountUsdc, retention: PINATA_RETENTION },
+        float: { chain: 'base', asset: 'USDC', balance, reserve: d.reserveUsdc },
+        executeDoor: '/ipfs',
+        at: Math.floor(Date.now() / 1000),
+      };
+      console.log(`ipfs quote ${size}B deliverable=${d.deliverable} downstream=${price.amountUsdc} float=${balance} payer=${meta.payer ?? '-'} ${Date.now() - t0}ms${d.reason ? `: ${d.reason}` : ''}`);
+      return acceptReceipt(res, quote, meta);
+    } catch (e) {
+      const msg = (e as Error).message;
+      console.log(`ipfs quote REJECT ${size}B ${Date.now() - t0}ms: ${msg}`);
+      return refuse(res, 502, 'T00', `ipfs quote failed: ${msg}`);
     }
   };
 }
@@ -470,7 +533,7 @@ async function main() {
     floatReaders.push(async () =>
       judge({
         name: 'walrus-float',
-        role: 'pays Lighthouse x402 per Walrus upload and renewal (~0.033 USDC each)',
+        role: 'pays Lighthouse x402 per Walrus upload and renewal (~0.033 USDC each) and Pinata x402 per IPFS pin (~0.001 to 0.005 USDC)',
         chain: 'base',
         asset: 'USDC',
         address: float.address,
@@ -513,8 +576,31 @@ async function main() {
       maxBytes: MAX_BODY_BYTES,
       input: "['i', base64, 'blob'], optional param name",
     };
+    if (process.env.LADING_IPFS !== 'off') {
+      const pinner = pinataUploader(evmKey);
+      doors['/ipfs'] = ipfsDoor(pinner);
+      doors['/ipfs/quote'] = ipfsQuoteDoor(pinner, float);
+      describeDoors.ipfsQuote = {
+        path: '/ipfs/quote',
+        answers: 'IpfsQuote: deliverable, downstream USDC price, float',
+        input: 'params op=ipfs, phase=quote, size (bytes); or the blob itself',
+        floatAddress: float.address,
+      };
+      describeDoors.ipfs = {
+        path: '/ipfs',
+        network: 'ipfs',
+        provider: 'pinata-x402',
+        endpoint: PINATA_402,
+        gateways: IPFS_GATEWAYS,
+        retention: PINATA_RETENTION,
+        maxBytes: MAX_BODY_BYTES,
+        input: "['i', base64, 'blob'], optional param name",
+      };
+    } else {
+      console.log('LADING_IPFS=off: the ipfs door is OFF');
+    }
   } else {
-    console.log('LADING_EVM_PRIVATE_KEY unset: the walrus door is OFF');
+    console.log('LADING_EVM_PRIVATE_KEY unset: the walrus and ipfs doors are OFF');
   }
 
   const filecoinKey = process.env.LADING_FILECOIN_PRIVATE_KEY as `0x${string}` | undefined;
