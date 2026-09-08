@@ -55,7 +55,12 @@ const NAME_LOW_SOL = process.env.LADING_NAME_LOW_SOL ?? '0.008';
 /** Lamports the name key must hold before a name job is quoted deliverable: record rent (~2.81M) plus fee, with a margin for a second job in flight. */
 const NAME_NEED_LAMPORTS = BigInt(process.env.LADING_NAME_NEED_LAMPORTS ?? 6_000_000);
 /** Which writer the walrus doors use: `lighthouse` (Base USDC via Lighthouse x402), `native` (this broker's Sui key, WAL + SUI), or `auto` (native when its floats cover the write, else Lighthouse). Default: auto when a Sui key is set, else lighthouse. */
-const WALRUS_PROVIDER = (process.env.LADING_WALRUS_PROVIDER ?? (process.env.LADING_SUI_SECRET_KEY ? 'auto' : 'lighthouse')) as 'lighthouse' | 'native' | 'auto';
+const WALRUS_PROVIDER = ((): 'lighthouse' | 'native' | 'auto' => {
+  // Compose hands an unset variable through as an empty string; that is "unset" here too.
+  const v = process.env.LADING_WALRUS_PROVIDER?.trim() || (process.env.LADING_SUI_SECRET_KEY?.trim() ? 'auto' : 'lighthouse');
+  if (v !== 'lighthouse' && v !== 'native' && v !== 'auto') throw new Error(`LADING_WALRUS_PROVIDER must be lighthouse, native or auto, got ${JSON.stringify(v)}`);
+  return v;
+})();
 const WALRUS_LOW_WAL = process.env.LADING_WALRUS_LOW_WAL ?? '0.5';
 const WALRUS_LOW_SUI = process.env.LADING_WALRUS_LOW_SUI ?? '0.05';
 /** The Base key must hold this many times the downstream price before a walrus job is quoted deliverable. */
@@ -605,7 +610,7 @@ async function main() {
   const floatReaders: Array<() => Promise<FloatRow>> = [];
 
   const evmKey = process.env.LADING_EVM_PRIVATE_KEY as `0x${string}` | undefined;
-  const suiKey = process.env.LADING_SUI_SECRET_KEY;
+  const suiKey = process.env.LADING_SUI_SECRET_KEY?.trim() || undefined;
   let ledger: Ledger | undefined;
   const writers: Writers = { mode: WALRUS_PROVIDER };
   if (evmKey) writers.lighthouse = { uploader: lighthouseUploader(evmKey), float: walrusFloat(evmKey) };
