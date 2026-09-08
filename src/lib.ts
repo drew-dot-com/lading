@@ -22,6 +22,7 @@ import { dueWithin, fmtDate, walrusRecords, type RenewalRow, type SavedPut, type
 import { daysLeft } from './ledger.js';
 import { buildManifest, parseManifest, type ManifestContent } from './manifest.js';
 import { undernameFor } from './arns.js';
+import { manifestFromPage, PAGE_CONTENT_TYPE, PATHS_CONTENT_TYPE, pathManifest, renderPage } from './page.js';
 import { ARWEAVE_TXID_RE, DEFAULT_ARNS_GATEWAYS, DEFAULT_IPFS_GATEWAY, DEFAULT_IPFS_GATEWAYS, arnsReadUrls, arweaveReadUrls, ipfsReadUrls, readFirst, readGateways, viaNote } from './read.js';
 
 export interface Routes {
@@ -65,9 +66,14 @@ export interface LadingOptions {
   channelDeposit: bigint;
   /** Hex Nostr secret; when absent one is read from, or written to, `<home>/nostr.key`. */
   nostrKey?: string;
+  /** A hosted gate whose free verify door the bill of lading page offers as a second opinion (`LADING_GATE_URL`); empty = no such button. */
+  gateUrl?: string;
   /** Progress lines. */
   log: (line: string) => void;
 }
+
+/** Where the page's footer sends a reader for the source. */
+export const REPO_URL = 'https://github.com/drew-dot-com/lading';
 
 const env = (k: string, d: string) => process.env[k] ?? d;
 
@@ -103,6 +109,7 @@ export function optionsFromEnv(overrides: Partial<LadingOptions> = {}): LadingOp
     channelStore: env('LADING_CHANNEL_STORE', join(home, 'channel-store.json')),
     channelDeposit: BigInt(env('LADING_CHANNEL_DEPOSIT', '2000000')),
     nostrKey: process.env.LADING_NOSTR_KEY,
+    gateUrl: env('LADING_GATE_URL', 'https://lading.167-233-221-236.sslip.io').replace(/\/+$/, '') || undefined,
     log: (line) => console.log(line),
     ...overrides,
   };
@@ -136,6 +143,23 @@ const walrusNeed = (q: WalrusQuote, n: number) => {
 };
 
 export type Paid<T> = { receipt: T; route: string; price: bigint | null };
+
+/** What the payer's channel with the edge holds, in base units. */
+export interface ChannelState {
+  channelId: string;
+  nonce: number;
+  spent: bigint;
+  deposit: bigint;
+  available: bigint;
+}
+/** The slice of the client's `channel` facade Lading uses. */
+type FacadeState = { channelId: string; nonce: number; spent: bigint; depositTotal: bigint; available: bigint };
+type ChannelFacade = { state(o?: { onChain?: boolean }): Promise<FacadeState>; deposit(amount: bigint): Promise<FacadeState> };
+/** Units kept free above a job's own price, so a route whose terms moved a little between the quote and the claim still clears. */
+const HEADROOM_MARGIN = 5_000n;
+/** Tries for a claim the edge refuses against a deposit figure a top-up just raised, and the pause between them. */
+const UNDERCOLLATERAL_RETRIES = 4;
+const UNDERCOLLATERAL_PAUSE_MS = 5_000;
 export type Network = 'arweave' | 'walrus' | 'filecoin' | 'ipfs';
 /** Every storage network a put buys, in the order the legs run. Arweave and Walrus are required for a finish; Filecoin and IPFS are skipped when their quote refuses. */
 export const NETWORKS = ['arweave', 'walrus', 'filecoin', 'ipfs'] as const;
@@ -187,6 +211,9 @@ export interface PutResult {
   legs: LegReceipt[];
   manifest: NostrEvent;
   manifestTxId?: string;
+  /** The rendered bill of lading page and the path manifest the name points at (the page at `/`, the JSON at `/manifest.json`). */
+  pageTxId?: string;
+  pathsTxId?: string;
   name?: NameReceipt;
   paid: PaidRow[];
   /** Base units across every job, unknown prices counted as 0. */
@@ -377,13 +404,55 @@ export class Lading {
     this.c = undefined;
   }
 
+  /** The open channel's deposit as last read on chain, so headroom needs no chain round trip per job. */
+  private depositKnown?: bigint;
+
+  /**
+   * The payer's channel with the edge as the client tracks it: what is
+   * deposited (read on chain once, then after each top-up), what the claims
+   * so far add up to, and what is left. `undefined` when no channel is open
+   * yet (the first paid job opens one with the configured deposit).
+   */
+  async channelState(): Promise<ChannelState | undefined> {
+    const c = await this.client();
+    const ch = (c as unknown as { channel?: ChannelFacade }).channel;
+    if (!ch) return undefined;
+    let s: FacadeState;
+    try {
+      s = await ch.state(this.depositKnown === undefined ? { onChain: true } : {});
+    } catch {
+      return undefined;
+    }
+    if (this.depositKnown === undefined) this.depositKnown = s.depositTotal;
+    const deposit = this.depositKnown;
+    return { channelId: s.channelId, nonce: s.nonce, spent: s.spent, deposit, available: deposit > s.spent ? deposit - s.spent : 0n };
+  }
+
+  /**
+   * A claim past the counterparty's deposit is refused by the edge ("could
+   * never be redeemed"), and the client tops a channel up only when it opens
+   * one. So before each job: if what is left of the deposit cannot cover it,
+   * add another deposit's worth (monotonic on chain, one transaction) rather
+   * than close, settle and reopen, which trips connector#1283 on Solana.
+   */
+  private async ensureHeadroom(need: bigint): Promise<void> {
+    const s = await this.channelState();
+    if (!s || s.available >= need) return;
+    const add = this.opts.channelDeposit > need ? this.opts.channelDeposit : need;
+    this.log(`channel  ${s.channelId.slice(0, 8)}… has ${s.available} units left and the next job needs ${need}: depositing ${add} more`);
+    const c = await this.client();
+    const r = await (c as unknown as { channel: ChannelFacade }).channel.deposit(add);
+    this.depositKnown = r.depositTotal;
+    this.log(`channel  ✓ deposit now ${r.depositTotal} units, ${r.available} left`);
+  }
+
   // ---- files under home ----
 
   private manifestPath = (sha: string) => join(this.opts.home, 'manifests', `${sha}.json`);
   private progressPath = (sha: string) => join(this.opts.home, 'progress', `${sha}.json`);
 
   /** The local record of a put: written as soon as the manifest is on Arweave, so a later failed leg is resumable with `lading name`. */
-  private save(sha: string, state: { manifest: NostrEvent; manifestTxId?: string; name?: NameReceipt; paid: Array<{ leg: string; route: string; price: bigint | null | string }> }): string {
+  private save(sha: string, state: { manifest: NostrEvent; manifestTxId?: string; pageTxId?: string; pathsTxId?: string; name?: NameReceipt; paid: Array<{ leg: string; route: string; price: bigint | null | string }> }): string {
     mkdirSync(join(this.opts.home, 'manifests'), { recursive: true });
     const out = this.manifestPath(sha);
     writeFileSync(out, JSON.stringify({ ...state, paid: state.paid.map((p) => ({ ...p, price: p.price?.toString() })) }, null, 2));
@@ -444,6 +513,8 @@ export class Lading {
       legs: content.legs,
       manifest: saved.manifest,
       manifestTxId: saved.manifestTxId,
+      pageTxId: saved.pageTxId,
+      pathsTxId: saved.pathsTxId,
       name: saved.name as NameReceipt | undefined,
       paid,
       total: paid.reduce((a, p) => a + (p.price ?? 0n), 0n),
@@ -481,9 +552,20 @@ export class Lading {
   private async job<T>(route: string, event: NostrEvent, timeoutMs = 180_000): Promise<Paid<T>> {
     const c = await this.client();
     const price = await this.charge(route, Buffer.byteLength(JSON.stringify({ event })));
-    const answer = await sendJob<T>({ client: c as never, destination: route, timeoutMs }, event as never);
-    if (!answer.accepted) throw new Error(`${route}: ${answer.code} ${answer.message}`);
-    return { receipt: answer.receipt, route, price };
+    await this.ensureHeadroom((price ?? 0n) + HEADROOM_MARGIN);
+    // The edge compares a claim against the deposit it last read and re-reads
+    // the chain on a breach, but not more than once every couple of seconds
+    // (connector claim_gate.rs `min_reattempt_interval`, default 2 s): a claim
+    // sent right after a top-up can be refused against the old figure. Such a
+    // refusal moves no watermark, so the same claim is good again shortly.
+    for (let attempt = 1; ; attempt++) {
+      const answer = await sendJob<T>({ client: c as never, destination: route, timeoutMs }, event as never);
+      if (answer.accepted) return { receipt: answer.receipt, route, price };
+      const stale = answer.code === 'F03' && /deposited on chain/.test(answer.message ?? '');
+      if (!stale || attempt >= UNDERCOLLATERAL_RETRIES) throw new Error(`${route}: ${answer.code} ${answer.message}`);
+      this.log(`channel  edge still holds the old deposit figure (${answer.message?.match(/more than the (\d+)/)?.[1] ?? '?'}); retrying in ${UNDERCOLLATERAL_PAUSE_MS / 1000} s (${attempt}/${UNDERCOLLATERAL_RETRIES})`);
+      await new Promise((r) => setTimeout(r, UNDERCOLLATERAL_PAUSE_MS));
+    }
   }
 
   /** Ask the walrus quote door whether an object of this size would go through right now. 1,000 units, against 40,000 for the leg. */
@@ -831,8 +913,10 @@ export class Lading {
       this.log(`relay    ✓ event ${manifest.id}  (${Date.now() - t0} ms)`);
     }
 
-    // The manifest itself onto Arweave, then named.
+    // The manifest itself onto Arweave, then the page over it, then named.
     let manifestTxId: string | undefined;
+    let pageTxId: string | undefined;
+    let pathsTxId: string | undefined;
     let nameReceipt: NameReceipt | undefined;
     if (!skip.arweave) {
       const ev = buildJobEvent({
@@ -852,10 +936,14 @@ export class Lading {
       this.save(sha, { manifest, manifestTxId, paid });
       this.clearProgress(sha);
 
+      // The page a browser sees under the name, and the path manifest the name points at.
+      ({ pageTxId, pathsTxId } = await this.publishPage(manifest, manifestTxId, paid, t0));
+      this.save(sha, { manifest, manifestTxId, pageTxId, pathsTxId, paid });
+
       let nameOk = !skip.name;
       const undername = o.po.undername ?? undernameFor(sha);
       if (nameOk && doQuote) {
-        const q = await this.quoteName(undername, manifestTxId);
+        const q = await this.quoteName(undername, pathsTxId);
         paid.push({ leg: 'name-quote', route: q.route, price: q.price });
         this.log(`name     quote ${fmtQuote(q.receipt)}  (${Date.now() - t0} ms)`);
         if (!q.receipt.deliverable) {
@@ -864,18 +952,18 @@ export class Lading {
         }
       }
       if (nameOk) {
-        const ev2 = buildJobEvent({ kind: LEG_KIND, params: { op: 'name', txid: manifestTxId, sha256: sha, undername } });
+        const ev2 = buildJobEvent({ kind: LEG_KIND, params: { op: 'name', txid: pathsTxId, sha256: sha, undername } });
         const r2 = await this.job<NameReceipt>(R.name, ev2 as never, 120_000);
         nameReceipt = r2.receipt;
         paid.push({ leg: 'name', route: r2.route, price: r2.price });
         this.log(`name     ✓ ${nameReceipt.url}  (${Date.now() - t0} ms)`);
         // Re-sign with the name known, so the relay copy and the file copy agree on where the manifest lives.
-        manifest = buildManifest({ ...content, arns: { undername, name: nameReceipt.name, manifestTxId } }, sk);
+        manifest = buildManifest({ ...content, arns: { undername, name: nameReceipt.name, manifestTxId, pageTxId, pathsTxId } }, sk);
         if (!skip.relay) await c.send(R.relay, { body: { event: manifest } });
       }
     }
 
-    const savedPath = this.save(sha, { manifest, manifestTxId, name: nameReceipt, paid });
+    const savedPath = this.save(sha, { manifest, manifestTxId, pageTxId, pathsTxId, name: nameReceipt, paid });
     this.clearProgress(sha);
     const total = paid.reduce((a, p) => a + (p.price ?? 0n), 0n);
     return {
@@ -886,6 +974,8 @@ export class Lading {
       legs,
       manifest,
       manifestTxId,
+      pageTxId,
+      pathsTxId,
       name: nameReceipt,
       paid,
       total,
@@ -1046,36 +1136,107 @@ export class Lading {
     return gone;
   }
 
-  /** Retry the ArNS name leg for a saved manifest whose earlier name job failed, without re-uploading. */
-  async nameOnly(sha: string, o: { undername?: string; quote?: boolean; skipRelay?: boolean } = {}): Promise<{ name: NameReceipt; already: boolean; manifest: NostrEvent }> {
+  /**
+   * The bill of lading page onto Arweave, then the path manifest that serves
+   * it at `/` and the signed JSON at `/manifest.json`. Two small writes on the
+   * Arweave route; the name then points at the path manifest. The page is
+   * rendered from the manifest as signed before the name leg, which is exactly
+   * what `manifest.json` holds.
+   */
+  private async publishPage(manifest: NostrEvent, manifestTxId: string, paid: PaidRow[], t0 = Date.now()): Promise<{ pageTxId: string; pathsTxId: string }> {
     const R = this.opts.routes;
-    const p = this.manifestPath(sha);
-    if (!existsSync(p)) throw new Error(`no saved manifest for ${sha} at ${p}`);
-    const saved = JSON.parse(readFileSync(p, 'utf8')) as { manifest: NostrEvent; manifestTxId?: string; name?: NameReceipt; paid: unknown[] };
+    const html = renderPage(manifest, { readUrls: (n, id, proof) => this.readUrlsFor(n, id, proof), gateway: this.opts.gateway, gateUrl: this.opts.gateUrl, repoUrl: REPO_URL });
+    const write = async (leg: string, body: string, contentType: string) => {
+      const ev = buildJobEvent({ kind: 5094, params: {}, tags: [['i', Buffer.from(body).toString('base64'), 'blob'], ['bid', '100000', 'usdc'], ['output', contentType]] });
+      const r = await this.job<{ txId?: string }>(R.ario, ev as never);
+      if (!r.receipt.txId) throw new Error(`${leg} write accepted without a txId`);
+      paid.push({ leg, route: r.route, price: r.price });
+      this.log(`${leg.padEnd(8)} ✓ ${r.receipt.txId}  (${Buffer.byteLength(body)} B, ${Date.now() - t0} ms)`);
+      return r.receipt.txId;
+    };
+    const pageTxId = await write('page', html, PAGE_CONTENT_TYPE);
+    const pathsTxId = await write('paths', pathManifest(pageTxId, manifestTxId), PATHS_CONTENT_TYPE);
+    return { pageTxId, pathsTxId };
+  }
+
+  /** A saved put's page and path manifest, publishing them first when the record predates 0.13 or died before them. */
+  private async ensurePage(sha: string, saved: SavedPut, paid: PaidRow[], force = false): Promise<{ pageTxId: string; pathsTxId: string }> {
     if (!saved.manifestTxId) throw new Error('saved manifest has no Arweave txId; run put again');
-    if (saved.name) {
-      this.log(`already named: ${saved.name.url}`);
-      return { name: saved.name, already: true, manifest: saved.manifest };
+    if (!force && saved.pageTxId && saved.pathsTxId) return { pageTxId: saved.pageTxId, pathsTxId: saved.pathsTxId };
+    // A named record holds the manifest as re-signed with the name; the page
+    // must carry the very event manifest.json holds, so read that back.
+    let onArweave = saved.manifest;
+    if (saved.manifest.tags.some((t) => t[0] === 'arns')) {
+      const r = await readFirst(arweaveReadUrls(saved.manifestTxId, this.readGateways()));
+      if (!r.bytes) throw new Error(`cannot read the manifest ${saved.manifestTxId} back to render its page: ${r.tried.join(', ')}`);
+      onArweave = JSON.parse(new TextDecoder().decode(r.bytes)) as NostrEvent;
+      if (parseManifest(onArweave).sha256 !== sha) throw new Error(`manifest ${saved.manifestTxId} is not for ${sha}`);
     }
+    const ids = await this.publishPage(onArweave, saved.manifestTxId, paid);
+    saved.pageTxId = ids.pageTxId;
+    saved.pathsTxId = ids.pathsTxId;
+    writeFileSync(this.manifestPath(sha), JSON.stringify({ ...saved, paid: [...saved.paid, ...paid.map((p) => ({ ...p, price: p.price?.toString() }))] }, null, 2));
+    return ids;
+  }
+
+  /** Point the undername at a txid, re-sign the manifest with the name known, publish that to the relay, and record it all. */
+  private async nameAt(sha: string, saved: SavedPut, ids: { pageTxId: string; pathsTxId: string }, o: { undername?: string; quote?: boolean; skipRelay?: boolean }): Promise<{ name: NameReceipt; manifest: NostrEvent }> {
+    const R = this.opts.routes;
     const content = parseManifest(saved.manifest);
     const sk = this.nostrSecret();
     const c = await this.client();
     const undername = o.undername ?? undernameFor(sha);
     if (o.quote !== false) {
-      const q = await this.quoteName(undername, saved.manifestTxId);
+      const q = await this.quoteName(undername, ids.pathsTxId);
       this.log(`name     quote ${fmtQuote(q.receipt)}`);
       if (!q.receipt.deliverable) throw new Error(`name leg would not go through; nothing paid for it. (${q.receipt.reason})`);
     }
-    const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'name', txid: saved.manifestTxId, sha256: sha, undername } });
+    const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'name', txid: ids.pathsTxId, sha256: sha, undername } });
     const r = await this.job<NameReceipt>(R.name, ev as never, 120_000);
     this.log(`name     ✓ ${r.receipt.url}`);
-    const manifest = buildManifest({ ...content, arns: { undername, name: r.receipt.name, manifestTxId: saved.manifestTxId } }, sk);
+    const manifest = buildManifest({ ...content, arns: { undername, name: r.receipt.name, manifestTxId: saved.manifestTxId as string, ...ids } }, sk);
     if (!o.skipRelay) {
       const rr = await c.send(R.relay, { body: { event: manifest } });
       this.log(rr.fulfilled ? `relay    ✓ re-signed manifest ${manifest.id}` : `relay    ✗ ${rr.code} ${rr.message}`);
     }
-    writeFileSync(p, JSON.stringify({ ...saved, manifest, name: r.receipt, paid: [...saved.paid, { leg: 'name', route: r.route, price: r.price?.toString() }] }, null, 2));
-    return { name: r.receipt, already: false, manifest };
+    writeFileSync(this.manifestPath(sha), JSON.stringify({ ...saved, ...ids, manifest, name: r.receipt, paid: [...saved.paid, { leg: 'name', route: r.route, price: r.price?.toString() }] }, null, 2));
+    return { name: r.receipt, manifest };
+  }
+
+  /** Retry the ArNS name leg for a saved manifest whose earlier name job failed, without re-uploading the object. */
+  async nameOnly(sha: string, o: { undername?: string; quote?: boolean; skipRelay?: boolean } = {}): Promise<{ name: NameReceipt; already: boolean; manifest: NostrEvent }> {
+    const hit = this.savedPut(sha);
+    if (!hit) throw new Error(`no saved manifest for ${sha} at ${this.manifestPath(sha)}`);
+    const { saved } = hit;
+    if (saved.name) {
+      this.log(`already named: ${saved.name.url}`);
+      return { name: saved.name as NameReceipt, already: true, manifest: saved.manifest };
+    }
+    const ids = await this.ensurePage(sha, saved, []);
+    const r = await this.nameAt(sha, saved, ids, o);
+    return { ...r, already: false };
+  }
+
+  /**
+   * Give a saved put its page: publish the page and path manifest when the
+   * record has none (a name from before 0.13 points at the bare JSON) and
+   * point the name at them. A record that already has both and is named at
+   * them is left alone. `all` runs it over every saved put.
+   */
+  async pageOnly(sha: string, o: { quote?: boolean; skipRelay?: boolean; force?: boolean } = {}): Promise<{ pageTxId: string; pathsTxId: string; name?: NameReceipt; already: boolean }> {
+    const hit = this.savedPut(sha);
+    if (!hit) throw new Error(`no saved manifest for ${sha} at ${this.manifestPath(sha)}`);
+    const { saved } = hit;
+    const had = !!(saved.pageTxId && saved.pathsTxId);
+    const named = saved.name as NameReceipt | undefined;
+    if (!o.force && had && named && named.manifestTxId === saved.pathsTxId) {
+      this.log(`already paged: ${named.url}`);
+      return { pageTxId: saved.pageTxId as string, pathsTxId: saved.pathsTxId as string, name: named, already: true };
+    }
+    // `force` renders the page again (a newer page template) and points the name at the new one.
+    const ids = await this.ensurePage(sha, saved, [], o.force);
+    const r = await this.nameAt(sha, saved, ids, { undername: named?.undername, ...o });
+    return { ...ids, name: r.name, already: false };
   }
 
   // ---- reading back ----
@@ -1091,16 +1252,19 @@ export class Lading {
       const j = JSON.parse(readFileSync(ref, 'utf8'));
       return { event: (j.manifest ?? j) as NostrEvent, source: 'local file' };
     }
+    // A name serves the page at `/` and the JSON at `/manifest.json` (0.13+),
+    // or the bare JSON at `/` (older); ask for the JSON first, then take
+    // whatever the root serves, page or JSON.
     const urls = ARWEAVE_TXID_RE.test(ref)
       ? arweaveReadUrls(ref, this.readGateways())
       : ref.startsWith('http')
         ? [ref]
-        : arnsReadUrls(ref, this.arnsGateways());
+        : [...arnsReadUrls(ref, this.arnsGateways()).map((u) => `${u}manifest.json`), ...arnsReadUrls(ref, this.arnsGateways())];
     const r = await readFirst(urls);
     if (!r.bytes) throw new Error(`${urls[0]}: ${r.tried.join(', ')}`);
     const host = r.url.replace(/^https?:\/\//, '').split('/')[0];
     const source = r.tried.length > 1 ? `${host} (${r.tried.slice(0, -1).join(', ')})` : host;
-    return { event: JSON.parse(new TextDecoder().decode(r.bytes)) as NostrEvent, source };
+    return { event: manifestFromPage(new TextDecoder().decode(r.bytes)), source };
   }
 
   /** The gateways a raw txid may be read from, the ArNS gateway first. */

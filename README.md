@@ -129,8 +129,9 @@ lading put report.pdf
 | 8. bill of lading | signed locally by the payer's Nostr key | kind 30320, `d` = sha256 | free |
 | 9. relay copy | `g.drew.relay` | the node relay | 1,000 |
 | 10. manifest to Arweave | `g.drew.ario` | the org store, on the txId | schedule |
-| 11. name quote | `g.drew.lading.name.quote` (kind 5320, `phase=quote`) | Lading: deliverable, undername, lamports float | 1,000 |
-| 12. ArNS name | `g.drew.lading.name` (kind 5320) | Lading, on the ANT record write | 5,000 |
+| 11. page + path manifest to Arweave | `g.drew.ario` | the org store, on the two txIds: the rendered bill of lading page, and an `arweave/paths` manifest serving it at `/` and the JSON at `/manifest.json` | schedule, twice |
+| 12. name quote | `g.drew.lading.name.quote` (kind 5320, `phase=quote`) | Lading: deliverable, undername, lamports float | 1,000 |
+| 13. ArNS name | `g.drew.lading.name` (kind 5320) | Lading, on the ANT record write, pointing at the path manifest | 5,000 |
 
 A leg that fails answers `accept: false`, buys nothing downstream, and costs
 the route price. Steps are skippable (`--skip-walrus`, `--skip-filecoin`,
@@ -139,6 +140,15 @@ IPFS quote that says not deliverable skips that leg and carries on; the
 manifest then simply lists fewer legs. The local record is written as soon as the
 manifest is on Arweave, so a failed name leg is resumable with
 `lading name <sha256>` without re-uploading anything.
+
+The name is a page. `https://<name>.permagate.io/` renders the bill of lading
+(the object, every leg with its receipt, a button that re-reads each leg and
+hashes it in the browser, and one that asks the gate's free verify door), with
+nothing loaded from anywhere else; `https://<name>.permagate.io/manifest.json`
+is the signed event for programs. Both are on Arweave under the name. A put
+from before 0.13 serves the bare JSON at `/`; `lading page <sha256|all>` writes
+the page and path manifest for a saved put and points its name at them, and
+`verify` reads either shape.
 
 The same bytes put twice from the same home buy nothing the second time:
 `put` finds the saved manifest for that sha256 and returns it (`reused`),
@@ -246,6 +256,7 @@ src/filecoin-fund.ts  operator tool: deposit USDFC and approve warm storage, onc
 src/quote.ts     the pure deliverability decisions behind the quote doors
 src/arns.ts      ANT undername write, owner or controller
 src/manifest.ts  build and verify the kind 30320 bill of lading
+src/page.ts      the bill of lading page a name serves, and the arweave/paths manifest behind it
 src/floats.ts    float rows: each hot key judged against its low-water mark; GET /floats on the broker, health in the gate's describe
 src/cli.ts       the paying client that composes the legs
 deploy/routes.toml   the [[routes]] rows for the edge connector

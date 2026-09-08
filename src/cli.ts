@@ -13,6 +13,9 @@
  *                           a path to a saved manifest.
  *   lading name <sha>       retry the ArNS name leg for a saved manifest whose
  *                           earlier name job failed, without re-uploading.
+ *   lading page <sha|all>   give a saved put its public bill of lading page: write
+ *                           the page and the path manifest to Arweave and point the
+ *                           name at them (a name from before 0.13 serves bare JSON).
  *   lading quote <file>     the full bill before paying it: every route's price
  *                           plus each leg's quote (deliverable right now, and
  *                           the downstream cost the broker will carry).
@@ -97,6 +100,24 @@ async function renew(ref: string) {
   console.log(`\nrenewed ${r.bought} of ${r.targets} records, paid ${r.total} base units`);
 }
 
+async function page(ref: string) {
+  const shas = ref === 'all' ? lading.savedPuts().filter((p) => p.saved.manifestTxId).map((p) => p.sha) : [ref];
+  if (shas.length === 0) throw new Error(`no saved puts under ${join(home, 'manifests')}`);
+  let done = 0;
+  for (const sha of shas) {
+    console.log(`\n${sha}`);
+    try {
+      const r = await lading.pageOnly(sha, { quote: !flag('no-quote'), skipRelay: flag('skip-relay'), force: flag('force') });
+      if (!r.already) done++;
+      console.log(`  page     ${r.name?.url ?? `https://${gateway}/${r.pathsTxId}/`}  (page ${r.pageTxId}, paths ${r.pathsTxId})`);
+    } catch (e) {
+      console.log(`  ✗ ${(e as Error).message}`);
+      if (ref !== 'all') throw e;
+    }
+  }
+  if (ref === 'all') console.log(`\n${done} of ${shas.length} saved puts given a page`);
+}
+
 async function describe() {
   for (const { key, route, price } of await lading.describe()) console.log(`${key.padEnd(12)} ${route.padEnd(30)} ${price === null ? 'not priced' : `${price} base units`}`);
 }
@@ -124,6 +145,7 @@ const run =
   : cmd === 'quote' && arg ? quote(arg)
   : cmd === 'verify' && arg ? verify(arg)
   : cmd === 'name' && arg ? lading.nameOnly(arg, { undername: opt('undername'), quote: !flag('no-quote'), skipRelay: flag('skip-relay') }).then(() => undefined)
+  : cmd === 'page' && arg ? page(arg)
   : cmd === 'renewals' ? renewals()
   : cmd === 'renew' && arg ? renew(arg)
   : cmd === 'describe' ? describe()
@@ -135,6 +157,7 @@ if (!run) {
       '       lading quote <file> [--part-bytes n]\n' +
       '       lading verify <arns-name|manifest-txid|saved.json>\n' +
       '       lading name <sha256> [--no-quote]\n' +
+      '       lading page <sha256|all> [--no-quote] [--force]   (write the bill of lading page + path manifest, point the name at them; --force re-renders an existing page)\n' +
       '       lading renewals [--within days] [--live]\n' +
       '       lading renew <sha256|lighthouse-record-id> [--no-quote]\n' +
       '       lading describe\n' +

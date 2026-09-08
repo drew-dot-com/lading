@@ -12,8 +12,13 @@ export interface ManifestContent {
   size: number;
   mime?: string;
   legs: LegReceipt[];
-  /** Set once the manifest itself is on Arweave and named. */
-  arns?: { undername: string; name: string; manifestTxId: string };
+  /**
+   * Set once the manifest itself is on Arweave and named. `manifestTxId` is the
+   * bare signed JSON; since 0.13 the name points at `pathsTxId`, an Arweave
+   * path manifest serving the page (`pageTxId`) at `/` and the JSON at
+   * `/manifest.json`. A name from before 0.13 points straight at `manifestTxId`.
+   */
+  arns?: { undername: string; name: string; manifestTxId: string; pageTxId?: string; pathsTxId?: string };
   /**
    * Present when the put came through a door other than the payer's own CLI:
    * the gate signs with its key and records who paid it at the boundary (an

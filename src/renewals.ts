@@ -40,6 +40,9 @@ export interface SavedRenewal {
 export interface SavedPut {
   manifest: NostrEvent;
   manifestTxId?: string;
+  /** The rendered bill of lading page and the path manifest the name points at (0.13+). */
+  pageTxId?: string;
+  pathsTxId?: string;
   name?: { name: string; url: string };
   paid: unknown[];
   renewals?: SavedRenewal[];

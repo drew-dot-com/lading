@@ -108,16 +108,16 @@ const payerAddress = () =>
     throw e;
   }));
 
-/** The open channel as the client's store records it: headroom is what is left of the deposit before the next channel has to open. */
-function channelHeadroom(): Record<string, string | number | null> {
+/**
+ * The open channel as the client tracks it, deposit read on chain: headroom is
+ * what is left before the next job has to top the deposit up (lib does that
+ * by itself, one deposit's worth at a time, from this payer's USDC).
+ */
+async function channelHeadroom(): Promise<Record<string, string | number | null>> {
   try {
-    if (!existsSync(lading.opts.channelStore)) return { channel: null };
-    const store = JSON.parse(readFileSync(lading.opts.channelStore, 'utf8')) as Record<string, { nonce: number; cumulativeAmount: string }>;
-    const [id, c] = Object.entries(store).at(-1) ?? [];
-    if (!id || !c) return { channel: null };
-    const used = BigInt(c.cumulativeAmount);
-    const deposit = lading.opts.channelDeposit;
-    return { channel: id, nonce: c.nonce, usedUnits: used.toString(), depositUnits: deposit.toString(), headroomUnits: (deposit > used ? deposit - used : 0n).toString() };
+    const s = await lading.channelState();
+    if (!s) return { channel: null };
+    return { channel: s.channelId, nonce: s.nonce, usedUnits: s.spent.toString(), depositUnits: s.deposit.toString(), headroomUnits: s.available.toString() };
   } catch (e) {
     return { channel: `unreadable: ${(e as Error).message.slice(0, 80)}` };
   }
@@ -137,7 +137,7 @@ const payerFloats = cached(30_000, async (): Promise<FloatRow[]> => {
       balance: microToDecimal(h.usdcMicro),
       low: GATE_LOW_USDC,
       fund: `Send USDC (SPL) on Solana to ${owner}.`,
-      extra: channelHeadroom(),
+      extra: await channelHeadroom(),
     }),
     judge({
       name: 'gate-payer-sol',
@@ -334,6 +334,17 @@ function payerOf(req: Request): string | undefined {
 
 const app = express();
 app.disable('x-powered-by');
+
+// The bill of lading page lives under an ArNS name on another origin and asks
+// the free read doors from the browser; nothing paid or stateful is exposed.
+const CORS_FREE_GETS = new Set(['/v1/verify', '/v1/manifest', '/v1/describe', '/v1/quote', '/health']);
+app.use((req, res, next) => {
+  if (!CORS_FREE_GETS.has(req.path)) return next();
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  return next();
+});
 
 // A put is priced on its declared length, so it has to declare one, and it has to fit.
 app.post('/v1/put', (req, res, next) => {

@@ -434,7 +434,7 @@ export async function runMcp(o: McpOptions) {
     'lading_lookup',
     {
       title: 'Is this already archived?',
-      description: 'Free. Whether the gate already holds a bill of lading for a file (path), a text string, or a sha256. Returns the existing record (receipts, manifest URL, ArNS name) or says it is not archived. lading_put runs this first and pays nothing for bytes the gate already archived.',
+      description: 'Free. Whether the gate already holds a bill of lading for a file (path), a text string, or a sha256. Returns the existing record (receipts, manifest URL, ArNS name; the name URL is the public bill of lading page, with /manifest.json beside it) or says it is not archived. lading_put runs this first and pays nothing for bytes the gate already archived.',
       inputSchema: {
         path: z.string().optional().describe('local file to hash'),
         text: z.string().optional().describe('text to hash instead of a file'),
