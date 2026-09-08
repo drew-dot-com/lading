@@ -23,11 +23,14 @@ import { registerExactEvmScheme } from '@x402/evm/exact/client';
 import { privateKeyToAccount } from 'viem/accounts';
 import type { IpfsReceipt } from './kinds.js';
 import { rawCidSha256 } from './walrus.js';
-import { DEFAULT_IPFS_GATEWAYS, ipfsReadUrls, readGateways } from './read.js';
+import { DEFAULT_IPFS_GATEWAY, DEFAULT_IPFS_GATEWAYS, ipfsReadUrls, readGateways } from './read.js';
 
 export const PINATA_402 = process.env.PINATA_402_URL ?? 'https://402.pinata.cloud';
 /** Gateways an IPFS CID is read back from, in order: the pinner's own first, then ones it does not run. */
-export const IPFS_GATEWAYS = readGateways('gateway.pinata.cloud', process.env.LADING_IPFS_GATEWAYS, DEFAULT_IPFS_GATEWAYS);
+export const IPFS_GATEWAYS = readGateways(process.env.LADING_IPFS_GATEWAY ?? DEFAULT_IPFS_GATEWAY, process.env.LADING_IPFS_GATEWAYS, DEFAULT_IPFS_GATEWAYS);
+/** Lading's own kubo (RPC API on the compose network). Every pinned object is added here too; unset = skip. */
+export const KUBO_API = process.env.LADING_KUBO_API?.trim() || undefined;
+export const PINATA_GATEWAY = 'gateway.pinata.cloud';
 /** What the door sells: twelve months of pinning per payment. */
 export const PINATA_RETENTION = 'P365D';
 const PINATA_RETENTION_MS = 365 * 86_400_000;
@@ -75,10 +78,12 @@ function settlementOf(res: Response): { transaction?: string; payer?: string } {
 const withTimeout = (ms: number) => AbortSignal.timeout(ms);
 
 /**
- * Read the CID back: Pinata's gateway first (the pin itself), then the first
- * gateway Pinata does not run that answers (the network). Fresh content can
- * take a while to be found by other gateways, so a miss there is recorded,
- * not fatal; the pinner's own answer is what FULFILL requires.
+ * Read the CID back through the gateway list: Lading's own kubo first (it just
+ * added the bytes, so it answers at once), then Pinata's (the pin itself, a
+ * few tries because its public gateway rate-limits), then gateways neither of
+ * us runs. FULFILL requires Pinata to have answered the pin AND some gateway
+ * to serve bytes with the right sha256; `publicUrl` records the first gateway
+ * that is not ours.
  */
 /** Tries on the pinner's own gateway before giving up: with 3 s × n backoff, 10 tries wait about 165 s plus fetch time. A 1 MiB dag-pb CID took over two minutes to appear on 2026-09-08. */
 export const PINNER_READBACK_ATTEMPTS = Number(process.env.LADING_IPFS_READBACK_ATTEMPTS ?? 10);
@@ -91,15 +96,16 @@ export async function readBack(cid: string, expectedSha256: string, gateways = I
   let publicUrl: string | undefined;
   for (const [i, url] of ipfsReadUrls(cid, gateways).entries()) {
     const host = gateways[i]!;
-    const tries = i === 0 ? attempts : 1;
+    const ours = i === 0 && KUBO_API !== undefined;
+    const tries = ours ? 2 : host === PINATA_GATEWAY ? attempts : 1;
     for (let t = 0; t < tries; t++) {
       try {
-        const r = await fetch(url, { cache: 'no-store', signal: withTimeout(i === 0 ? 60_000 : 30_000), headers: { accept: 'application/octet-stream' } });
+        const r = await fetch(url, { cache: 'no-store', signal: withTimeout(ours || host === PINATA_GATEWAY ? 60_000 : 30_000), headers: { accept: 'application/octet-stream' } });
         if (r.ok) {
           const ok = sha256Hex(new Uint8Array(await r.arrayBuffer())) === expectedSha256;
           checks.push(`${host}:${ok ? 'sha256-match' : 'sha256-mismatch'}`);
           if (ok && !readUrl) readUrl = url;
-          if (ok && i > 0) publicUrl = url;
+          if (ok && !ours && !publicUrl) publicUrl = url;
           break;
         }
         checks.push(`${host}:${r.status}`);
@@ -108,12 +114,29 @@ export async function readBack(cid: string, expectedSha256: string, gateways = I
       } catch (e) {
         checks.push(`${host}:${(e as Error).name === 'TimeoutError' ? 'timeout' : (e as Error).message.slice(0, 30)}`);
       }
-      if (t < tries - 1) await new Promise((d) => setTimeout(d, 3000 * (t + 1) + (i === 0 ? 5000 : 0)));
+      if (t < tries - 1) await new Promise((d) => setTimeout(d, 3000 * (t + 1) + (host === PINATA_GATEWAY ? 5000 : 0)));
     }
+    // Enough once a gateway that is not ours has served the bytes.
     if (publicUrl) break;
   }
   const strong = checks.includes('cid-digest=sha256') || readUrl !== undefined;
   return { checks, strong, readUrl, publicUrl };
+}
+
+/**
+ * Add the bytes to Lading's own kubo, pinned, with the same UnixFS layout
+ * Pinata uses (CIDv1, raw leaves, 256 KiB balanced chunks) so both sides
+ * name the object by the same CID. Answers the CID kubo computed.
+ */
+export async function kuboAdd(bytes: Uint8Array, fileName: string, api = KUBO_API): Promise<string> {
+  if (!api) throw new Error('LADING_KUBO_API unset');
+  const form = new FormData();
+  form.append('file', new Blob([bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer], { type: 'application/octet-stream' }), fileName);
+  const r = await fetch(`${api}/api/v0/add?pin=true&cid-version=1&raw-leaves=true&chunker=size-262144&quieter=true`, { method: 'POST', body: form, signal: withTimeout(120_000) });
+  if (!r.ok) throw new Error(`kubo add failed: ${r.status} ${(await r.text()).slice(0, 200)}`);
+  const j = (await r.json()) as { Hash?: string };
+  if (!j.Hash) throw new Error(`kubo add returned no Hash: ${JSON.stringify(j).slice(0, 200)}`);
+  return j.Hash;
 }
 
 export function pinataUploader(evmPrivateKey: `0x${string}`, o: { network?: string; base?: string } = {}): IpfsUploader {
@@ -155,6 +178,16 @@ export function pinataUploader(evmPrivateKey: `0x${string}`, o: { network?: stri
       const cid = j.data?.cid;
       if (!cid) throw new Error(`pinata upload returned no cid: ${JSON.stringify(j).slice(0, 200)}`);
 
+      // Our own copy, under the same CID, before the read-back so our gateway can answer it.
+      let kubo: string | undefined;
+      if (KUBO_API) {
+        try {
+          const ours = await kuboAdd(bytes, fileName);
+          kubo = ours === cid ? 'pinned' : `cid-mismatch(${ours})`;
+        } catch (e) {
+          kubo = `failed(${(e as Error).message.slice(0, 80)})`;
+        }
+      }
       const check = await readBack(cid, sha);
       if (!check.strong) throw new Error(`pinata pinned ${cid} but no read-back matched: ${check.checks.join(';')}`);
       const at = Math.floor(Date.now() / 1000);
@@ -170,6 +203,7 @@ export function pinataUploader(evmPrivateKey: `0x${string}`, o: { network?: stri
           readUrl: check.readUrl ?? ipfsReadUrls(cid, IPFS_GATEWAYS)[0]!,
           ...(check.publicUrl ? { publicUrl: check.publicUrl } : {}),
           ...(j.data?.id ? { pinataId: j.data.id } : {}),
+          ...(kubo ? { kubo } : {}),
           expiresAt: at * 1000 + PINATA_RETENTION_MS,
           ...(settlement.transaction ? { baseTx: settlement.transaction } : {}),
           ...(settlement.payer ? { payer: settlement.payer } : {}),

@@ -34,7 +34,7 @@ import { lighthouseUploader, sha256Hex, LIGHTHOUSE_X402, WALRUS_AGGREGATOR, type
 import { solanaNamer, undernameFor, UNDERNAME_RE, type Namer } from './arns.js';
 import { cached, decideFilecoin, decideName, decideWalrus, decideWalrusNative, decideWalrusRenew, type FilecoinQuote, type IpfsQuote, type NameQuote, type WalrusQuote, type WalrusRenewQuote } from './quote.js';
 import { nativeWalrusUploader, nineDec, SUI_PER_WRITE, WALRUS_UPLOAD_RELAY, type NativeWalrusUploader } from './walrus-native.js';
-import { pinataUploader, IPFS_GATEWAYS, PINATA_402, PINATA_RETENTION, type IpfsUploader } from './ipfs.js';
+import { pinataUploader, IPFS_GATEWAYS, KUBO_API, PINATA_402, PINATA_RETENTION, type IpfsUploader } from './ipfs.js';
 import { daysLeft, openLedger, type Ledger } from './ledger.js';
 import { filecoinChain, synapseUploader, runwayText, FILECOIN_MIN_BYTES, type FilecoinUploader } from './filecoin.js';
 import { createPublicClient, http as viemHttp, erc20Abi, formatUnits } from 'viem';
@@ -728,6 +728,7 @@ async function main() {
         network: 'ipfs',
         provider: 'pinata-x402',
         endpoint: PINATA_402,
+        ...(KUBO_API ? { kubo: KUBO_API, note: 'every pin is also added to our own kubo under the same CID and reprovided to the DHT; the first gateway is ours' } : {}),
         gateways: IPFS_GATEWAYS,
         retention: PINATA_RETENTION,
         maxBytes: MAX_BODY_BYTES,

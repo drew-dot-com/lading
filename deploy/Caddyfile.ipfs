@@ -1,0 +1,7 @@
+# Append to /opt/toon-relay/deploy/Caddyfile (back it up first), then
+# `caddy reload`. Lading's own IPFS gateway: kubo serves only what it pins
+# (Gateway.NoFetch), so this is a read path for Lading receipts, not a proxy.
+ipfs.167-233-221-236.sslip.io {
+	encode zstd gzip
+	reverse_proxy lading-kubo:8080
+}

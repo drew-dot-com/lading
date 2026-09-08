@@ -37,8 +37,8 @@ test('ipfs quote: same reserve rule as walrus, reason names the ipfs float', () 
 });
 
 test('ipfs read urls: the pinner first, then the configured order, no duplicates', () => {
-  const gws = readGateways('gateway.pinata.cloud', undefined, DEFAULT_IPFS_GATEWAYS);
-  assert.deepEqual(gws, ['gateway.pinata.cloud', 'ipfs.filebase.io', 'ipfs.io']);
-  assert.equal(ipfsReadUrls('bafyabc', gws)[1], 'https://ipfs.filebase.io/ipfs/bafyabc');
+  const gws = readGateways('ipfs.167-233-221-236.sslip.io', undefined, DEFAULT_IPFS_GATEWAYS);
+  assert.deepEqual(gws, ['ipfs.167-233-221-236.sslip.io', 'gateway.pinata.cloud', 'ipfs.filebase.io', 'ipfs.io']);
+  assert.equal(ipfsReadUrls('bafyabc', gws)[2], 'https://ipfs.filebase.io/ipfs/bafyabc');
   assert.deepEqual(readGateways('gateway.pinata.cloud', 'https://ipfs.io/, gateway.pinata.cloud', DEFAULT_IPFS_GATEWAYS), ['gateway.pinata.cloud', 'ipfs.io']);
 });

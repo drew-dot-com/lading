@@ -15,6 +15,8 @@ services:
       LADING_WALRUS_PROVIDER: ${LADING_WALRUS_PROVIDER:-}       # lighthouse | native | auto (default: auto when the Sui key is set)
       LADING_WALRUS_EPOCHS: ${LADING_WALRUS_EPOCHS:-26}         # two-week epochs per native write; 26 = 364 days
       LADING_IPFS: ${LADING_IPFS:-}                             # off to disable the Pinata door
+      LADING_KUBO_API: ${LADING_KUBO_API:-http://lading-kubo:5001}   # our own kubo: every pinned object is added here too; empty = skip
+      LADING_IPFS_GATEWAYS: ${LADING_IPFS_GATEWAYS:-ipfs.167-233-221-236.sslip.io,gateway.pinata.cloud,ipfs.filebase.io,ipfs.io}
       LADING_FILECOIN_PRIVATE_KEY: ${LADING_FILECOIN_PRIVATE_KEY:-}   # Filecoin key with USDFC deposited in Filecoin Pay (npm run fund:filecoin); door OFF when unset
       LADING_FILECOIN_CHAIN: ${LADING_FILECOIN_CHAIN:-mainnet}
       LADING_FILECOIN_COPIES: ${LADING_FILECOIN_COPIES:-2}
@@ -64,9 +66,30 @@ services:
       LADING_ARNS_GATEWAYS: ${LADING_ARNS_GATEWAYS:-ardrive.net,vilenarios.com}
     volumes: [lading_gate_data:/data]
     networks: [relay_deploy_net]
+  # Lading's own IPFS node: a second copy of every pinned object, reprovided
+  # to the DHT so other gateways can find it, and a gateway of our own
+  # (ipfs.<ip>.sslip.io through Caddy, see deploy/Caddyfile.ipfs) that never
+  # rate-limits our read-backs. Serves only what it pins (Gateway.NoFetch).
+  # 4001 is the one port this project publishes on the host.
+  kubo:
+    image: ipfs/kubo:v0.43.0
+    container_name: lading-kubo
+    restart: unless-stopped
+    environment:
+      IPFS_PROFILE: server
+      LADING_PUBLIC_IP: ${LADING_PUBLIC_IP:-167.233.221.236}
+    ports: ['4001:4001/tcp', '4001:4001/udp']
+    expose: ['5001', '8080']
+    volumes:
+      - kubo_data:/data/ipfs
+      - ./deploy/kubo-init.sh:/container-init.d/10-lading.sh:ro
+    mem_limit: 768m
+    networks: [relay_deploy_net]
+
 volumes:
   lading_data:
   lading_gate_data:
+  kubo_data:
 networks:
   relay_deploy_net:
     external: true

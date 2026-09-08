@@ -22,7 +22,7 @@ import { dueWithin, fmtDate, walrusRecords, type RenewalRow, type SavedPut, type
 import { daysLeft } from './ledger.js';
 import { buildManifest, parseManifest, type ManifestContent } from './manifest.js';
 import { undernameFor } from './arns.js';
-import { ARWEAVE_TXID_RE, DEFAULT_ARNS_GATEWAYS, DEFAULT_IPFS_GATEWAYS, arnsReadUrls, arweaveReadUrls, ipfsReadUrls, readFirst, readGateways, viaNote } from './read.js';
+import { ARWEAVE_TXID_RE, DEFAULT_ARNS_GATEWAYS, DEFAULT_IPFS_GATEWAY, DEFAULT_IPFS_GATEWAYS, arnsReadUrls, arweaveReadUrls, ipfsReadUrls, readFirst, readGateways, viaNote } from './read.js';
 
 export interface Routes {
   ario: string;
@@ -95,7 +95,7 @@ export function optionsFromEnv(overrides: Partial<LadingOptions> = {}): LadingOp
     arnsGateways: readGateways(env('LADING_ARNS_GATEWAY', 'permagate.io'), process.env.LADING_ARNS_GATEWAYS, DEFAULT_ARNS_GATEWAYS),
     lighthouseX402: env('LIGHTHOUSE_X402_URL', 'https://x402-walrus.lighthouse.storage'),
     walrusAggregator: env('WALRUS_AGGREGATOR_URL', 'https://aggregator.walrus-mainnet.walrus.space'),
-    ipfsGateways: readGateways('gateway.pinata.cloud', process.env.LADING_IPFS_GATEWAYS, DEFAULT_IPFS_GATEWAYS),
+    ipfsGateways: readGateways(env('LADING_IPFS_GATEWAY', DEFAULT_IPFS_GATEWAY), process.env.LADING_IPFS_GATEWAYS, DEFAULT_IPFS_GATEWAYS),
     home,
     solanaKeypair: env('SOLANA_KEYPAIR', join(homedir(), '.config/solana/id.json')),
     solanaSecret: process.env.SOLANA_KEYPAIR_JSON ? Uint8Array.from(JSON.parse(process.env.SOLANA_KEYPAIR_JSON) as number[]) : undefined,
