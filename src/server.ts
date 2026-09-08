@@ -1,7 +1,7 @@
 /**
  * Lading's handler: the doors a TOON connector terminates routes at.
  *
- *   POST /walrus         kind:5320, `['i', base64, 'blob']`  → WalrusReceipt
+ *   POST /walrus         kind:5320, `['i', base64, 'blob']`  → WalrusReceipt (native Sui writer or Lighthouse, LADING_WALRUS_PROVIDER)
  *   POST /filecoin       kind:5320, `['i', base64, 'blob']`  → FilecoinReceipt
  *   POST /ipfs           kind:5320, `['i', base64, 'blob']`  → IpfsReceipt
  *   POST /name           kind:5320, params op=name, txid, undername → NameReceipt
@@ -32,7 +32,8 @@ import { getPublicKey, verifyEvent, type Event as NostrEvent } from 'nostr-tools
 import { LEG_KIND, MANIFEST_KIND } from './kinds.js';
 import { lighthouseUploader, sha256Hex, LIGHTHOUSE_X402, WALRUS_AGGREGATOR, type WalrusUploader } from './walrus.js';
 import { solanaNamer, undernameFor, UNDERNAME_RE, type Namer } from './arns.js';
-import { cached, decideFilecoin, decideName, decideWalrus, decideWalrusRenew, type FilecoinQuote, type IpfsQuote, type NameQuote, type WalrusQuote, type WalrusRenewQuote } from './quote.js';
+import { cached, decideFilecoin, decideName, decideWalrus, decideWalrusNative, decideWalrusRenew, type FilecoinQuote, type IpfsQuote, type NameQuote, type WalrusQuote, type WalrusRenewQuote } from './quote.js';
+import { nativeWalrusUploader, nineDec, SUI_PER_WRITE, WALRUS_UPLOAD_RELAY, type NativeWalrusUploader } from './walrus-native.js';
 import { pinataUploader, IPFS_GATEWAYS, PINATA_402, PINATA_RETENTION, type IpfsUploader } from './ipfs.js';
 import { daysLeft, openLedger, type Ledger } from './ledger.js';
 import { filecoinChain, synapseUploader, runwayText, FILECOIN_MIN_BYTES, type FilecoinUploader } from './filecoin.js';
@@ -53,6 +54,10 @@ const FILECOIN_LOW_FIL = process.env.LADING_FILECOIN_LOW_FIL ?? '0.02';
 const NAME_LOW_SOL = process.env.LADING_NAME_LOW_SOL ?? '0.008';
 /** Lamports the name key must hold before a name job is quoted deliverable: record rent (~2.81M) plus fee, with a margin for a second job in flight. */
 const NAME_NEED_LAMPORTS = BigInt(process.env.LADING_NAME_NEED_LAMPORTS ?? 6_000_000);
+/** Which writer the walrus doors use: `lighthouse` (Base USDC via Lighthouse x402), `native` (this broker's Sui key, WAL + SUI), or `auto` (native when its floats cover the write, else Lighthouse). Default: auto when a Sui key is set, else lighthouse. */
+const WALRUS_PROVIDER = (process.env.LADING_WALRUS_PROVIDER ?? (process.env.LADING_SUI_SECRET_KEY ? 'auto' : 'lighthouse')) as 'lighthouse' | 'native' | 'auto';
+const WALRUS_LOW_WAL = process.env.LADING_WALRUS_LOW_WAL ?? '0.5';
+const WALRUS_LOW_SUI = process.env.LADING_WALRUS_LOW_SUI ?? '0.05';
 /** The Base key must hold this many times the downstream price before a walrus job is quoted deliverable. */
 const WALRUS_RESERVE_MULTIPLE = Number(process.env.LADING_WALRUS_RESERVE_MULTIPLE ?? 2);
 /** Days of Filecoin Pay runway the broker must hold before a filecoin job is quoted deliverable. */
@@ -136,26 +141,128 @@ async function openJob(req: IncomingMessage, res: ServerResponse, op: string, ph
   return { event, meta };
 }
 
-function walrusDoor(uploader: WalrusUploader, ledger: Ledger) {
+/** Bytes out of a leg event's blob input, or a refusal already sent. */
+function blobOf(event: NostrEvent, res: ServerResponse): Uint8Array | undefined {
+  const b64 = inputOf(event, 'blob');
+  if (!b64) {
+    refuse(res, 422, 'F00', "Missing input: ['i', <base64>, 'blob']");
+    return undefined;
+  }
+  let bytes: Uint8Array;
+  try {
+    bytes = new Uint8Array(Buffer.from(b64, 'base64'));
+  } catch {
+    refuse(res, 422, 'F00', 'blob input is not base64');
+    return undefined;
+  }
+  if (bytes.length === 0) {
+    refuse(res, 422, 'F00', 'blob is empty');
+    return undefined;
+  }
+  if (bytes.length > MAX_BODY_BYTES) {
+    refuse(res, 422, 'F00', `blob is ${bytes.length} bytes, over the ${MAX_BODY_BYTES}-byte cap`);
+    return undefined;
+  }
+  return bytes;
+}
+
+/** The Base key's USDC balance, cached: one read per FLOAT_CACHE_MS however many quotes arrive. */
+function walrusFloat(evmKey: `0x${string}`) {
+  const account = privateKeyToAccount(evmKey);
+  const client = createPublicClient({ chain: base, transport: viemHttp(BASE_RPC) });
+  const read = cached(FLOAT_CACHE_MS, async () => {
+    const raw = await client.readContract({ address: BASE_USDC, abi: erc20Abi, functionName: 'balanceOf', args: [account.address] });
+    return formatUnits(raw, 6);
+  });
+  return { address: account.address, read };
+}
+
+type Writers = {
+  mode: 'lighthouse' | 'native' | 'auto';
+  lighthouse?: { uploader: WalrusUploader; float: ReturnType<typeof walrusFloat> };
+  native?: { uploader: NativeWalrusUploader; floats: () => Promise<Awaited<ReturnType<NativeWalrusUploader['floats']>>> };
+};
+
+/** The quote one writer gives for `size` bytes right now. */
+async function quoteWith(w: Writers, which: 'lighthouse' | 'native', size: number): Promise<WalrusQuote> {
+  const at = Math.floor(Date.now() / 1000);
+  if (which === 'native') {
+    const n = w.native!;
+    const [q, f] = await Promise.all([n.uploader.quote(Math.max(size, 1)), n.floats()]);
+    const suiPerWriteMist = BigInt(Math.round(Number(SUI_PER_WRITE) * 1e9));
+    const d = decideWalrusNative({ size, maxBytes: MAX_BODY_BYTES, costFrost: q.amountFrost, walFrost: f.walFrost, suiMist: f.suiMist, suiPerWriteMist, reserveMultiple: WALRUS_RESERVE_MULTIPLE });
+    return {
+      op: 'walrus',
+      deliverable: d.deliverable,
+      ...(d.reason ? { reason: d.reason } : {}),
+      size,
+      maxBytes: MAX_BODY_BYTES,
+      downstream: { provider: 'walrus-native', amountUsdc: '0', amount: q.amountWal, asset: 'WAL', retention: `P${q.epochs * 14}D`, epochs: q.epochs, suiPerWrite: SUI_PER_WRITE },
+      float: { chain: 'sui', asset: 'WAL', balance: f.wal, reserve: d.reserveWal, sui: f.sui },
+      executeDoor: '/walrus',
+      at,
+    };
+  }
+  const l = w.lighthouse!;
+  const [price, balance] = await Promise.all([l.uploader.quote(Math.max(size, 1)), l.float.read()]);
+  const d = decideWalrus({ size, maxBytes: MAX_BODY_BYTES, priceUsdc: price.amountUsdc, balanceUsdc: balance, reserveMultiple: WALRUS_RESERVE_MULTIPLE });
+  return {
+    op: 'walrus',
+    deliverable: d.deliverable,
+    ...(d.reason ? { reason: d.reason } : {}),
+    size,
+    maxBytes: MAX_BODY_BYTES,
+    downstream: { provider: 'lighthouse-x402', amountUsdc: price.amountUsdc, amount: price.amountUsdc, asset: 'USDC', retention: 'P365D' },
+    float: { chain: 'base', asset: 'USDC', balance, reserve: d.reserveUsdc },
+    executeDoor: '/walrus',
+    at,
+  };
+}
+
+/**
+ * Which writer takes this object: the configured one, or in `auto` mode the
+ * native writer whenever its WAL and SUI cover the write and Lighthouse
+ * otherwise. The quote says which, so a payer knows the provider before the
+ * leg is paid. A writer whose quote throws (its RPC down) is treated as not
+ * deliverable, never as an exception, so the other one can still answer.
+ */
+async function chooseWalrus(w: Writers, size: number): Promise<{ which: 'lighthouse' | 'native'; quote: WalrusQuote }> {
+  const tryQuote = async (which: 'lighthouse' | 'native') => {
+    try {
+      return await quoteWith(w, which, size);
+    } catch (e) {
+      const at = Math.floor(Date.now() / 1000);
+      const msg = `${which} quote failed: ${(e as Error).message.slice(0, 160)}`;
+      return which === 'native'
+        ? ({ op: 'walrus', deliverable: false, reason: msg, size, maxBytes: MAX_BODY_BYTES, downstream: { provider: 'walrus-native', amountUsdc: '0', amount: '0', asset: 'WAL', retention: 'P364D' }, float: { chain: 'sui', asset: 'WAL', balance: '?', reserve: '?' }, executeDoor: '/walrus', at } as WalrusQuote)
+        : ({ op: 'walrus', deliverable: false, reason: msg, size, maxBytes: MAX_BODY_BYTES, downstream: { provider: 'lighthouse-x402', amountUsdc: '0', amount: '0', asset: 'USDC', retention: 'P365D' }, float: { chain: 'base', asset: 'USDC', balance: '?', reserve: '?' }, executeDoor: '/walrus', at } as WalrusQuote);
+    }
+  };
+  if (w.mode === 'native' || (w.mode === 'auto' && !w.lighthouse)) return { which: 'native', quote: await tryQuote('native') };
+  if (w.mode === 'lighthouse' || !w.native) return { which: 'lighthouse', quote: await tryQuote('lighthouse') };
+  const n = await tryQuote('native');
+  if (n.deliverable) return { which: 'native', quote: n };
+  const l = await tryQuote('lighthouse');
+  return { which: 'lighthouse', quote: { ...l, alternative: { provider: 'walrus-native', reason: n.reason ?? 'not deliverable' } } };
+}
+
+function walrusDoor(w: Writers, ledger: Ledger | undefined) {
   return async (req: IncomingMessage, res: ServerResponse) => {
     const job = await openJob(req, res, 'walrus');
     if (!job) return;
     const { event, meta } = job;
-    const b64 = inputOf(event, 'blob');
-    if (!b64) return refuse(res, 422, 'F00', "Missing input: ['i', <base64>, 'blob']");
-    let bytes: Uint8Array;
-    try {
-      bytes = new Uint8Array(Buffer.from(b64, 'base64'));
-    } catch {
-      return refuse(res, 422, 'F00', 'blob input is not base64');
-    }
-    if (bytes.length === 0) return refuse(res, 422, 'F00', 'blob is empty');
+    const bytes = blobOf(event, res);
+    if (!bytes) return;
     const fileName = paramOf(event, 'name') ?? `${sha256Hex(bytes).slice(0, 12)}.bin`;
     const t0 = Date.now();
+    let which: 'lighthouse' | 'native' = w.mode === 'native' ? 'native' : 'lighthouse';
     try {
-      const receipt = await uploader.upload(bytes, fileName);
+      const pick = await chooseWalrus(w, bytes.length);
+      which = pick.which;
+      if (!pick.quote.deliverable) throw new Error(`${which} would not go through: ${pick.quote.reason}`);
+      const receipt = which === 'native' ? await w.native!.uploader.upload(bytes, fileName, (line) => console.log(line)) : await w.lighthouse!.uploader.upload(bytes, fileName);
       const lighthouseId = String(receipt.proof.lighthouseId ?? '');
-      if (lighthouseId) {
+      if (lighthouseId && ledger) {
         ledger.upsert({
           lighthouseId,
           blobId: receipt.id,
@@ -171,30 +278,19 @@ function walrusDoor(uploader: WalrusUploader, ledger: Ledger) {
         });
       }
       console.log(
-        `walrus ok ${bytes.length}B sha=${receipt.sha256.slice(0, 12)} blob=${receipt.id} readback=${receipt.proof.readback ?? '?'} ` +
+        `walrus ok ${bytes.length}B via ${receipt.provider} sha=${receipt.sha256.slice(0, 12)} blob=${receipt.id}${receipt.proof.objectId ? ` object=${receipt.proof.objectId}` : ''} readback=${receipt.proof.readback ?? '?'} ` +
           `payer=${meta.payer ?? '-'} amount=${meta.amount ?? '-'} chain=${meta.chain ?? '-'} ${Date.now() - t0}ms`,
       );
       return acceptReceipt(res, receipt, meta);
     } catch (e) {
       const msg = (e as Error).message;
-      console.log(`walrus REJECT ${bytes.length}B payer=${meta.payer ?? '-'} ${Date.now() - t0}ms: ${msg}`);
+      console.log(`walrus REJECT ${bytes.length}B via ${which} payer=${meta.payer ?? '-'} ${Date.now() - t0}ms: ${msg}`);
       return refuse(res, 502, 'T00', `walrus leg failed, nothing charged downstream: ${msg}`);
     }
   };
 }
 
-/** The Base key's USDC balance, cached: one read per FLOAT_CACHE_MS however many quotes arrive. */
-function walrusFloat(evmKey: `0x${string}`) {
-  const account = privateKeyToAccount(evmKey);
-  const client = createPublicClient({ chain: base, transport: viemHttp(BASE_RPC) });
-  const read = cached(FLOAT_CACHE_MS, async () => {
-    const raw = await client.readContract({ address: BASE_USDC, abi: erc20Abi, functionName: 'balanceOf', args: [account.address] });
-    return formatUnits(raw, 6);
-  });
-  return { address: account.address, read };
-}
-
-function walrusQuoteDoor(uploader: WalrusUploader, float: ReturnType<typeof walrusFloat>) {
+function walrusQuoteDoor(w: Writers) {
   return async (req: IncomingMessage, res: ServerResponse) => {
     const job = await openJob(req, res, 'walrus', 'quote');
     if (!job) return;
@@ -205,20 +301,8 @@ function walrusQuoteDoor(uploader: WalrusUploader, float: ReturnType<typeof walr
     if (!Number.isInteger(size) || size < 0) return refuse(res, 422, 'F00', 'param size (bytes) or a blob input is required');
     const t0 = Date.now();
     try {
-      const [price, balance] = await Promise.all([uploader.quote(Math.max(size, 1)), float.read()]);
-      const d = decideWalrus({ size, maxBytes: MAX_BODY_BYTES, priceUsdc: price.amountUsdc, balanceUsdc: balance, reserveMultiple: WALRUS_RESERVE_MULTIPLE });
-      const quote: WalrusQuote = {
-        op: 'walrus',
-        deliverable: d.deliverable,
-        ...(d.reason ? { reason: d.reason } : {}),
-        size,
-        maxBytes: MAX_BODY_BYTES,
-        downstream: { provider: 'lighthouse-x402', amountUsdc: price.amountUsdc, retention: 'P365D' },
-        float: { chain: 'base', asset: 'USDC', balance, reserve: d.reserveUsdc },
-        executeDoor: '/walrus',
-        at: Math.floor(Date.now() / 1000),
-      };
-      console.log(`walrus quote ${size}B deliverable=${d.deliverable} downstream=${price.amountUsdc} float=${balance} payer=${meta.payer ?? '-'} ${Date.now() - t0}ms${d.reason ? `: ${d.reason}` : ''}`);
+      const { which, quote } = await chooseWalrus(w, size);
+      console.log(`walrus quote ${size}B via ${which} deliverable=${quote.deliverable} downstream=${quote.downstream.amount} ${quote.downstream.asset} float=${quote.float.balance} ${quote.float.asset}${quote.float.sui ? ` sui=${quote.float.sui}` : ''} payer=${meta.payer ?? '-'} ${Date.now() - t0}ms${quote.reason ? `: ${quote.reason}` : ''}${quote.alternative ? ` (native: ${quote.alternative.reason})` : ''}`);
       return acceptReceipt(res, quote, meta);
     } catch (e) {
       const msg = (e as Error).message;
@@ -233,10 +317,8 @@ function ipfsDoor(uploader: IpfsUploader) {
     const job = await openJob(req, res, 'ipfs');
     if (!job) return;
     const { event, meta } = job;
-    const b64 = inputOf(event, 'blob');
-    if (!b64) return refuse(res, 422, 'F00', "input ['i', base64, 'blob'] is required");
-    const bytes = Buffer.from(b64, 'base64');
-    if (bytes.length === 0) return refuse(res, 422, 'F00', 'blob is empty');
+    const bytes = blobOf(event, res);
+    if (!bytes) return;
     const fileName = paramOf(event, 'name') ?? `${sha256Hex(bytes).slice(0, 12)}.bin`;
     const t0 = Date.now();
     try {
@@ -523,13 +605,22 @@ async function main() {
   const floatReaders: Array<() => Promise<FloatRow>> = [];
 
   const evmKey = process.env.LADING_EVM_PRIVATE_KEY as `0x${string}` | undefined;
+  const suiKey = process.env.LADING_SUI_SECRET_KEY;
   let ledger: Ledger | undefined;
-  if (evmKey) {
-    const uploader = lighthouseUploader(evmKey);
-    const float = walrusFloat(evmKey);
+  const writers: Writers = { mode: WALRUS_PROVIDER };
+  if (evmKey) writers.lighthouse = { uploader: lighthouseUploader(evmKey), float: walrusFloat(evmKey) };
+  if (suiKey) {
+    const uploader = nativeWalrusUploader({ suiSecretKey: suiKey });
+    writers.native = { uploader, floats: cached(FLOAT_CACHE_MS, () => uploader.floats()) };
+    console.log(`walrus native writer: sui ${uploader.address}, ${uploader.epochs} epochs per write, relay ${WALRUS_UPLOAD_RELAY}`);
+  }
+  if ((writers.mode === 'native' && !writers.native) || (writers.mode === 'lighthouse' && !writers.lighthouse)) {
+    throw new Error(`LADING_WALRUS_PROVIDER=${writers.mode} but its key is not set (${writers.mode === 'native' ? 'LADING_SUI_SECRET_KEY' : 'LADING_EVM_PRIVATE_KEY'})`);
+  }
+  if (writers.lighthouse) {
+    const { uploader, float } = writers.lighthouse;
     ledger = openLedger(DATA_DIR);
     console.log(ledger.path ? `walrus ledger ${ledger.path}: ${ledger.list().length} records` : 'LADING_DATA_DIR unset: the walrus ledger is in memory only');
-    doors['/walrus'] = walrusDoor(uploader, ledger);
     floatReaders.push(async () =>
       judge({
         name: 'walrus-float',
@@ -542,7 +633,6 @@ async function main() {
         fund: `Send USDC on Base to ${float.address}.`,
       }),
     );
-    doors['/walrus/quote'] = walrusQuoteDoor(uploader, float);
     doors['/walrus/renew'] = walrusRenewDoor(uploader, ledger);
     doors['/walrus/renew/quote'] = walrusRenewQuoteDoor(uploader, float, ledger);
     describeDoors.walrusRenewQuote = {
@@ -557,27 +647,69 @@ async function main() {
       provider: 'lighthouse-x402',
       extends: 'P365D',
       renewer: uploader.address,
-      note: 'Lighthouse lets only the paying wallet renew; that is this address for every record sold through /walrus',
+      note: 'Lighthouse lets only the paying wallet renew; that is this address for every record sold through /walrus while Lighthouse wrote it. Native records (proof.objectId) are extended on Sui, not here.',
       input: 'params op=walrus-renew, lighthouseId or blobId',
     };
+  }
+  if (writers.native) {
+    const { uploader, floats } = writers.native;
+    floatReaders.push(async () => {
+      const f = await floats();
+      return judge({
+        name: 'walrus-wal',
+        role: `WAL for native Walrus writes (about ${'0.15'} WAL per object for ${uploader.epochs} epochs, billed on the encoded size)`,
+        chain: 'sui',
+        asset: 'WAL',
+        address: uploader.address,
+        balance: f.wal,
+        low: WALRUS_LOW_WAL,
+        fund: `Send WAL on Sui to ${uploader.address}.`,
+        extra: { epochsPerWrite: uploader.epochs },
+      });
+    });
+    floatReaders.push(async () => {
+      const f = await floats();
+      return judge({
+        name: 'walrus-sui',
+        role: `SUI for the upload relay tip and register/certify gas (about ${SUI_PER_WRITE} SUI set aside per write)`,
+        chain: 'sui',
+        asset: 'SUI',
+        address: uploader.address,
+        balance: f.sui,
+        low: WALRUS_LOW_SUI,
+        fund: `Send SUI to ${uploader.address}.`,
+      });
+    });
+  }
+  if (writers.lighthouse || writers.native) {
+    doors['/walrus'] = walrusDoor(writers, ledger);
+    doors['/walrus/quote'] = walrusQuoteDoor(writers);
     describeDoors.walrusQuote = {
       path: '/walrus/quote',
-      answers: 'WalrusQuote: deliverable, downstream USDC price, float',
+      answers: 'WalrusQuote: deliverable, which writer (downstream.provider), downstream price in that writer\'s asset, float',
       input: 'params op=walrus, phase=quote, size (bytes); or the blob itself',
-      floatAddress: float.address,
+      ...(writers.lighthouse ? { floatAddress: writers.lighthouse.float.address } : {}),
+      ...(writers.native ? { suiAddress: writers.native.uploader.address } : {}),
     };
     describeDoors.walrus = {
       path: '/walrus',
       network: 'walrus',
-      provider: 'lighthouse-x402',
-      endpoint: LIGHTHOUSE_X402,
+      mode: writers.mode,
+      providers: [...(writers.native ? ['walrus-native'] : []), ...(writers.lighthouse ? ['lighthouse-x402'] : [])],
+      ...(writers.lighthouse ? { endpoint: LIGHTHOUSE_X402 } : {}),
+      ...(writers.native ? { relay: WALRUS_UPLOAD_RELAY, epochs: writers.native.uploader.epochs } : {}),
       aggregator: WALRUS_AGGREGATOR,
-      retention: 'P365D',
+      retention: writers.native ? `P${writers.native.uploader.epochs * 14}D (native) / P365D (lighthouse)` : 'P365D',
       maxBytes: MAX_BODY_BYTES,
       input: "['i', base64, 'blob'], optional param name",
     };
+  } else {
+    console.log('LADING_EVM_PRIVATE_KEY and LADING_SUI_SECRET_KEY unset: the walrus door is OFF');
+  }
+  if (writers.lighthouse) {
+    const { float } = writers.lighthouse;
     if (process.env.LADING_IPFS !== 'off') {
-      const pinner = pinataUploader(evmKey);
+      const pinner = pinataUploader(evmKey!);
       doors['/ipfs'] = ipfsDoor(pinner);
       doors['/ipfs/quote'] = ipfsQuoteDoor(pinner, float);
       describeDoors.ipfsQuote = {
@@ -600,7 +732,7 @@ async function main() {
       console.log('LADING_IPFS=off: the ipfs door is OFF');
     }
   } else {
-    console.log('LADING_EVM_PRIVATE_KEY unset: the walrus and ipfs doors are OFF');
+    console.log('LADING_EVM_PRIVATE_KEY unset: the ipfs door is OFF');
   }
 
   const filecoinKey = process.env.LADING_FILECOIN_PRIVATE_KEY as `0x${string}` | undefined;

@@ -17,8 +17,16 @@ export interface WalrusQuote {
   reason?: string;
   size: number;
   maxBytes: number;
-  downstream: { provider: 'lighthouse-x402'; amountUsdc: string; retention: 'P365D' };
-  float: { chain: 'base'; asset: 'USDC'; balance: string; reserve: string };
+  /**
+   * Which door would run the leg and what it costs downstream, in the float's
+   * own asset: USDC on Base for Lighthouse (`amountUsdc`, kept for older
+   * readers), WAL on Sui for the native writer (`amount` + `asset`, plus the
+   * epochs bought and the SUI set aside for gas and the relay tip).
+   */
+  downstream: { provider: 'lighthouse-x402' | 'walrus-native'; amountUsdc: string; amount: string; asset: 'USDC' | 'WAL'; retention: string; epochs?: number; suiPerWrite?: string };
+  float: { chain: 'base' | 'sui'; asset: 'USDC' | 'WAL'; balance: string; reserve: string; sui?: string };
+  /** In `auto` mode, why the other provider was not chosen. */
+  alternative?: { provider: 'lighthouse-x402' | 'walrus-native'; reason: string };
   executeDoor: '/walrus';
   at: number;
 }
@@ -115,6 +123,31 @@ export function decideWalrus(input: {
     };
   }
   return { deliverable: true, reserveUsdc };
+}
+
+/**
+ * A native Walrus write goes through when the object fits the packet cap, the
+ * Sui key holds the WAL cost with the same reserve multiple Lighthouse gets,
+ * and enough SUI for the relay tip plus register and certify gas.
+ */
+export function decideWalrusNative(input: {
+  size: number;
+  maxBytes: number;
+  costFrost: bigint;
+  walFrost: bigint;
+  suiMist: bigint;
+  suiPerWriteMist: bigint;
+  reserveMultiple?: number;
+}): { deliverable: boolean; reason?: string; reserveWal: string } {
+  const mult = BigInt(input.reserveMultiple ?? 2);
+  const reserve = input.costFrost * mult;
+  const nine = (u: bigint) => `${u / 1_000_000_000n}.${(u % 1_000_000_000n).toString().padStart(9, '0')}`;
+  const reserveWal = nine(reserve);
+  if (input.size <= 0) return { deliverable: false, reason: 'object is empty', reserveWal };
+  if (input.size > input.maxBytes) return { deliverable: false, reason: `object is ${input.size} bytes, over the ${input.maxBytes}-byte cap`, reserveWal };
+  if (input.walFrost < reserve) return { deliverable: false, reason: `walrus WAL float ${nine(input.walFrost)} on Sui is under the ${reserveWal} WAL reserve for a ${nine(input.costFrost)} WAL write`, reserveWal };
+  if (input.suiMist < input.suiPerWriteMist) return { deliverable: false, reason: `walrus SUI float ${nine(input.suiMist)} is under the ${nine(input.suiPerWriteMist)} SUI one write needs for gas and the relay tip`, reserveWal };
+  return { deliverable: true, reserveWal };
 }
 
 /**

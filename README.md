@@ -11,7 +11,7 @@ archived on several storage networks, paying per object per network, and
 each leg hands back the network's own identifier and proof. Every copy is
 then listed in a signed manifest that lives on Arweave under an ArNS name.
 
-Status: v0.10.0, Arweave, Walrus, Filecoin and IPFS legs, ArNS naming, relay copy,
+Status: v0.11.0, Arweave, Walrus, Filecoin and IPFS legs, ArNS naming, relay copy,
 a quote door in front of each broker leg, objects over one packet travelling
 as parts, Walrus renewals, and a hosted x402 gate with an MCP shim so Claude
 can archive through it. Runs against Drew's mainnet node today.
@@ -233,6 +233,7 @@ src/gate.ts      the hosted door: express + x402 (USDC on Base, PayAI facilitato
 src/gate-price.ts what the door charges for a TOON bill: margin and floor, pure
 src/mcp.ts       the MCP shim Claude runs locally: pays the gate per tool call with LADING_X402_KEY
 src/walrus.ts    Lighthouse x402 upload (USDC on Base), blobId lookup, aggregator read-back
+src/walrus-native.ts  native Walrus writer: Sui key, WAL + SUI, Mysten upload relay, aggregator read-back
 src/filecoin.ts  Filecoin Onchain Cloud upload (Synapse SDK, USDFC in Filecoin Pay), provider read-back
 src/ipfs.ts      Pinata x402 pin (USDC on Base), read-back from the pinner's gateway and one it does not run
 src/filecoin-fund.ts  operator tool: deposit USDFC and approve warm storage, once
@@ -292,9 +293,28 @@ buys one more year per record through `g.drew.lading.walrus.renew` (flat
 current paid-through date, the float). The blob and its id do not change, so
 the manifest stands; the renewal is appended to the payer's saved file and to
 the broker's ledger (`LADING_DATA_DIR/walrus-ledger.jsonl`, one JSON line per
-change, `GET /walrus/ledger` for the operator's view). A native Walrus leg
-(own publisher, SUI plus WAL) would return the Sui blob object and certified
-epoch directly and is the v2 path.
+change, `GET /walrus/ledger` for the operator's view).
+
+The native Walrus writer (`src/walrus-native.ts`) is the other way to run the
+same `/walrus` door: this broker's own Sui key (`LADING_SUI_SECRET_KEY`, a
+`suiprivkey…` string) pays WAL for storage and SUI for gas, writes through
+Mysten's upload relay (`upload-relay.mainnet.walrus.space`, a SUI tip of 40
+MIST per encoded KiB; there is no public mainnet publisher and Mysten says
+there will be none), and gets the certified blob object back from the chain.
+26 two-week epochs (364 days, `LADING_WALRUS_EPOCHS`) cost about 0.15 WAL per
+object whatever its size up to the cap, because Walrus bills on the encoded
+size (about 63 MiB of fixed overhead); the quote door reads the live price from
+the system object. The receipt records the blob id, the blob OBJECT id (what
+an extension needs), start and end epoch, and the aggregator read-back. Blobs
+are written permanent (not deletable). `LADING_WALRUS_PROVIDER` picks
+`lighthouse`, `native`, or `auto` (the default once the Sui key is set):
+native when its WAL and SUI floats cover the write, Lighthouse otherwise, and
+the quote names which (`downstream.provider`, `downstream.amount` in that
+writer's asset, `alternative` with the other writer's reason). Float rows
+`walrus-wal` (low under `LADING_WALRUS_LOW_WAL`, 0.5) and `walrus-sui` (low
+under `LADING_WALRUS_LOW_SUI`, 0.05) join `GET /floats`. Native records are
+not in the Lighthouse ledger and `lading renew` does not extend them yet; the
+object id in the proof is what a later `extendBlob` door will take.
 
 Filecoin Onchain Cloud is pay-per-epoch out of a USDFC deposit in Filecoin
 Pay, with one data set per copy per provider (two copies by default). The

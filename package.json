@@ -1,6 +1,6 @@
 {
   "name": "lading",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Archive broker for agents on TOON. One channel, several storage networks (Arweave, Walrus, Filecoin), every leg answers with the network's own receipt or buys nothing, and a signed bill of lading named on ArNS. Hosted behind an x402 door with an MCP shim for Claude.",
   "type": "module",
   "license": "MIT",
@@ -26,6 +26,8 @@
     "@ar.io/sdk": "^4.1.4",
     "@filoz/synapse-sdk": "^2.0.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "@mysten/sui": "^2.29.0",
+    "@mysten/walrus": "^1.2.23",
     "@solana/kit": "^2.1.0",
     "@toon-protocol/client": "^2.1.1",
     "@x402/core": "^2.25.0",

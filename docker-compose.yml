@@ -10,7 +10,11 @@ services:
     environment:
       PORT: '3600'
       MAX_BODY_BYTES: '3145728'
-      LADING_EVM_PRIVATE_KEY: ${LADING_EVM_PRIVATE_KEY}        # Base key holding USDC; pays Lighthouse per upload
+      LADING_EVM_PRIVATE_KEY: ${LADING_EVM_PRIVATE_KEY}        # Base key holding USDC; pays Lighthouse per Walrus upload and Pinata per IPFS pin
+      LADING_SUI_SECRET_KEY: ${LADING_SUI_SECRET_KEY:-}         # suiprivkey… holding WAL + SUI; the native Walrus writer, OFF when unset
+      LADING_WALRUS_PROVIDER: ${LADING_WALRUS_PROVIDER:-}       # lighthouse | native | auto (default: auto when the Sui key is set)
+      LADING_WALRUS_EPOCHS: ${LADING_WALRUS_EPOCHS:-26}         # two-week epochs per native write; 26 = 364 days
+      LADING_IPFS: ${LADING_IPFS:-}                             # off to disable the Pinata door
       LADING_FILECOIN_PRIVATE_KEY: ${LADING_FILECOIN_PRIVATE_KEY:-}   # Filecoin key with USDFC deposited in Filecoin Pay (npm run fund:filecoin); door OFF when unset
       LADING_FILECOIN_CHAIN: ${LADING_FILECOIN_CHAIN:-mainnet}
       LADING_FILECOIN_COPIES: ${LADING_FILECOIN_COPIES:-2}

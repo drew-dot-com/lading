@@ -110,12 +110,30 @@ export function optionsFromEnv(overrides: Partial<LadingOptions> = {}): LadingOp
 
 export const sha256 = (b: Uint8Array) => createHash('sha256').update(b).digest('hex');
 
+/** Packet expiry for a Filecoin leg job. The edge accepted 600 s and 900 s expiries on 2026-09-08. */
+export const FILECOIN_JOB_TIMEOUT_MS = Number(process.env.LADING_FILECOIN_JOB_TIMEOUT_MS ?? 600_000);
+
 /** USDC/USDFC decimal strings compared in micro-units, as quote.ts does. */
 export const micro = (v: string): bigint => {
   const [i, f = ''] = v.split('.');
   return BigInt(i || '0') * 1_000_000n + BigInt((f + '000000').slice(0, 6));
 };
 const timesMicro = (v: string, n: number) => (Number(micro(v) * BigInt(n)) / 1e6).toFixed(6);
+/** Decimal strings in 18 places, for amounts in any asset (USDC has 6, WAL and SUI 9). */
+const atto = (v: string): bigint => {
+  const [i, f = ''] = v.trim().split('.');
+  return BigInt(i || '0') * 10n ** 18n + BigInt((f + '0'.repeat(18)).slice(0, 18));
+};
+const timesDecimal = (v: string, n: number) => {
+  const u = atto(v) * BigInt(n);
+  return `${u / 10n ** 18n}.${(u % 10n ** 18n).toString().padStart(18, '0')}`.replace(/(\.\d*?[1-9])0+$|\.0+$/, '$1');
+};
+/** What a walrus quote says the write costs downstream, in the float's asset: `amount`/`asset` when the door sent them, else the Lighthouse USDC. */
+const walrusNeed = (q: WalrusQuote, n: number) => {
+  const asset = q.downstream.asset ?? 'USDC';
+  const amount = q.downstream.amount ?? q.downstream.amountUsdc;
+  return { asset, need: timesDecimal(amount, n), short: q.deliverable && n > 1 && atto(q.float.balance) < atto(amount) * BigInt(n) };
+};
 
 export type Paid<T> = { receipt: T; route: string; price: bigint | null };
 export type Network = 'arweave' | 'walrus' | 'filecoin' | 'ipfs';
@@ -619,7 +637,8 @@ export class Lading {
     // Filecoin Onchain Cloud, through Lading's door. Lading FULFILLs on the PieceCID once the provider committed the piece and served it back.
     return {
       send: async (part, pname) => {
-        const r = await this.job<FilecoinReceipt>(R.filecoin, blobEvent(LEG_KIND, { op: 'filecoin', name: pname || o.name }, part) as never, 300_000);
+        // A provider commit can take five minutes on a slow day (313 s seen 2026-09-08); the edge abandons a packet at its expiry and the broker's spend is then for nothing, so give it ten.
+        const r = await this.job<FilecoinReceipt>(R.filecoin, blobEvent(LEG_KIND, { op: 'filecoin', name: pname || o.name }, part) as never, FILECOIN_JOB_TIMEOUT_MS);
         return { id: r.receipt.id, sha256: r.receipt.sha256, proof: r.receipt.proof, retention: r.receipt.retention, provider: r.receipt.provider, route: r.route, price: r.price };
       },
       line: (out) => `${out.id}  dataSet=${out.proof?.dataSetId} copies=${out.proof?.copies} readback=${out.proof?.readback}`,
@@ -736,10 +755,9 @@ export class Lading {
       if (o.quote && n > 0) {
         const q = await this.quoteWalrus(largest, o.name);
         paid.push({ leg: 'walrus-quote', route: q.route, price: q.price });
-        const need = timesMicro(q.receipt.downstream.amountUsdc, n);
-        const short = q.receipt.deliverable && n > 1 && micro(q.receipt.float.balance) < micro(need);
-        this.log(`walrus   quote ${fmtQuote(q.receipt)}${n > 1 ? `, ${n} parts need ${need} USDC` : ''}  (${Date.now() - t0} ms)`);
-        if (!q.receipt.deliverable || short) throw new Error(`walrus leg would not go through; nothing paid for it. Re-run with --skip-walrus to archive without it. (${short ? `float ${q.receipt.float.balance} USDC is under the ${need} USDC that ${n} parts cost` : q.receipt.reason})`);
+        const { asset, need, short } = walrusNeed(q.receipt, n);
+        this.log(`walrus   quote ${fmtQuote(q.receipt)}${n > 1 ? `, ${n} parts need ${need} ${asset}` : ''}  (${Date.now() - t0} ms)`);
+        if (!q.receipt.deliverable || short) throw new Error(`walrus leg would not go through; nothing paid for it. Re-run with --skip-walrus to archive without it. (${short ? `float ${q.receipt.float.balance} ${asset} is under the ${need} ${asset} that ${n} parts cost` : q.receipt.reason})`);
       }
       await this.buyParts({ ...common, network: 'walrus' });
     }
@@ -1274,10 +1292,9 @@ export class Lading {
     const rows: QuoteRow[] = [];
     rows.push(row('arweave'));
     const wq = await this.quoteWalrus(largest, o.name);
-    const wNeed = timesMicro(wq.receipt.downstream.amountUsdc, n);
-    const wShort = wq.receipt.deliverable && n > 1 && micro(wq.receipt.float.balance) < micro(wNeed);
+    const { asset: wAsset, need: wNeed, short: wShort } = walrusNeed(wq.receipt, n);
     const wGo = wq.receipt.deliverable && !wShort;
-    rows.push({ leg: 'walrus-quote', route: wq.route, price: wq.price, note: fmtQuote(wq.receipt) + (n > 1 ? `, ${n} parts need ${wNeed} USDC${wShort ? ' (SHORT)' : ''}` : '') });
+    rows.push({ leg: 'walrus-quote', route: wq.route, price: wq.price, note: fmtQuote(wq.receipt) + (n > 1 ? `, ${n} parts need ${wNeed} ${wAsset}${wShort ? ' (SHORT)' : ''}` : '') });
     rows.push({ leg: 'walrus', route: R.walrus, price: wGo ? row('walrus').price : 0n, note: wGo ? row('walrus').note : 'would not be paid' });
     const fq = await this.quoteFilecoin(largest, o.name);
     const fNeed = timesMicro(fq.receipt.downstream.addPieceFeeUsdfc, n);
@@ -1312,7 +1329,13 @@ export const fmtRenewQuote = (q: WalrusRenewQuote) =>
 export const fmtQuote = (q: WalrusQuote | FilecoinQuote | IpfsQuote | NameQuote) => {
   const head = q.deliverable ? 'deliverable' : 'NOT deliverable';
   const tail = q.reason ? `: ${q.reason}` : '';
-  if (q.op === 'walrus' || q.op === 'ipfs') return `${head}, downstream ${q.downstream.amountUsdc} USDC, float ${q.float.balance} USDC on Base${tail}`;
+  if (q.op === 'walrus') {
+    const asset = q.downstream.asset ?? 'USDC';
+    const amount = q.downstream.amount ?? q.downstream.amountUsdc;
+    const chain = q.float.chain === 'sui' ? 'Sui' : 'Base';
+    return `${head} via ${q.downstream.provider}, downstream ${amount} ${asset}${q.downstream.epochs ? ` for ${q.downstream.epochs} epochs` : ''}, float ${q.float.balance} ${q.float.asset} on ${chain}${q.float.sui ? ` (+ ${q.float.sui} SUI)` : ''}${tail}${q.alternative ? ` [native: ${q.alternative.reason}]` : ''}`;
+  }
+  if (q.op === 'ipfs') return `${head}, downstream ${q.downstream.amountUsdc} USDC, float ${q.float.balance} USDC on Base${tail}`;
   if (q.op === 'filecoin') return `${head}, add-piece fee ${q.downstream.addPieceFeeUsdfc} USDFC for ${q.copies} copies, float ${q.float.available} USDFC, runway ${/^\d+$/.test(q.float.runwayDays) ? `${q.float.runwayDays}d` : q.float.runwayDays}${tail}`;
   return `${head}, ${q.name}, float ${(Number(q.float.lamports) / 1e9).toFixed(4)} SOL${tail}`;
 };
