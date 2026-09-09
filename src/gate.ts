@@ -59,7 +59,7 @@ import { judge, lamportsToSol, microToDecimal, report, solanaHoldings, type Floa
 import { cached } from './quote.js';
 import { DEFAULT_PART_BYTES, planParts } from './parts.js';
 import { gatePriceMicro, gatePriceUsdc, microToUsdc, pricingFromEnv, usdcToMicro, walrusDurationSurcharge } from './gate-price.js';
-import { ChoiceError, choicesBlock, defaultChoices, describeChoices, parseChoices, skipFor, type Choices } from './choices.js';
+import { ChoiceError, choicesBlock, defaultChoices, describeChoices, parseChoices, skipFor, type Choices, type SkipMap } from './choices.js';
 
 import { VERSION } from './version.js';
 import { installLongFetch } from './long-fetch.js';
@@ -244,14 +244,16 @@ function declaredSha(raw: string | undefined): string | undefined {
 /** The choices on a request, from headers (paid doors), the query (free quotes) or a JSON body (assemble). A bad choice is a 400. */
 function choicesOf(get: (name: string) => unknown): Choices {
   try {
-    return parseChoices({ networks: get('networks'), walrusEpochs: get('walrusEpochs') });
+    return parseChoices({ networks: get('networks'), walrusEpochs: get('walrusEpochs'), arns: get('arns') });
   } catch (e) {
     if (e instanceof ChoiceError) throw new HttpError(400, e.message);
     throw e;
   }
 }
-const choicesFromHeaders = (get: (h: string) => string | undefined) => choicesOf((k) => (k === 'networks' ? get('x-networks') : get('x-walrus-epochs')) || undefined);
-const choicesFromQuery = (q: Record<string, unknown>) => choicesOf((k) => (k === 'networks' ? q.networks : q['walrus-epochs']));
+const HEADER_OF: Record<string, string> = { networks: 'x-networks', walrusEpochs: 'x-walrus-epochs', arns: 'x-arns' };
+const QUERY_OF: Record<string, string> = { networks: 'networks', walrusEpochs: 'walrus-epochs', arns: 'arns' };
+const choicesFromHeaders = (get: (h: string) => string | undefined) => choicesOf((k) => get(HEADER_OF[k]) || undefined);
+const choicesFromQuery = (q: Record<string, unknown>) => choicesOf((k) => q[QUERY_OF[k]]);
 
 /** The door price for a bill with the choices applied: the TOON units plus the duration surcharge, then margin and floor. */
 function priceWithChoices(est: Estimate, c: Choices): { units: bigint; surcharge: bigint; price: bigint } {
@@ -284,7 +286,7 @@ async function quotePut(size: number, partBytes: number, sha?: string, choices: 
       price: { usdc: floorUsdc(), network: NETWORK, payTo: PAY_TO ?? null, margin: pricing.margin, floorUsdc: pricing.floorUsdc },
     };
   }
-  const est: Estimate = await lading.estimate(size, partBytes, choices.networks);
+  const est: Estimate = await lading.estimate(size, partBytes, choices.networks, !!choices.arns);
   if (est.unpriced.length) throw new HttpError(503, `edge did not price ${est.unpriced.join(', ')}`);
   const { surcharge, price } = priceWithChoices(est, choices);
   return {
@@ -335,11 +337,11 @@ async function quotePart(size: number, known: boolean, choices: Choices = defaul
   return { size, reused: false, toon: toonBlock(est), price: priceBlock(doorPrice(est, 'part', choices)) };
 }
 
-/** The finish of an object in `n` parts: relay copy, manifest, name. Already archived: the floor. */
-async function quoteFinish(n: number, sha?: string) {
+/** The finish of an object in `n` parts: relay copy, manifest, and with `arns` the page and name. Already archived: the floor. */
+async function quoteFinish(n: number, sha?: string, choices: Choices = defaultChoices()) {
   if (!Number.isInteger(n) || n <= 0) throw new HttpError(400, 'part count must be a positive integer');
   if (sha && lading.archived(sha)) return { parts: n, reused: true, toon: { units: '0', usdc: microToUsdc(0n), rows: [] }, price: priceBlock(floorUsdc()) };
-  const est = await lading.estimateFinish(n);
+  const est = await lading.estimateFinish(n, !!choices.arns);
   return { parts: n, reused: false, toon: toonBlock(est), price: priceBlock(doorPrice(est, 'finish')) };
 }
 
@@ -357,7 +359,7 @@ async function quoteParts(size: number, partBytes: number, sha?: string, choices
     parts.push({ index: p.index, size: p.size, reused: q.reused, price: q.price.usdc, toonUnits: q.toon.units });
     total += usdcToMicro(q.price.usdc);
   }
-  const finish = await quoteFinish(plan.length, sha);
+  const finish = await quoteFinish(plan.length, sha, choices);
   total += usdcToMicro(finish.price.usdc);
   return {
     size,
@@ -469,7 +471,7 @@ if (!FREE) {
               return q.price.usdc;
             },
           },
-          description: 'Lading put: the bytes onto Arweave, Walrus, Filecoin and IPFS (or the networks in x-networks, with x-walrus-epochs as the Walrus period), a signed bill of lading on Arweave, named on ArNS. Priced on content-length and the choices; a declared x-sha256 this gate already archived is answered from the record at the floor price.',
+          description: 'Lading put: the bytes onto Arweave, Walrus, Filecoin and IPFS (or the networks in x-networks, with x-walrus-epochs as the Walrus period), a signed bill of lading on Arweave; with x-arns: true also a public page and an ArNS name. Priced on content-length and the choices; a declared x-sha256 this gate already archived is answered from the record at the floor price.',
           mimeType: 'application/json',
           serviceName: 'lading',
         },
@@ -695,7 +697,7 @@ app.post('/v1/put', express.raw({ type: () => true, limit: MAX_BODY_BYTES }), as
       });
     }
     const quoted = await quotePut(bytes.length, partBytes, declared, choices);
-    log(`put ${sha.slice(0, 12)} ${bytes.length} B "${name}" payer=${payer ?? (FREE ? 'free' : '?')} price=${quoted.price.usdc} USDC toon=${quoted.toon.units} networks=${choices.networks.join('+')}${choices.walrusEpochs ? ` walrus-epochs=${choices.walrusEpochs}` : ''}${prior ? ' (already archived: reuse)' : ''}`);
+    log(`put ${sha.slice(0, 12)} ${bytes.length} B "${name}" payer=${payer ?? (FREE ? 'free' : '?')} price=${quoted.price.usdc} USDC toon=${quoted.toon.units} networks=${choices.networks.join('+')}${choices.walrusEpochs ? ` walrus-epochs=${choices.walrusEpochs}` : ''}${choices.arns ? ' arns' : ''}${prior ? ' (already archived: reuse)' : ''}`);
     const r = await serialize(() =>
       lading.put(bytes, {
         name,
@@ -741,7 +743,7 @@ app.post('/v1/parts', express.raw({ type: () => true, limit: MAX_BODY_BYTES }), 
     const choices = choicesFromHeaders((h) => req.get(h) || undefined);
     const known = !!declared && lading.partKnown(sha, index, declared, choices.networks);
     const quoted = await quotePart(bytes.length, known, choices);
-    log(`part ${sha.slice(0, 12)} ${index + 1}/${count} ${bytes.length} B "${name}" payer=${payer ?? (FREE ? 'free' : '?')} price=${quoted.price.usdc} USDC networks=${choices.networks.join('+')}${choices.walrusEpochs ? ` walrus-epochs=${choices.walrusEpochs}` : ''}${known ? ' (already bought: reuse)' : ''}`);
+    log(`part ${sha.slice(0, 12)} ${index + 1}/${count} ${bytes.length} B "${name}" payer=${payer ?? (FREE ? 'free' : '?')} price=${quoted.price.usdc} USDC networks=${choices.networks.join('+')}${choices.walrusEpochs ? ` walrus-epochs=${choices.walrusEpochs}` : ''}${choices.arns ? ' arns' : ''}${known ? ' (already bought: reuse)' : ''}`);
     const r = await serialize(() => lading.putPart(bytes, { sha256: sha, size, index, count, partBytes, partSha256: partSha, name, mime: mime === 'application/octet-stream' ? undefined : mime, skip: skipFor(choices), walrusEpochs: choices.walrusEpochs }));
     log(`part ${sha.slice(0, 12)} ${index + 1}/${count} done: ${Object.keys(r.receipts).join('+') || 'nothing'}${r.missing.length ? ` missing ${r.missing.join(',')}` : ''} paid=${r.total}${r.archived ? ' (object already archived)' : ''}`);
     return res.json({
@@ -780,9 +782,9 @@ app.post('/v1/assemble', express.json({ limit: '16kb' }), async (req, res, next)
     const mime = typeof b.mime === 'string' && b.mime && b.mime !== 'application/octet-stream' ? b.mime : undefined;
     const skipList = Array.isArray(b.skip) ? (b.skip as unknown[]).filter((x): x is 'filecoin' | 'walrus' | 'ipfs' => x === 'filecoin' || x === 'walrus' || x === 'ipfs') : [];
     // A network left out of the choice is skipped like one listed in `skip` (the older field, kept).
-    const skip = { ...skipFor(choices), ...Object.fromEntries(skipList.map((k) => [k, true])) } as Partial<Record<'arweaveObject' | 'filecoin' | 'walrus' | 'ipfs', boolean>>;
+    const skip = { ...skipFor(choices), ...Object.fromEntries(skipList.map((k) => [k, true])) } as SkipMap;
     const payer = payerOf(req);
-    const quoted = await quoteFinish(count, sha);
+    const quoted = await quoteFinish(count, sha, choices);
     log(`assemble ${sha.slice(0, 12)} ${size} B in ${count} parts "${name}" payer=${payer ?? (FREE ? 'free' : '?')} price=${quoted.price.usdc} USDC${skipList.length ? ` skip=${skipList.join(',')}` : ''}`);
     const r = await serialize(() => lading.finish({ sha256: sha, size, count, partBytes, name, mime, skip, via: { door: 'x402', network: NETWORK, ...(payer ? { payer } : {}) } }));
     log(`assemble ${sha.slice(0, 12)} ${r.reused ? 'reused' : 'done'}: ${r.legs.map((l) => l.network).join('+')} manifest=${r.manifestTxId ?? '-'} name=${r.name?.name ?? '-'} paid=${r.reused ? 0 : r.total}`);

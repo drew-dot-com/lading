@@ -273,7 +273,7 @@ export async function runMcp(o: McpOptions) {
         return await paid('/v1/assemble', {
           method: 'POST',
           headers: { 'content-type': 'application/json', 'x-object-sha256': sha, 'x-part-count': String(slices.length) },
-          body: JSON.stringify({ sha256: sha, size: bytes.length, partCount: slices.length, partBytes, name: fileName, mime: contentType, networks: choices.networks, ...(choices.walrusEpochs ? { walrusEpochs: choices.walrusEpochs } : {}), ...(skip.length ? { skip } : {}) }),
+          body: JSON.stringify({ sha256: sha, size: bytes.length, partCount: slices.length, partBytes, name: fileName, mime: contentType, networks: choices.networks, ...(choices.walrusEpochs ? { walrusEpochs: choices.walrusEpochs } : {}), ...(choices.arns ? { arns: true } : {}), ...(skip.length ? { skip } : {}) }),
         });
       } finally {
         stopBeat();
@@ -412,10 +412,11 @@ export async function runMcp(o: McpOptions) {
     },
   );
 
-  /** The two choices every put and quote takes (choices.ts). */
+  /** The three choices every put and quote takes (choices.ts). */
   const choiceSchema = {
-    networks: z.array(z.enum(['arweave', 'walrus', 'filecoin', 'ipfs'])).min(1).optional().describe('which storage networks carry the object (default all four); the bill of lading is on Arweave whatever is chosen'),
+    networks: z.array(z.enum(['arweave', 'walrus', 'filecoin', 'ipfs'])).min(1).optional().describe('which storage networks carry the object (default all four); the signed bill of lading is on Arweave whatever is chosen'),
     walrusEpochs: z.number().int().min(1).max(53).optional().describe('Walrus storage period in two-week epochs, 1..53 (default 26, a year); past 26 the door adds 1/26 of the walrus leg per epoch'),
+    arns: z.boolean().optional().describe('true also publishes a public bill of lading page and names it on ArNS (l-<sha12>_<base>), four more legs on the bill; default false: the signed manifest JSON only. A file the gate already holds gets its name on a later call with arns true'),
   };
 
   server.registerTool(
@@ -425,11 +426,11 @@ export async function runMcp(o: McpOptions) {
       description: 'Free. The USDC price this door charges to archive an object of the given size (or the file at path), with the underlying TOON bill per leg. With a path the file is hashed too, so a file the gate already archived quotes at the floor with reused: true. networks and walrusEpochs price the same choices lading_put takes.',
       inputSchema: { size: z.number().int().positive().optional().describe('object size in bytes'), path: z.string().optional().describe('local file to size and hash instead'), ...choiceSchema },
     },
-    async ({ size, path, networks, walrusEpochs }) => {
+    async ({ size, path, networks, walrusEpochs, arns }) => {
       try {
         const n = path ? statSync(resolve(path)).size : size;
         if (!n) return fail('give size or path');
-        const choices = parseChoices({ networks, walrusEpochs });
+        const choices = parseChoices({ networks, walrusEpochs, arns });
         const sha = path ? `&sha=${sha256Hex(new Uint8Array(readFileSync(resolve(path))))}` : '';
         const facts = await door();
         if (n > facts.maxBodyBytes) return text(await getJson(`/v1/quote/parts?size=${n}&part-bytes=${facts.partBytes}${sha}${choiceQuery(choices)}`));
@@ -470,7 +471,7 @@ export async function runMcp(o: McpOptions) {
     {
       title: 'Archive with Lading',
       description:
-        'PAID (USDC on Base, quoted first, refused over the cap). Archives a local file (path) or a text string onto Arweave, Walrus, Filecoin and IPFS (or only the networks chosen, with walrusEpochs as the Walrus period) through the TOON mesh, writes a signed bill of lading to Arweave and names it on ArNS. Returns every network receipt, the manifest URL and the ArNS name. Idempotent: bytes the gate already archived come back from the existing record and nothing is paid, unless force is true. Objects over the door\'s single-body limit (3 MiB) go as 1 MiB parts, one small payment each plus one for the finish; the cap applies to the whole bill, and a put that dies resumes where it stopped.',
+        'PAID (USDC on Base, quoted first, refused over the cap). Archives a local file (path) or a text string onto Arweave, Walrus, Filecoin and IPFS (or only the networks chosen, with walrusEpochs as the Walrus period) through the TOON mesh and writes a signed bill of lading to Arweave; with arns true it also publishes a public page and names it on ArNS. Returns every network receipt and the manifest URL (and the ArNS name when bought). Idempotent: bytes the gate already archived come back from the existing record and nothing is paid, unless force is true (or arns is true on a record not yet named, which buys the page and the name only). Objects over the door\'s single-body limit (3 MiB) go as 1 MiB parts, one small payment each plus one for the finish; the cap applies to the whole bill, and a put that dies resumes where it stopped.',
       inputSchema: {
         path: z.string().optional().describe('local file to archive'),
         text: z.string().optional().describe('text to archive instead of a file'),
@@ -480,9 +481,9 @@ export async function runMcp(o: McpOptions) {
         ...choiceSchema,
       },
     },
-    async ({ path, text: body, name, mime, force, networks, walrusEpochs }, extra) => {
+    async ({ path, text: body, name, mime, force, networks, walrusEpochs, arns }, extra) => {
       try {
-        const choices = parseChoices({ networks, walrusEpochs });
+        const choices = parseChoices({ networks, walrusEpochs, arns });
         const bytes = inputBytes(path, body);
         const sha = sha256Hex(bytes);
         const fileName = name ?? (path ? basename(path) : 'text.txt');
@@ -500,7 +501,7 @@ export async function runMcp(o: McpOptions) {
           return text(await multipartPut(bytes, sha, fileName, contentType, facts.partBytes, choices, extra as Extra));
         }
         const { usdc } = await guard(`/v1/quote?size=${bytes.length}${force ? '' : `&sha=${sha}`}${choiceQuery(choices)}`, `archiving ${bytes.length} bytes`);
-        log(`put ${fileName} ${bytes.length} B for ${usdc} USDC${force ? ' (forced)' : ''} networks=${choices.networks.join('+')}${choices.walrusEpochs ? ` walrus-epochs=${choices.walrusEpochs}` : ''}`);
+        log(`put ${fileName} ${bytes.length} B for ${usdc} USDC${force ? ' (forced)' : ''} networks=${choices.networks.join('+')}${choices.walrusEpochs ? ` walrus-epochs=${choices.walrusEpochs}` : ''}${choices.arns ? ' arns' : ''}`);
         const r = await paid('/v1/put', {
           method: 'POST',
           headers: {

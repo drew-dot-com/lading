@@ -18,7 +18,10 @@
  *                           name at them (a name from before 0.13 serves bare JSON).
  *                           --networks a,b keeps the object to those networks (the
  *                           bill of lading stays on Arweave); --walrus-epochs n picks
- *                           the Walrus period (1..53 two-week epochs, default 26).
+ *                           the Walrus period (1..53 two-week epochs, default 26);
+ *                           --arns adds the public page and the ArNS name (off by
+ *                           default since 0.17: an agent reads the manifest, and a
+ *                           name spends one of the base name's undername slots).
  *   lading quote <file>     the full bill before paying it: every route's price
  *                           plus each leg's quote (deliverable right now, and
  *                           the downstream cost the broker will carry).
@@ -52,8 +55,8 @@ const opt = (name: string) => {
   const i = process.argv.indexOf(`--${name}`);
   return i === -1 ? undefined : process.argv[i + 1];
 };
-/** --networks a,b and --walrus-epochs n, the door's two choices, on put and quote. */
-const choices = () => parseChoices({ networks: opt('networks'), walrusEpochs: opt('walrus-epochs') });
+/** --networks a,b, --walrus-epochs n and --arns, the door's three choices, on put and quote. */
+const choices = () => parseChoices({ networks: opt('networks'), walrusEpochs: opt('walrus-epochs'), arns: flag('arns') });
 const partBytes = () => {
   const n = Number(opt('part-bytes') ?? DEFAULT_PART_BYTES);
   if (!Number.isInteger(n) || n <= 0) throw new Error(`--part-bytes must be a positive integer, got ${opt('part-bytes')}`);
@@ -74,7 +77,7 @@ async function put(file: string) {
     quote: !flag('no-quote'),
     force: flag('force'),
     walrusEpochs: c.walrusEpochs,
-    skip: { ...skipFor(c), arweave: flag('skip-arweave'), walrus: flag('skip-walrus') || !c.networks.includes('walrus'), filecoin: flag('skip-filecoin') || !c.networks.includes('filecoin'), ipfs: flag('skip-ipfs') || !c.networks.includes('ipfs'), relay: flag('skip-relay'), name: flag('skip-name') },
+    skip: { ...skipFor(c), arweave: flag('skip-arweave'), walrus: flag('skip-walrus') || !c.networks.includes('walrus'), filecoin: flag('skip-filecoin') || !c.networks.includes('filecoin'), ipfs: flag('skip-ipfs') || !c.networks.includes('ipfs'), relay: flag('skip-relay'), name: flag('skip-name') || !c.arns, page: !c.arns },
   });
   console.log(r.reused ? `\nBILL OF LADING (already archived ${new Date(r.archivedAt * 1000).toISOString().slice(0, 10)}, nothing bought; --force archives again)` : '\nBILL OF LADING');
   for (const l of r.legs) console.log(`  ${l.network.padEnd(8)} ${l.id}  ${l.retention}${l.parts ? `  (${l.parts.length} parts)` : ''}`);
@@ -152,7 +155,7 @@ async function describe() {
 async function quote(file: string) {
   const bytes = new Uint8Array(readFileSync(file));
   const c = choices();
-  const q = await lading.quote(bytes, { name: opt('name') ?? basename(file), undername: opt('undername'), partBytes: partBytes(), networks: c.networks, walrusEpochs: c.walrusEpochs });
+  const q = await lading.quote(bytes, { name: opt('name') ?? basename(file), undername: opt('undername'), partBytes: partBytes(), networks: c.networks, walrusEpochs: c.walrusEpochs, arns: c.arns });
   console.log(`\n${file}: ${q.size} bytes, sha256 ${q.sha256}${q.parts > 1 ? `, ${q.parts} parts of up to ${q.largestPart} bytes` : ''}`);
   for (const { leg, route, price, note } of q.rows) console.log(`  ${leg.padEnd(13)} ${route.padEnd(30)} ${String(price ?? '?').padStart(8)}  ${note}`);
   console.log(`  ${'total'.padEnd(13)} ${''.padEnd(30)} ${q.total.toString().padStart(8)}  base units (${(Number(q.total) / 1e6).toFixed(4)} USDC), quotes paid now: ${q.quotesPaid}`);
@@ -182,8 +185,8 @@ const run =
   : null;
 if (!run) {
   console.log(
-    'usage: lading put <file> [--name n] [--mime m] [--undername u] [--part-bytes n] [--networks a,b] [--walrus-epochs n] [--no-quote] [--force] [--skip-arweave|--skip-walrus|--skip-filecoin|--skip-ipfs|--skip-relay|--skip-name]\n' +
-      '       lading quote <file> [--part-bytes n] [--networks a,b] [--walrus-epochs n]   (--networks picks the storage networks, default all four; --walrus-epochs 1..53 the Walrus period, default 26)\n' +
+    'usage: lading put <file> [--name n] [--mime m] [--undername u] [--part-bytes n] [--networks a,b] [--walrus-epochs n] [--arns] [--no-quote] [--force] [--skip-arweave|--skip-walrus|--skip-filecoin|--skip-ipfs|--skip-relay]\n' +
+      '       lading quote <file> [--part-bytes n] [--networks a,b] [--walrus-epochs n] [--arns]   (--networks picks the storage networks, default all four; --walrus-epochs 1..53 the Walrus period, default 26; --arns adds the public page and the ArNS name, off by default)\n' +
       '       lading verify <arns-name|manifest-txid|saved.json>\n' +
       '       lading name <sha256> [--no-quote]\n' +
       '       lading page <sha256|all> [--no-quote] [--force]   (write the bill of lading page + path manifest, point the name at them; --force re-renders an existing page)\n' +

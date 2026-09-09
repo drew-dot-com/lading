@@ -141,19 +141,25 @@ test('parts: status, partKnown, a finish with gaps, plan validation, and the pro
   }
 });
 
-test('estimate keeps only the chosen networks (a leg and its quote door go together); the finish rows always stay', async () => {
+test('estimate keeps only the chosen networks (a leg and its quote door go together); the finish rows always stay, the name rows only with arns', async () => {
   const home = mkdtempSync(join(tmpdir(), 'lading-est-'));
   try {
     const l = lading(home);
     // Route prices without an edge: flat 1,000 for a quote door, 40,000 otherwise; the arweave schedule as 10 per payload byte.
     l.charge = async (route: string, payloadLen: number) => (route.endsWith('.quote') ? 1_000n : route === l.opts.routes.ario ? BigInt(payloadLen) * 10n : 40_000n);
     const all = await l.estimate(1000);
-    assert.deepEqual(all.rows.map((r) => r.leg), ['arweave', 'walrus-quote', 'walrus', 'filecoin-quote', 'filecoin', 'ipfs-quote', 'ipfs', 'relay', 'manifest', 'name-quote', 'name']);
+    assert.deepEqual(all.rows.map((r) => r.leg), ['arweave', 'walrus-quote', 'walrus', 'filecoin-quote', 'filecoin', 'ipfs-quote', 'ipfs', 'relay', 'manifest']);
+    // With arns the finish grows by the page, its path manifest, the name quote and the name; nothing else moves.
+    const named = await l.estimate(1000, undefined, undefined, true);
+    assert.deepEqual(named.rows.map((r) => r.leg), [...all.rows.map((r) => r.leg), 'page', 'paths', 'name-quote', 'name']);
+    assert.equal(named.total - all.total, named.rows.filter((r) => ['page', 'paths', 'name-quote', 'name'].includes(r.leg)).reduce((a, r) => a + r.price!, 0n));
+    assert.deepEqual((await l.estimateFinish(1)).rows.map((r) => r.leg), ['relay', 'manifest']);
+    assert.deepEqual((await l.estimateFinish(1, true)).rows.map((r) => r.leg), ['relay', 'manifest', 'page', 'paths', 'name-quote', 'name']);
     const two = await l.estimate(1000, undefined, ['arweave', 'walrus']);
-    assert.deepEqual(two.rows.map((r) => r.leg), ['arweave', 'walrus', 'walrus-quote', 'relay', 'manifest', 'name-quote', 'name'].sort((a, b) => all.rows.findIndex((r) => r.leg === a) - all.rows.findIndex((r) => r.leg === b)));
+    assert.deepEqual(two.rows.map((r) => r.leg), ['arweave', 'walrus', 'walrus-quote', 'relay', 'manifest'].sort((a, b) => all.rows.findIndex((r) => r.leg === a) - all.rows.findIndex((r) => r.leg === b)));
     assert.equal(all.total - two.total, 2n * (1_000n + 40_000n));
     const one = await l.estimate(1000, undefined, ['ipfs']);
-    assert.deepEqual(one.rows.map((r) => r.leg), ['ipfs-quote', 'ipfs', 'relay', 'manifest', 'name-quote', 'name']);
+    assert.deepEqual(one.rows.map((r) => r.leg), ['ipfs-quote', 'ipfs', 'relay', 'manifest']);
     const part = await l.estimatePart(500, ['walrus']);
     assert.deepEqual(part.rows.map((r) => r.leg), ['walrus-quote', 'walrus']);
     assert.equal(part.total, 41_000n);

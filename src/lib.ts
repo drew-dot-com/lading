@@ -211,8 +211,11 @@ export interface PutOptions {
    * Legs to leave out. `arweave` keeps everything off Arweave (no manifest,
    * page or name either); `arweaveObject` keeps only the object's bytes off it,
    * the bill of lading still anchored there (what a door's network choice means).
+   * `page` leaves out the public page and the path manifest, and with them the
+   * name (a name has nothing to point at without them); `name` leaves out the
+   * name alone. A door without `arns` chosen sets both.
    */
-  skip?: Partial<Record<'arweave' | 'arweaveObject' | 'walrus' | 'filecoin' | 'ipfs' | 'relay' | 'name', boolean>>;
+  skip?: Partial<Record<'arweave' | 'arweaveObject' | 'walrus' | 'filecoin' | 'ipfs' | 'relay' | 'page' | 'name', boolean>>;
   /** Walrus storage period in two-week epochs, 1..53; unset = the broker's default (26). Set, the native writer takes the leg. */
   walrusEpochs?: number;
   /** Recorded on the manifest when the put came through a door other than the CLI. */
@@ -645,6 +648,20 @@ export class Lading {
 
   /** A manifest with four legs, plus part receipts, before signing. */
   private manifestGuess = (n: number) => 1200 + 4 * 400 + (n > 1 ? 4 * n * 400 : 0);
+  /** The public page is the manifest rendered with its proofs and a verifier; the path manifest that names it is a few hundred bytes. */
+  private pageGuess = (n: number) => 12_000 + this.manifestGuess(n);
+  private static readonly PATHS_BYTES = 400;
+
+  /** The finish rows a name adds: the page, its path manifest, the name quote, the name. */
+  private async nameRows(n: number, quote: (route: string) => Promise<bigint | null>): Promise<QuoteRow[]> {
+    const R = this.opts.routes;
+    return [
+      { leg: 'page', route: R.ario, price: await this.charge(R.ario, this.pageGuess(n)), note: 'bill of lading page on Arweave, estimate' },
+      { leg: 'paths', route: R.ario, price: await this.charge(R.ario, Lading.PATHS_BYTES), note: 'path manifest on Arweave, estimate' },
+      { leg: 'name-quote', route: R.nameQuote, price: await quote(R.nameQuote), note: 'quote door' },
+      { leg: 'name', route: R.name, price: await this.charge(R.name, 0), note: 'flat' },
+    ];
+  }
 
   /** The bill for one slice of `size` bytes on the four networks, each quote door asked once: what the gate charges per `POST /v1/parts`. Free. */
   async estimatePart(size: number, networks: readonly Network[] = NETWORKS): Promise<Estimate> {
@@ -662,14 +679,13 @@ export class Lading {
     return { size, parts: 1, rows, total: rows.reduce((a, r) => a + (r.price ?? 0n), 0n), unpriced };
   }
 
-  /** The bill for the finish of an object in `n` parts: relay copy, manifest on Arweave, name quote, name. Free. */
-  async estimateFinish(n: number): Promise<Estimate> {
+  /** The bill for the finish of an object in `n` parts: relay copy, manifest on Arweave, and with `arns` the page, path manifest, name quote and name. Free. */
+  async estimateFinish(n: number, arns = false): Promise<Estimate> {
     const R = this.opts.routes;
     const rows: QuoteRow[] = [
       { leg: 'relay', route: R.relay, price: await this.charge(R.relay, this.manifestGuess(n)), note: 'manifest copy' },
       { leg: 'manifest', route: R.ario, price: await this.charge(R.ario, this.manifestGuess(n)), note: 'manifest on Arweave, estimate' },
-      { leg: 'name-quote', route: R.nameQuote, price: await this.charge(R.nameQuote, 0), note: 'quote door' },
-      { leg: 'name', route: R.name, price: await this.charge(R.name, 0), note: 'flat' },
+      ...(arns ? await this.nameRows(n, (route) => this.charge(route, 0)) : []),
     ];
     const unpriced = [...new Set(rows.filter((r) => r.price === null).map((r) => r.route))];
     return { size: 0, parts: n, rows, total: rows.reduce((a, r) => a + (r.price ?? 0n), 0n), unpriced };
@@ -681,7 +697,7 @@ export class Lading {
    * This is what the gate charges against, so it is deliberately the ceiling
    * (a leg that is skipped at run time only makes the real bill smaller).
    */
-  async estimate(size: number, partBytes = DEFAULT_PART_BYTES, networks: readonly Network[] = NETWORKS): Promise<Estimate> {
+  async estimate(size: number, partBytes = DEFAULT_PART_BYTES, networks: readonly Network[] = NETWORKS, arns = false): Promise<Estimate> {
     const R = this.opts.routes;
     const parts = planParts(size, partBytes);
     const n = parts.length;
@@ -711,8 +727,7 @@ export class Lading {
       { leg: 'ipfs', route: R.ipfs, price: await flat(R.ipfs), note: `flat${partsNote}` },
       { leg: 'relay', route: R.relay, price: await this.charge(R.relay, this.manifestGuess(n)), note: 'manifest copy' },
       { leg: 'manifest', route: R.ario, price: await this.charge(R.ario, this.manifestGuess(n)), note: 'manifest on Arweave, estimate' },
-      { leg: 'name-quote', route: R.nameQuote, price: await quote(R.nameQuote), note: 'quote door' },
-      { leg: 'name', route: R.name, price: await this.charge(R.name, 0), note: 'flat' },
+      ...(arns ? await this.nameRows(n, quote) : []),
     ]);
     for (const r of rows) if (r.price === null) unpriced.push(r.route);
     const total = rows.reduce((a, r) => a + (r.price ?? 0n), 0n);
@@ -976,11 +991,16 @@ export class Lading {
       this.save(sha, { manifest, manifestTxId, paid });
       this.clearProgress(sha);
 
-      // The page a browser sees under the name, and the path manifest the name points at.
-      ({ pageTxId, pathsTxId } = await this.publishPage(manifest, manifestTxId, paid, t0));
-      this.save(sha, { manifest, manifestTxId, pageTxId, pathsTxId, paid });
+      // The page a browser sees under the name, and the path manifest the name
+      // points at. Both only when asked for (the door's `arns` choice): an
+      // agent reads the manifest, and a name spends an undername slot.
+      if (!skip.page) {
+        ({ pageTxId, pathsTxId } = await this.publishPage(manifest, manifestTxId, paid, t0));
+        this.save(sha, { manifest, manifestTxId, pageTxId, pathsTxId, paid });
+      }
 
-      let nameOk = !skip.name;
+      let nameOk = !skip.name && !!pathsTxId;
+      if (!skip.name && !pathsTxId) this.log('name     SKIPPED with the page; name it later with: lading name ' + sha);
       const undername = o.po.undername ?? undernameFor(sha);
       if (nameOk && doQuote) {
         const q = await this.quoteName(undername, pathsTxId);
@@ -991,7 +1011,7 @@ export class Lading {
           this.log(`name     SKIPPED, nothing paid for it; retry later with: lading name ${sha}`);
         }
       }
-      if (nameOk) {
+      if (nameOk && pathsTxId) {
         const ev2 = buildJobEvent({ kind: LEG_KIND, params: { op: 'name', txid: pathsTxId, sha256: sha, undername } });
         const r2 = await this.job<NameReceipt>(R.name, ev2 as never, 120_000);
         nameReceipt = r2.receipt;
@@ -1538,7 +1558,7 @@ export class Lading {
   }
 
   /** The whole bill before paying it: route prices from the edge, deliverability from the three quote doors. Costs three quotes. */
-  async quote(bytes: Uint8Array, o: { name: string; undername?: string; partBytes?: number; networks?: readonly Network[]; walrusEpochs?: number }): Promise<QuoteResult> {
+  async quote(bytes: Uint8Array, o: { name: string; undername?: string; partBytes?: number; networks?: readonly Network[]; walrusEpochs?: number; arns?: boolean }): Promise<QuoteResult> {
     const R = this.opts.routes;
     const nets = o.networks ?? NETWORKS;
     const sha = sha256(bytes);
@@ -1546,7 +1566,7 @@ export class Lading {
     const parts = planParts(bytes.length, o.partBytes ?? DEFAULT_PART_BYTES);
     const n = parts.length;
     const largest = Math.max(...parts.map((q) => q.size));
-    const est = await this.estimate(bytes.length, o.partBytes ?? DEFAULT_PART_BYTES, nets);
+    const est = await this.estimate(bytes.length, o.partBytes ?? DEFAULT_PART_BYTES, nets, !!o.arns);
     const row = (leg: string) => est.rows.find((r) => r.leg === leg)!;
     const rows: QuoteRow[] = [];
     let quotesPaid = 0n;
@@ -1579,10 +1599,14 @@ export class Lading {
     }
     rows.push(row('relay'));
     rows.push(row('manifest'));
-    const nq = await this.quoteName(undername);
-    quotesPaid += nq.price ?? 0n;
-    rows.push({ leg: 'name-quote', route: nq.route, price: nq.price, note: fmtQuote(nq.receipt) });
-    rows.push({ leg: 'name', route: R.name, price: nq.receipt.deliverable ? row('name').price : 0n, note: nq.receipt.deliverable ? 'flat' : 'would be skipped' });
+    if (o.arns) {
+      rows.push(row('page'));
+      rows.push(row('paths'));
+      const nq = await this.quoteName(undername);
+      quotesPaid += nq.price ?? 0n;
+      rows.push({ leg: 'name-quote', route: nq.route, price: nq.price, note: fmtQuote(nq.receipt) });
+      rows.push({ leg: 'name', route: R.name, price: nq.receipt.deliverable ? row('name').price : 0n, note: nq.receipt.deliverable ? 'flat' : 'would be skipped' });
+    }
     const total = rows.reduce((a, r) => a + (r.price ?? 0n), 0n);
     return { sha256: sha, size: bytes.length, parts: n, largestPart: largest, rows, total, quotesPaid };
   }

@@ -9,12 +9,15 @@ A bill of lading is the document a bank pays against. Lading does that for
 bytes: an agent opens one payment channel with a TOON node and gets an object
 archived on several storage networks, paying per object per network, and
 each leg hands back the network's own identifier and proof. Every copy is
-then listed in a signed manifest that lives on Arweave under an ArNS name.
+then listed in a signed manifest that lives on Arweave. Ask for it, and the
+manifest also gets a public page under an ArNS name.
 
-Status: v0.11.0, Arweave, Walrus, Filecoin and IPFS legs, ArNS naming, relay copy,
-a quote door in front of each broker leg, objects over one packet travelling
-as parts, Walrus renewals, network and duration choices at the door, and a hosted x402 gate with an MCP shim so Claude
-can archive through it. Runs against Drew's mainnet node today.
+Status: v0.17.0, Arweave, Walrus, Filecoin and IPFS legs, relay copy, a quote
+door in front of each broker leg, objects over one packet travelling as
+parts, Walrus renewals, network, duration and naming choices at the door
+(the page and the ArNS name are opt-in since 0.17), and a hosted x402 gate
+with an MCP shim so Claude can archive through it. Runs against Drew's
+mainnet node today.
 
 ## Use it from Claude
 
@@ -27,8 +30,9 @@ claude mcp add lading -e LADING_X402_KEY=0x… -- npx -y lading mcp --gate https
 ```
 
 Tools: `lading_wallet`, `lading_describe`, `lading_quote`, `lading_lookup`
-(free), `lading_put` (paid: file path or text, returns every network receipt,
-the manifest URL and the ArNS name), `lading_verify` (free), `lading_renew`
+(free), `lading_put` (paid: file path or text, returns every network receipt
+and the manifest URL; `arns: true` adds a public page and an ArNS name),
+`lading_verify` (free), `lading_renew`
 (paid). Every paid call asks the gate's free quote first and refuses over
 `LADING_MAX_USDC_PER_CALL` (default 0.50 USDC). A 1 MiB put is about 0.15
 USDC; a small one about 0.10.
@@ -129,9 +133,9 @@ lading put report.pdf
 | 8. bill of lading | signed locally by the payer's Nostr key | kind 30320, `d` = sha256 | free |
 | 9. relay copy | `g.drew.relay` | the node relay | 1,000 |
 | 10. manifest to Arweave | `g.drew.ario` | the org store, on the txId | schedule |
-| 11. page + path manifest to Arweave | `g.drew.ario` | the org store, on the two txIds: the rendered bill of lading page, and an `arweave/paths` manifest serving it at `/` and the JSON at `/manifest.json` | schedule, twice |
-| 12. name quote | `g.drew.lading.name.quote` (kind 5320, `phase=quote`) | Lading: deliverable, undername, lamports float | 1,000 |
-| 13. ArNS name | `g.drew.lading.name` (kind 5320) | Lading, on the ANT record write, pointing at the path manifest | 5,000 |
+| 11. page + path manifest to Arweave (only with `arns`) | `g.drew.ario` | the org store, on the two txIds: the rendered bill of lading page, and an `arweave/paths` manifest serving it at `/` and the JSON at `/manifest.json` | schedule, twice |
+| 12. name quote (only with `arns`) | `g.drew.lading.name.quote` (kind 5320, `phase=quote`) | Lading: deliverable, undername, lamports float | 1,000 |
+| 13. ArNS name (only with `arns`) | `g.drew.lading.name` (kind 5320) | Lading, on the ANT record write, pointing at the path manifest | 5,000 |
 
 A leg that fails answers `accept: false`, buys nothing downstream, and costs
 the route price. Steps are skippable (`--skip-walrus`, `--skip-filecoin`,
@@ -190,29 +194,43 @@ never assembled are swept after `LADING_PROGRESS_MAX_AGE_DAYS` (7).
 
 ## Choices at the door
 
-A caller picks which networks carry the object and how long Walrus keeps
-it; the price follows (0.16). `networks` is any of `arweave`, `walrus`,
-`filecoin`, `ipfs`, at least one (default all four); a network left out
-drops from the bill together with its quote door, so the price is exactly
-the legs bought plus the finish. Leaving `arweave` out keeps only the
-object's bytes off it: the signed bill of lading, its page and the ArNS name
-are on Arweave whatever is chosen. `walrus-epochs` is the Walrus storage
-period in two-week epochs, 1..53 (default 26, a year); set, the write goes
-to the native writer, and past 26 the door adds 1/26 of the walrus leg's
-route price per epoch (the broker's route is flat for a year; fewer epochs
-cost the same, a write's fixed costs being most of it). Nothing else is a
-knob: Arweave is permanent, Pinata pins for a year, Filecoin is paid per
-epoch from the broker's deposit. The choices ride as `networks=` and
-`walrus-epochs=` on `GET /v1/quote` and `GET /v1/quote/parts`, as
-`x-networks` and `x-walrus-epochs` headers on `POST /v1/put` and every
-`POST /v1/parts` of one object, and as `networks` / `walrusEpochs` in the
-`POST /v1/assemble` body; every answer echoes them under `choices` and the
-walrus leg's `retention` on the manifest shows the period bought.
-`/v1/describe` lists them under `choices`. The shim's `lading_put` and
-`lading_quote` take `networks` and `walrusEpochs`; the CLI takes
-`--networks a,b` and `--walrus-epochs n` on `put` and `quote`. A hash the
-gate already archived is still answered from the saved record whatever is
-chosen (choices shape a new archive; `force` archives again).
+A caller picks which networks carry the object, how long Walrus keeps it,
+and whether the bill gets a public page and an ArNS name; the price follows.
+
+`networks` is any of `arweave`, `walrus`, `filecoin`, `ipfs`, at least one
+(default all four); a network left out drops from the bill together with its
+quote door, so the price is exactly the legs bought plus the finish. Leaving
+`arweave` out keeps only the object's bytes off it: the signed bill of lading
+is on Arweave whatever is chosen.
+
+`walrus-epochs` is the Walrus storage period in two-week epochs, 1..53
+(default 26, a year); set, the write goes to the native writer, and past 26
+the door adds 1/26 of the walrus leg's route price per epoch (the broker's
+route is flat for a year; fewer epochs cost the same, a write's fixed costs
+being most of it).
+
+`arns` (default false, since 0.17) adds the finish an agent does not need
+but a person might: the rendered bill of lading page and its path manifest
+on Arweave, the name quote, and an ArNS undername `l-<sha12>_<base>` pointed
+at them. Off, a put returns the signed manifest JSON and its Arweave URL and
+names nothing; every ArNS name spends one of the base name's undername
+slots, and those are bought in ARIO. A hash the gate already holds gets its
+page and name on a later put with `arns` true, nothing else re-bought (the
+CLI's `lading name <sha>` does the same from a saved record).
+
+Nothing else is a knob: Arweave is permanent, Pinata pins for a year,
+Filecoin is paid per epoch from the broker's deposit. The choices ride as
+`networks=`, `walrus-epochs=` and `arns=` on `GET /v1/quote` and
+`GET /v1/quote/parts`, as `x-networks`, `x-walrus-epochs` and `x-arns`
+headers on `POST /v1/put` and every `POST /v1/parts` of one object, and as
+`networks` / `walrusEpochs` / `arns` in the `POST /v1/assemble` body; every
+answer echoes them under `choices` and the walrus leg's `retention` on the
+manifest shows the period bought. `/v1/describe` lists them under `choices`.
+The shim's `lading_put` and `lading_quote` take `networks`, `walrusEpochs`
+and `arns`; the CLI takes `--networks a,b`, `--walrus-epochs n` and `--arns`
+on `put` and `quote`. A hash the gate already archived is still answered
+from the saved record whatever is chosen (choices shape a new archive;
+`force` archives again).
 
 ## Floats and alarms
 
