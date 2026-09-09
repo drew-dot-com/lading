@@ -187,7 +187,19 @@ export async function runMcp(o: McpOptions) {
       status?: { archived: boolean; networks: Record<string, { indexes: number[]; sealed: boolean }> };
     };
     if (usdcToMicro(q.total.usdc) > maxMicro) throw new Error(`archiving ${bytes.length} bytes as ${q.parts} parts would cost ${q.total.usdc} USDC in ${q.total.payments} payments, over the ${o.maxUsdc} USDC cap (LADING_MAX_USDC_PER_CALL)`);
-    if (q.status?.archived) return archived(sha);
+    if (q.status?.archived) {
+      const hit = await archived(sha);
+      // Held but not named, and a name asked for: the finish door alone buys the page and the name.
+      if (hit && choices.arns && !hit.name) {
+        log(`put ${fileName} already archived as ${String(hit.manifestTxId)}, unnamed; arns asked: buying the page and the name only`);
+        return paid('/v1/assemble', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-object-sha256': sha, 'x-part-count': String(plan(bytes.length, partBytes).length) },
+          body: JSON.stringify({ sha256: sha, size: bytes.length, partCount: plan(bytes.length, partBytes).length, partBytes, name: fileName, mime: contentType, networks: choices.networks, arns: true }),
+        });
+      }
+      return hit;
+    }
     const slices = plan(bytes.length, partBytes);
     if (slices.length !== q.parts) throw new Error(`the door plans ${q.parts} parts, this shim ${slices.length}; part size disagreement`);
     log(`put ${fileName} ${bytes.length} B as ${q.parts} parts of ${partBytes} B: ${q.total.usdc} USDC over ${q.total.payments} payments`);
@@ -490,10 +502,13 @@ export async function runMcp(o: McpOptions) {
         const contentType = mime ?? (path ? 'application/octet-stream' : 'text/plain; charset=utf-8');
         if (!force) {
           const hit = await archived(sha);
-          if (hit) {
+          // Held and named, or held and no name asked for: the record as it is, nothing paid.
+          // Held but unnamed with arns asked: the put goes through, and the door buys the page and the name only.
+          if (hit && !(choices.arns && !hit.name)) {
             log(`put ${fileName} ${bytes.length} B already archived as ${String(hit.manifestTxId)}; nothing paid`);
             return text({ ...hit, reused: true, paidThisCall: '0 USDC: the gate already held a bill of lading for these bytes (pass force to archive again)' });
           }
+          if (hit) log(`put ${fileName} already archived as ${String(hit.manifestTxId)}, unnamed; arns asked: buying the page and the name only`);
         }
         const facts = await door();
         if (bytes.length > facts.maxBodyBytes) {
