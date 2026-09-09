@@ -57,3 +57,22 @@ export function pricingFromEnv(env: NodeJS.ProcessEnv = process.env): GatePricin
   usdcToMicro(floorUsdc);
   return { margin, floorUsdc };
 }
+
+/** The broker's Walrus route buys this many two-week epochs; a caller who asks for more pays for them at the door. */
+export const WALRUS_DEFAULT_EPOCHS = 26;
+
+/**
+ * What a longer Walrus period adds at the door: the walrus leg's route units
+ * once more per default period, pro rata per epoch past the default, rounded
+ * up. The route itself is flat (it covers a year of storage plus the write),
+ * so this is where 53 epochs cost more than 26; fewer epochs cost the same,
+ * the fixed costs of a write being most of it.
+ */
+export function walrusDurationSurcharge(walrusUnits: bigint, epochs: number | undefined, defaultEpochs = WALRUS_DEFAULT_EPOCHS): bigint {
+  if (epochs === undefined || epochs <= defaultEpochs) return 0n;
+  if (walrusUnits < 0n) throw new Error('negative walrus units');
+  const extra = BigInt(epochs - defaultEpochs);
+  const d = BigInt(defaultEpochs);
+  const scaled = walrusUnits * extra;
+  return scaled / d + (scaled % d === 0n ? 0n : 1n);
+}

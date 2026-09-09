@@ -8,6 +8,7 @@
  *   POST /walrus/quote   kind:5320, params op=walrus, phase=quote, size → WalrusQuote
  *   POST /walrus/renew   kind:5320, params op=walrus-renew, lighthouseId → WalrusRenewReceipt
  *   POST /walrus/renew/quote kind:5320, params op=walrus-renew, phase=quote, lighthouseId → WalrusRenewQuote
+ *   (POST /walrus and its quote take an optional `epochs` param, 1..53: the storage period; it routes the write to the native writer)
  *   POST /walrus/extend  kind:5320, params op=walrus-extend, objectId[, epochs] → WalrusExtendReceipt (native records: more epochs on the Sui blob object)
  *   POST /walrus/extend/quote kind:5320, params op=walrus-extend, phase=quote, objectId[, epochs] → WalrusExtendQuote
  *   GET  /walrus/ledger  every Lighthouse record this broker paid for, soonest expiry first (operator view)
@@ -191,11 +192,11 @@ type Writers = {
 };
 
 /** The quote one writer gives for `size` bytes right now. */
-async function quoteWith(w: Writers, which: 'lighthouse' | 'native', size: number): Promise<WalrusQuote> {
+async function quoteWith(w: Writers, which: 'lighthouse' | 'native', size: number, epochs?: number): Promise<WalrusQuote> {
   const at = Math.floor(Date.now() / 1000);
   if (which === 'native') {
     const n = w.native!;
-    const [q, f] = await Promise.all([n.uploader.quote(Math.max(size, 1)), n.floats()]);
+    const [q, f] = await Promise.all([n.uploader.quote(Math.max(size, 1), epochs), n.floats()]);
     const suiPerWriteMist = BigInt(Math.round(Number(SUI_PER_WRITE) * 1e9));
     const d = decideWalrusNative({ size, maxBytes: MAX_BODY_BYTES, costFrost: q.amountFrost, walFrost: f.walFrost, suiMist: f.suiMist, suiPerWriteMist, reserveMultiple: WALRUS_RESERVE_MULTIPLE });
     return {
@@ -233,10 +234,10 @@ async function quoteWith(w: Writers, which: 'lighthouse' | 'native', size: numbe
  * leg is paid. A writer whose quote throws (its RPC down) is treated as not
  * deliverable, never as an exception, so the other one can still answer.
  */
-async function chooseWalrus(w: Writers, size: number): Promise<{ which: 'lighthouse' | 'native'; quote: WalrusQuote }> {
+async function chooseWalrus(w: Writers, size: number, epochs?: number): Promise<{ which: 'lighthouse' | 'native'; quote: WalrusQuote }> {
   const tryQuote = async (which: 'lighthouse' | 'native') => {
     try {
-      return await quoteWith(w, which, size);
+      return await quoteWith(w, which, size, epochs);
     } catch (e) {
       const at = Math.floor(Date.now() / 1000);
       const msg = `${which} quote failed: ${(e as Error).message.slice(0, 160)}`;
@@ -245,12 +246,29 @@ async function chooseWalrus(w: Writers, size: number): Promise<{ which: 'lightho
         : ({ op: 'walrus', deliverable: false, reason: msg, size, maxBytes: MAX_BODY_BYTES, downstream: { provider: 'lighthouse-x402', amountUsdc: '0', amount: '0', asset: 'USDC', retention: 'P365D' }, float: { chain: 'base', asset: 'USDC', balance: '?', reserve: '?' }, executeDoor: '/walrus', at } as WalrusQuote);
     }
   };
+  // A chosen period is a native matter: Lighthouse sells exactly a year.
+  if (epochs !== undefined) {
+    if (!w.native) {
+      const at = Math.floor(Date.now() / 1000);
+      return { which: 'lighthouse', quote: { op: 'walrus', deliverable: false, reason: `epochs=${epochs} needs the native Walrus writer; this broker only has Lighthouse, which sells a year`, size, maxBytes: MAX_BODY_BYTES, downstream: { provider: 'lighthouse-x402', amountUsdc: '0', amount: '0', asset: 'USDC', retention: 'P365D' }, float: { chain: 'base', asset: 'USDC', balance: '?', reserve: '?' }, executeDoor: '/walrus', at } };
+    }
+    return { which: 'native', quote: await tryQuote('native') };
+  }
   if (w.mode === 'native' || (w.mode === 'auto' && !w.lighthouse)) return { which: 'native', quote: await tryQuote('native') };
   if (w.mode === 'lighthouse' || !w.native) return { which: 'lighthouse', quote: await tryQuote('lighthouse') };
   const n = await tryQuote('native');
   if (n.deliverable) return { which: 'native', quote: n };
   const l = await tryQuote('lighthouse');
   return { which: 'lighthouse', quote: { ...l, alternative: { provider: 'walrus-native', reason: n.reason ?? 'not deliverable' } } };
+}
+
+/** The optional `epochs` param on a walrus write or quote: 1..53, or an error line. */
+function epochsParam(event: NostrEvent): { epochs?: number; error?: string } {
+  const raw = paramOf(event, 'epochs');
+  if (raw === undefined) return {};
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 53) return { error: `param epochs must be 1..53, got ${raw}` };
+  return { epochs: n };
 }
 
 function walrusDoor(w: Writers, ledger: Ledger | undefined) {
@@ -261,13 +279,15 @@ function walrusDoor(w: Writers, ledger: Ledger | undefined) {
     const bytes = blobOf(event, res);
     if (!bytes) return;
     const fileName = paramOf(event, 'name') ?? `${sha256Hex(bytes).slice(0, 12)}.bin`;
+    const ep = epochsParam(event);
+    if (ep.error) return refuse(res, 422, 'F00', ep.error);
     const t0 = Date.now();
     let which: 'lighthouse' | 'native' = w.mode === 'native' ? 'native' : 'lighthouse';
     try {
-      const pick = await chooseWalrus(w, bytes.length);
+      const pick = await chooseWalrus(w, bytes.length, ep.epochs);
       which = pick.which;
       if (!pick.quote.deliverable) throw new Error(`${which} would not go through: ${pick.quote.reason}`);
-      const receipt = which === 'native' ? await w.native!.uploader.upload(bytes, fileName, (line) => console.log(line)) : await w.lighthouse!.uploader.upload(bytes, fileName);
+      const receipt = which === 'native' ? await w.native!.uploader.upload(bytes, fileName, (line) => console.log(line), ep.epochs) : await w.lighthouse!.uploader.upload(bytes, fileName);
       const lighthouseId = String(receipt.proof.lighthouseId ?? '');
       if (lighthouseId && ledger) {
         ledger.upsert({
@@ -306,10 +326,12 @@ function walrusQuoteDoor(w: Writers) {
     const sizeParam = paramOf(event, 'size');
     const size = b64 ? Buffer.from(b64, 'base64').length : Number(sizeParam);
     if (!Number.isInteger(size) || size < 0) return refuse(res, 422, 'F00', 'param size (bytes) or a blob input is required');
+    const ep = epochsParam(event);
+    if (ep.error) return refuse(res, 422, 'F00', ep.error);
     const t0 = Date.now();
     try {
-      const { which, quote } = await chooseWalrus(w, size);
-      console.log(`walrus quote ${size}B via ${which} deliverable=${quote.deliverable} downstream=${quote.downstream.amount} ${quote.downstream.asset} float=${quote.float.balance} ${quote.float.asset}${quote.float.sui ? ` sui=${quote.float.sui}` : ''} payer=${meta.payer ?? '-'} ${Date.now() - t0}ms${quote.reason ? `: ${quote.reason}` : ''}${quote.alternative ? ` (native: ${quote.alternative.reason})` : ''}`);
+      const { which, quote } = await chooseWalrus(w, size, ep.epochs);
+      console.log(`walrus quote ${size}B${ep.epochs ? ` epochs=${ep.epochs}` : ''} via ${which} deliverable=${quote.deliverable} downstream=${quote.downstream.amount} ${quote.downstream.asset} float=${quote.float.balance} ${quote.float.asset}${quote.float.sui ? ` sui=${quote.float.sui}` : ''} payer=${meta.payer ?? '-'} ${Date.now() - t0}ms${quote.reason ? `: ${quote.reason}` : ''}${quote.alternative ? ` (native: ${quote.alternative.reason})` : ''}`);
       return acceptReceipt(res, quote, meta);
     } catch (e) {
       const msg = (e as Error).message;

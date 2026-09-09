@@ -13,7 +13,7 @@ then listed in a signed manifest that lives on Arweave under an ArNS name.
 
 Status: v0.11.0, Arweave, Walrus, Filecoin and IPFS legs, ArNS naming, relay copy,
 a quote door in front of each broker leg, objects over one packet travelling
-as parts, Walrus renewals, and a hosted x402 gate with an MCP shim so Claude
+as parts, Walrus renewals, network and duration choices at the door, and a hosted x402 gate with an MCP shim so Claude
 can archive through it. Runs against Drew's mainnet node today.
 
 ## Use it from Claude
@@ -188,6 +188,32 @@ sits on the floor; 50 MB is about 50 payments, 6 USDC and an hour, and needs
 the org store's ARIO funded ahead (about 35 ARIO per part). Progress files
 never assembled are swept after `LADING_PROGRESS_MAX_AGE_DAYS` (7).
 
+## Choices at the door
+
+A caller picks which networks carry the object and how long Walrus keeps
+it; the price follows (0.16). `networks` is any of `arweave`, `walrus`,
+`filecoin`, `ipfs`, at least one (default all four); a network left out
+drops from the bill together with its quote door, so the price is exactly
+the legs bought plus the finish. Leaving `arweave` out keeps only the
+object's bytes off it: the signed bill of lading, its page and the ArNS name
+are on Arweave whatever is chosen. `walrus-epochs` is the Walrus storage
+period in two-week epochs, 1..53 (default 26, a year); set, the write goes
+to the native writer, and past 26 the door adds 1/26 of the walrus leg's
+route price per epoch (the broker's route is flat for a year; fewer epochs
+cost the same, a write's fixed costs being most of it). Nothing else is a
+knob: Arweave is permanent, Pinata pins for a year, Filecoin is paid per
+epoch from the broker's deposit. The choices ride as `networks=` and
+`walrus-epochs=` on `GET /v1/quote` and `GET /v1/quote/parts`, as
+`x-networks` and `x-walrus-epochs` headers on `POST /v1/put` and every
+`POST /v1/parts` of one object, and as `networks` / `walrusEpochs` in the
+`POST /v1/assemble` body; every answer echoes them under `choices` and the
+walrus leg's `retention` on the manifest shows the period bought.
+`/v1/describe` lists them under `choices`. The shim's `lading_put` and
+`lading_quote` take `networks` and `walrusEpochs`; the CLI takes
+`--networks a,b` and `--walrus-epochs n` on `put` and `quote`. A hash the
+gate already archived is still answered from the saved record whatever is
+chosen (choices shape a new archive; `force` archives again).
+
 ## Floats and alarms
 
 Every hot key behind a put is judged in one place. The broker answers
@@ -245,6 +271,7 @@ No Nostr client can pay x402, so uploads draw on credit per pubkey: anyone with 
 ```
 src/server.ts    the handler: POST /walrus, /filecoin, /name and their /quote doors, GET /describe, GET /health
 src/lib.ts       the client as a library: put, putPart, finish, quote, estimate, verify, name, renewals, renew, describe; the CLI and the gate both run this
+src/choices.ts   the two choices a caller makes at a door (networks, Walrus epochs): parsing, the skip map, headers, the describe block; lib-free so the shim bundles it
 src/renew-cron.ts the renewal timer's one run: date every record live, renew what is due, report it as a float row and an ntfy push; the gate schedules it, the CLI runs it as renew-due
 src/cli.ts       the command line, a thin layer over lib.ts
 src/gate.ts      the hosted door: express + x402 (USDC on Base, PayAI facilitator), pays the TOON routes with its own key

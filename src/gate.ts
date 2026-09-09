@@ -12,6 +12,9 @@
  *                                 behind this door judged against its low-water mark (refuel polls it); free
  *   GET  /v1/quote?size=N         the door price for an object of N bytes; free
  *   GET  /v1/manifest?sha=<hex>   the bill of lading this gate already holds for those bytes, or 404; free
+ *   Choices (choices.ts): `networks=` and `walrus-epochs=` on the free quotes, `x-networks` / `x-walrus-epochs`
+ *                                 headers on the paid puts and parts, `networks` / `walrusEpochs` in the assemble
+ *                                 body. Networks not chosen drop from the bill; epochs past 26 add a surcharge.
  *   POST /v1/put                  octet-stream body, x-file-name, x-mime, x-sha256; x402 priced per request.
  *                                 A declared sha this gate already archived is answered from the saved
  *                                 record at the floor price, no leg re-bought (idempotent put).
@@ -55,7 +58,8 @@ import { InputError, Lading, PartsMissingError, optionsFromEnv, sha256, type Est
 import { judge, lamportsToSol, microToDecimal, report, solanaHoldings, type FloatRow, type FloatsReport } from './floats.js';
 import { cached } from './quote.js';
 import { DEFAULT_PART_BYTES, planParts } from './parts.js';
-import { gatePriceMicro, gatePriceUsdc, microToUsdc, pricingFromEnv, usdcToMicro } from './gate-price.js';
+import { gatePriceMicro, gatePriceUsdc, microToUsdc, pricingFromEnv, usdcToMicro, walrusDurationSurcharge } from './gate-price.js';
+import { ChoiceError, choicesBlock, defaultChoices, describeChoices, parseChoices, skipFor, type Choices } from './choices.js';
 
 import { VERSION } from './version.js';
 import { installLongFetch } from './long-fetch.js';
@@ -237,6 +241,25 @@ function declaredSha(raw: string | undefined): string | undefined {
   return sha;
 }
 
+/** The choices on a request, from headers (paid doors), the query (free quotes) or a JSON body (assemble). A bad choice is a 400. */
+function choicesOf(get: (name: string) => unknown): Choices {
+  try {
+    return parseChoices({ networks: get('networks'), walrusEpochs: get('walrusEpochs') });
+  } catch (e) {
+    if (e instanceof ChoiceError) throw new HttpError(400, e.message);
+    throw e;
+  }
+}
+const choicesFromHeaders = (get: (h: string) => string | undefined) => choicesOf((k) => (k === 'networks' ? get('x-networks') : get('x-walrus-epochs')) || undefined);
+const choicesFromQuery = (q: Record<string, unknown>) => choicesOf((k) => (k === 'networks' ? q.networks : q['walrus-epochs']));
+
+/** The door price for a bill with the choices applied: the TOON units plus the duration surcharge, then margin and floor. */
+function priceWithChoices(est: Estimate, c: Choices): { units: bigint; surcharge: bigint; price: bigint } {
+  const walrusUnits = est.rows.find((r) => r.leg === 'walrus')?.price ?? 0n;
+  const surcharge = walrusDurationSurcharge(walrusUnits, c.walrusEpochs);
+  return { units: est.total, surcharge, price: gatePriceMicro(est.total + surcharge, pricing) };
+}
+
 /** The floor as the door quotes it: the same six-decimal string every other price uses. */
 const floorUsdc = () => microToUsdc(usdcToMicro(pricing.floorUsdc));
 
@@ -245,7 +268,7 @@ const floorUsdc = () => microToUsdc(usdcToMicro(pricing.floorUsdc));
  * numbers a caller can check. With a `sha` this gate already archived the
  * price is the floor: the record is handed back, no leg is bought.
  */
-async function quotePut(size: number, partBytes: number, sha?: string) {
+async function quotePut(size: number, partBytes: number, sha?: string, choices: Choices = defaultChoices()) {
   if (!Number.isInteger(size) || size <= 0) throw new HttpError(400, 'size must be a positive integer');
   if (size > MAX_BODY_BYTES) throw new HttpError(413, `size over the ${MAX_BODY_BYTES} byte ceiling`);
   const prior = sha ? lading.archived(sha) : undefined;
@@ -254,21 +277,24 @@ async function quotePut(size: number, partBytes: number, sha?: string) {
       size,
       parts: prior.parts,
       partBytes,
+      choices: choicesBlock(choices),
       reused: true,
       existing: { manifestTxId: prior.manifestTxId, manifestUrl: prior.manifestUrl, name: prior.name?.name ?? null, archivedAt: prior.archivedAt },
       toon: { units: '0', usdc: microToUsdc(0n), rows: [] },
       price: { usdc: floorUsdc(), network: NETWORK, payTo: PAY_TO ?? null, margin: pricing.margin, floorUsdc: pricing.floorUsdc },
     };
   }
-  const est: Estimate = await lading.estimate(size, partBytes);
+  const est: Estimate = await lading.estimate(size, partBytes, choices.networks);
   if (est.unpriced.length) throw new HttpError(503, `edge did not price ${est.unpriced.join(', ')}`);
-  const price = gatePriceMicro(est.total, pricing);
+  const { surcharge, price } = priceWithChoices(est, choices);
   return {
     size,
     parts: est.parts,
     partBytes,
+    choices: choicesBlock(choices),
     reused: false,
     toon: { units: est.total.toString(), usdc: microToUsdc(est.total), rows: est.rows.map((r) => ({ leg: r.leg, route: r.route, units: r.price?.toString() ?? null, note: r.note })) },
+    ...(surcharge > 0n ? { surcharge: { units: surcharge.toString(), usdc: microToUsdc(surcharge), note: `walrus period ${choices.walrusEpochs} epochs: the walrus leg once more per 26 epochs past the default, pro rata` } } : {}),
     price: { usdc: microToUsdc(price), network: NETWORK, payTo: PAY_TO ?? null, margin: pricing.margin, floorUsdc: pricing.floorUsdc },
   };
 }
@@ -293,20 +319,20 @@ function putBody(r: PutResult, extra: Record<string, unknown> = {}) {
 }
 
 /** The door price for a bill: margin and floor. */
-const doorPrice = (est: Estimate, what: string) => {
+const doorPrice = (est: Estimate, what: string, choices: Choices = defaultChoices()) => {
   if (est.unpriced.length) throw new HttpError(503, `edge did not price ${est.unpriced.join(', ')} (${what})`);
-  return microToUsdc(gatePriceMicro(est.total, pricing));
+  return microToUsdc(priceWithChoices(est, choices).price);
 };
 const priceBlock = (usdc: string) => ({ usdc, network: NETWORK, payTo: PAY_TO ?? null, margin: pricing.margin, floorUsdc: pricing.floorUsdc });
 const toonBlock = (est: Estimate) => ({ units: est.total.toString(), usdc: microToUsdc(est.total), rows: est.rows.map((r) => ({ leg: r.leg, route: r.route, units: r.price?.toString() ?? null, note: r.note })) });
 
 /** One slice: the four legs and their quote doors for that many bytes. Known on arweave and walrus already: the floor. */
-async function quotePart(size: number, known: boolean) {
+async function quotePart(size: number, known: boolean, choices: Choices = defaultChoices()) {
   if (!Number.isInteger(size) || size <= 0) throw new HttpError(400, 'size must be a positive integer');
   if (size > MAX_BODY_BYTES) throw new HttpError(413, `part over the ${MAX_BODY_BYTES} byte ceiling`);
   if (known) return { size, reused: true, toon: { units: '0', usdc: microToUsdc(0n), rows: [] }, price: priceBlock(floorUsdc()) };
-  const est = await lading.estimatePart(size);
-  return { size, reused: false, toon: toonBlock(est), price: priceBlock(doorPrice(est, 'part')) };
+  const est = await lading.estimatePart(size, choices.networks);
+  return { size, reused: false, toon: toonBlock(est), price: priceBlock(doorPrice(est, 'part', choices)) };
 }
 
 /** The finish of an object in `n` parts: relay copy, manifest, name. Already archived: the floor. */
@@ -318,16 +344,16 @@ async function quoteFinish(n: number, sha?: string) {
 }
 
 /** The whole multipart bill for an object of `size` bytes: the plan, a price per part, the finish, the sum. */
-async function quoteParts(size: number, partBytes: number, sha?: string) {
+async function quoteParts(size: number, partBytes: number, sha?: string, choices: Choices = defaultChoices()) {
   if (!Number.isInteger(size) || size <= 0) throw new HttpError(400, 'size must be a positive integer');
   const plan = planParts(size, partBytes);
   const status = sha ? lading.partsStatus(sha) : undefined;
   const parts = [];
   let total = 0n;
   for (const p of plan) {
-    // Known here means: the status says both required networks hold this index (the door checks the slice's own hash when it arrives).
-    const known = !!status && (status.archived || (['arweave', 'walrus'] as const).every((n) => status.networks[n]?.indexes.includes(p.index)));
-    const q = await quotePart(p.size, known);
+    // Known here means: the status says every chosen network holds this index (the door checks the slice's own hash when it arrives).
+    const known = !!status && (status.archived || choices.networks.every((n) => status.networks[n]?.indexes.includes(p.index)));
+    const q = await quotePart(p.size, known, choices);
     parts.push({ index: p.index, size: p.size, reused: q.reused, price: q.price.usdc, toonUnits: q.toon.units });
     total += usdcToMicro(q.price.usdc);
   }
@@ -336,6 +362,7 @@ async function quoteParts(size: number, partBytes: number, sha?: string) {
   return {
     size,
     partBytes,
+    choices: choicesBlock(choices),
     parts: plan.length,
     plan: parts,
     finish: { reused: finish.reused, price: finish.price.usdc, toonUnits: finish.toon.units },
@@ -438,11 +465,11 @@ if (!FREE) {
             maxTimeoutSeconds: 900,
             price: async (ctx) => {
               const size = Number(ctx.adapter.getHeader('content-length'));
-              const q = await quotePut(size, partBytesOf(ctx.adapter.getHeader('x-part-bytes') || undefined), declaredSha(ctx.adapter.getHeader('x-sha256') || undefined));
+              const q = await quotePut(size, partBytesOf(ctx.adapter.getHeader('x-part-bytes') || undefined), declaredSha(ctx.adapter.getHeader('x-sha256') || undefined), choicesFromHeaders((h) => ctx.adapter.getHeader(h) || undefined));
               return q.price.usdc;
             },
           },
-          description: 'Lading put: the bytes onto Arweave, Walrus and Filecoin, a signed bill of lading on Arweave, named on ArNS. Priced on content-length; a declared x-sha256 this gate already archived is answered from the record at the floor price.',
+          description: 'Lading put: the bytes onto Arweave, Walrus, Filecoin and IPFS (or the networks in x-networks, with x-walrus-epochs as the Walrus period), a signed bill of lading on Arweave, named on ArNS. Priced on content-length and the choices; a declared x-sha256 this gate already archived is answered from the record at the floor price.',
           mimeType: 'application/json',
           serviceName: 'lading',
         },
@@ -457,8 +484,9 @@ if (!FREE) {
               const sha = declaredSha(ctx.adapter.getHeader('x-object-sha256') || undefined);
               const partSha = declaredSha(ctx.adapter.getHeader('x-sha256') || undefined);
               const index = ctx.adapter.getHeader('x-part-index');
-              const known = !!sha && !!partSha && index !== undefined && lading.partKnown(sha, Number(index), partSha);
-              return (await quotePart(size, known)).price.usdc;
+              const choices = choicesFromHeaders((h) => ctx.adapter.getHeader(h) || undefined);
+              const known = !!sha && !!partSha && index !== undefined && lading.partKnown(sha, Number(index), partSha, choices.networks);
+              return (await quotePart(size, known, choices)).price.usdc;
             },
           },
           description: 'Lading part: one slice of a larger object onto Arweave, Walrus and Filecoin, held until POST /v1/assemble. Priced on the slice; a slice this gate already bought is answered at the floor.',
@@ -562,6 +590,7 @@ app.get('/v1/describe', async (_req, res, next) => {
       endpoints: ['GET /v1/quote?size=N[&sha=]', 'GET /v1/manifest?sha=', 'POST /v1/put', 'GET /v1/quote/parts?size=N[&sha=]', 'GET /v1/parts?sha=', 'POST /v1/parts', 'POST /v1/assemble', 'GET /v1/renew/quote?id=', 'POST /v1/renew', 'GET /v1/verify?ref=', 'GET /v1/floats', 'GET /v1/renewals'],
       multipart: `Objects over ${MAX_BODY_BYTES} bytes go as parts of ${DEFAULT_PART_BYTES} bytes: one paid POST /v1/parts per slice (short request, small payment, settles on its own 2xx), then one paid POST /v1/assemble for the manifest and name. A slice already bought is answered at the floor; nothing is held in escrow.`,
       partBytes: DEFAULT_PART_BYTES,
+      choices: describeChoices(),
       idempotent: 'POST /v1/put with x-sha256 set to a hash this gate already archived answers from the saved bill of lading at the floor price and buys no leg; GET /v1/manifest?sha= reads it free.',
     });
   } catch (e) {
@@ -571,7 +600,7 @@ app.get('/v1/describe', async (_req, res, next) => {
 
 app.get('/v1/quote', async (req, res, next) => {
   try {
-    res.json(await quotePut(Number(req.query.size), partBytesOf(req.query['part-bytes']), declaredSha(req.query.sha === undefined ? undefined : String(req.query.sha))));
+    res.json(await quotePut(Number(req.query.size), partBytesOf(req.query['part-bytes']), declaredSha(req.query.sha === undefined ? undefined : String(req.query.sha)), choicesFromQuery(req.query as Record<string, unknown>)));
   } catch (e) {
     next(e);
   }
@@ -593,7 +622,7 @@ app.get('/v1/renew/quote', async (req, res, next) => {
 
 app.get('/v1/quote/parts', async (req, res, next) => {
   try {
-    res.json(await quoteParts(Number(req.query.size), partBytesOf(req.query['part-bytes']), declaredSha(req.query.sha === undefined ? undefined : String(req.query.sha))));
+    res.json(await quoteParts(Number(req.query.size), partBytesOf(req.query['part-bytes']), declaredSha(req.query.sha === undefined ? undefined : String(req.query.sha)), choicesFromQuery(req.query as Record<string, unknown>)));
   } catch (e) {
     next(e);
   }
@@ -653,6 +682,7 @@ app.post('/v1/put', express.raw({ type: () => true, limit: MAX_BODY_BYTES }), as
     const name = rawName ? basename(decodeURIComponent(rawName)).slice(0, 200) || `object-${sha.slice(0, 12)}` : `object-${sha.slice(0, 12)}`;
     const mime = req.get('x-mime') || req.get('content-type') || undefined;
     const partBytes = partBytesOf(req.get('x-part-bytes') || undefined);
+    const choices = choicesFromHeaders((h) => req.get(h) || undefined);
     const payer = payerOf(req);
     const prior = lading.archived(sha);
     if (prior && !declared && !FREE) {
@@ -664,13 +694,15 @@ app.post('/v1/put', express.raw({ type: () => true, limit: MAX_BODY_BYTES }), as
         existing: putBody(prior, { via: parseVia(prior) }),
       });
     }
-    const quoted = await quotePut(bytes.length, partBytes, declared);
-    log(`put ${sha.slice(0, 12)} ${bytes.length} B "${name}" payer=${payer ?? (FREE ? 'free' : '?')} price=${quoted.price.usdc} USDC toon=${quoted.toon.units}${prior ? ' (already archived: reuse)' : ''}`);
+    const quoted = await quotePut(bytes.length, partBytes, declared, choices);
+    log(`put ${sha.slice(0, 12)} ${bytes.length} B "${name}" payer=${payer ?? (FREE ? 'free' : '?')} price=${quoted.price.usdc} USDC toon=${quoted.toon.units} networks=${choices.networks.join('+')}${choices.walrusEpochs ? ` walrus-epochs=${choices.walrusEpochs}` : ''}${prior ? ' (already archived: reuse)' : ''}`);
     const r = await serialize(() =>
       lading.put(bytes, {
         name,
         mime: mime === 'application/octet-stream' ? undefined : mime,
         partBytes,
+        skip: skipFor(choices),
+        walrusEpochs: choices.walrusEpochs,
         via: { door: 'x402', network: NETWORK, ...(payer ? { payer } : {}) },
       }),
     );
@@ -678,6 +710,7 @@ app.post('/v1/put', express.raw({ type: () => true, limit: MAX_BODY_BYTES }), as
     return res.json(
       putBody(r, {
         price: quoted.price,
+        choices: quoted.choices,
         via: r.reused ? parseVia(r) : { door: 'x402', network: NETWORK, payer: payer ?? null },
         ...(r.reused ? { thisCall: { door: 'x402', network: NETWORK, payer: payer ?? null, toonUnits: '0' } } : {}),
       }),
@@ -705,10 +738,11 @@ app.post('/v1/parts', express.raw({ type: () => true, limit: MAX_BODY_BYTES }), 
     const name = rawName ? basename(decodeURIComponent(rawName)).slice(0, 200) || `object-${sha.slice(0, 12)}` : `object-${sha.slice(0, 12)}`;
     const mime = req.get('x-mime') || undefined;
     const payer = payerOf(req);
-    const known = !!declared && lading.partKnown(sha, index, declared);
-    const quoted = await quotePart(bytes.length, known);
-    log(`part ${sha.slice(0, 12)} ${index + 1}/${count} ${bytes.length} B "${name}" payer=${payer ?? (FREE ? 'free' : '?')} price=${quoted.price.usdc} USDC${known ? ' (already bought: reuse)' : ''}`);
-    const r = await serialize(() => lading.putPart(bytes, { sha256: sha, size, index, count, partBytes, partSha256: partSha, name, mime: mime === 'application/octet-stream' ? undefined : mime }));
+    const choices = choicesFromHeaders((h) => req.get(h) || undefined);
+    const known = !!declared && lading.partKnown(sha, index, declared, choices.networks);
+    const quoted = await quotePart(bytes.length, known, choices);
+    log(`part ${sha.slice(0, 12)} ${index + 1}/${count} ${bytes.length} B "${name}" payer=${payer ?? (FREE ? 'free' : '?')} price=${quoted.price.usdc} USDC networks=${choices.networks.join('+')}${choices.walrusEpochs ? ` walrus-epochs=${choices.walrusEpochs}` : ''}${known ? ' (already bought: reuse)' : ''}`);
+    const r = await serialize(() => lading.putPart(bytes, { sha256: sha, size, index, count, partBytes, partSha256: partSha, name, mime: mime === 'application/octet-stream' ? undefined : mime, skip: skipFor(choices), walrusEpochs: choices.walrusEpochs }));
     log(`part ${sha.slice(0, 12)} ${index + 1}/${count} done: ${Object.keys(r.receipts).join('+') || 'nothing'}${r.missing.length ? ` missing ${r.missing.join(',')}` : ''} paid=${r.total}${r.archived ? ' (object already archived)' : ''}`);
     return res.json({
       sha256: r.sha256,
@@ -722,6 +756,7 @@ app.post('/v1/parts', express.raw({ type: () => true, limit: MAX_BODY_BYTES }), 
       paid: r.paid.map((p) => ({ leg: p.leg, route: p.route, units: p.price?.toString() ?? null })),
       toon: { units: r.total.toString(), usdc: microToUsdc(r.total) },
       price: quoted.price,
+      choices: choicesBlock(choices),
       status: lading.partsStatus(sha),
       via: { door: 'x402', network: NETWORK, payer: payer ?? null },
     });
@@ -732,7 +767,8 @@ app.post('/v1/parts', express.raw({ type: () => true, limit: MAX_BODY_BYTES }), 
 
 app.post('/v1/assemble', express.json({ limit: '16kb' }), async (req, res, next) => {
   try {
-    const b = (req.body ?? {}) as { sha256?: unknown; size?: unknown; partCount?: unknown; partBytes?: unknown; name?: unknown; mime?: unknown; skip?: unknown };
+    const b = (req.body ?? {}) as { sha256?: unknown; size?: unknown; partCount?: unknown; partBytes?: unknown; name?: unknown; mime?: unknown; skip?: unknown; networks?: unknown; walrusEpochs?: unknown };
+    const choices = choicesOf((k) => b[k as 'networks' | 'walrusEpochs']);
     const sha = declaredSha(typeof b.sha256 === 'string' ? b.sha256 : undefined);
     if (!sha) throw new HttpError(400, 'sha256 required');
     const size = Number(b.size);
@@ -743,7 +779,8 @@ app.post('/v1/assemble', express.json({ limit: '16kb' }), async (req, res, next)
     const name = typeof b.name === 'string' && b.name ? basename(b.name).slice(0, 200) : `object-${sha.slice(0, 12)}`;
     const mime = typeof b.mime === 'string' && b.mime && b.mime !== 'application/octet-stream' ? b.mime : undefined;
     const skipList = Array.isArray(b.skip) ? (b.skip as unknown[]).filter((x): x is 'filecoin' | 'walrus' | 'ipfs' => x === 'filecoin' || x === 'walrus' || x === 'ipfs') : [];
-    const skip = Object.fromEntries(skipList.map((k) => [k, true])) as Partial<Record<'filecoin' | 'walrus' | 'ipfs', boolean>>;
+    // A network left out of the choice is skipped like one listed in `skip` (the older field, kept).
+    const skip = { ...skipFor(choices), ...Object.fromEntries(skipList.map((k) => [k, true])) } as Partial<Record<'arweaveObject' | 'filecoin' | 'walrus' | 'ipfs', boolean>>;
     const payer = payerOf(req);
     const quoted = await quoteFinish(count, sha);
     log(`assemble ${sha.slice(0, 12)} ${size} B in ${count} parts "${name}" payer=${payer ?? (FREE ? 'free' : '?')} price=${quoted.price.usdc} USDC${skipList.length ? ` skip=${skipList.join(',')}` : ''}`);

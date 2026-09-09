@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { gatePriceMicro, gatePriceUsdc, microToUsdc, pricingFromEnv, usdcToMicro } from './gate-price.ts';
+import { gatePriceMicro, gatePriceUsdc, microToUsdc, pricingFromEnv, usdcToMicro, walrusDurationSurcharge } from './gate-price.ts';
 
 test('usdc strings round-trip through micro-units', () => {
   assert.equal(usdcToMicro('0.05'), 50_000n);
@@ -37,4 +37,15 @@ test('pricing from env: defaults, overrides, rejects', () => {
   assert.deepEqual(pricingFromEnv({ LADING_GATE_MARGIN: '1.35', LADING_GATE_FLOOR_USDC: '0.10' }), { margin: 1.35, floorUsdc: '0.10' });
   assert.throws(() => pricingFromEnv({ LADING_GATE_MARGIN: '0.5' }));
   assert.throws(() => pricingFromEnv({ LADING_GATE_FLOOR_USDC: 'free' }));
+});
+
+test('a longer walrus period adds the walrus leg pro rata per epoch past the default, rounded up; shorter adds nothing', () => {
+  assert.equal(walrusDurationSurcharge(40_000n, undefined), 0n);
+  assert.equal(walrusDurationSurcharge(40_000n, 26), 0n);
+  assert.equal(walrusDurationSurcharge(40_000n, 1), 0n);
+  assert.equal(walrusDurationSurcharge(40_000n, 52), 40_000n);
+  assert.equal(walrusDurationSurcharge(40_000n, 53), 41_539n);
+  assert.equal(walrusDurationSurcharge(40_000n, 27), 1_539n);
+  // four parts: the surcharge scales with the units, not the count
+  assert.equal(walrusDurationSurcharge(160_000n, 39), 80_000n);
 });

@@ -140,3 +140,25 @@ test('parts: status, partKnown, a finish with gaps, plan validation, and the pro
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test('estimate keeps only the chosen networks (a leg and its quote door go together); the finish rows always stay', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'lading-est-'));
+  try {
+    const l = lading(home);
+    // Route prices without an edge: flat 1,000 for a quote door, 40,000 otherwise; the arweave schedule as 10 per payload byte.
+    l.charge = async (route: string, payloadLen: number) => (route.endsWith('.quote') ? 1_000n : route === l.opts.routes.ario ? BigInt(payloadLen) * 10n : 40_000n);
+    const all = await l.estimate(1000);
+    assert.deepEqual(all.rows.map((r) => r.leg), ['arweave', 'walrus-quote', 'walrus', 'filecoin-quote', 'filecoin', 'ipfs-quote', 'ipfs', 'relay', 'manifest', 'name-quote', 'name']);
+    const two = await l.estimate(1000, undefined, ['arweave', 'walrus']);
+    assert.deepEqual(two.rows.map((r) => r.leg), ['arweave', 'walrus', 'walrus-quote', 'relay', 'manifest', 'name-quote', 'name'].sort((a, b) => all.rows.findIndex((r) => r.leg === a) - all.rows.findIndex((r) => r.leg === b)));
+    assert.equal(all.total - two.total, 2n * (1_000n + 40_000n));
+    const one = await l.estimate(1000, undefined, ['ipfs']);
+    assert.deepEqual(one.rows.map((r) => r.leg), ['ipfs-quote', 'ipfs', 'relay', 'manifest', 'name-quote', 'name']);
+    const part = await l.estimatePart(500, ['walrus']);
+    assert.deepEqual(part.rows.map((r) => r.leg), ['walrus-quote', 'walrus']);
+    assert.equal(part.total, 41_000n);
+    assert.deepEqual(one.unpriced, []);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});

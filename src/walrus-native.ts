@@ -113,9 +113,10 @@ export interface NativeExtendQuote {
 export interface NativeWalrusUploader {
   readonly address: string;
   readonly epochs: number;
-  quote(size: number): Promise<NativeWalrusQuote>;
+  /** Cost of a write of `size` bytes for `epochs` (default: this writer's). */
+  quote(size: number, epochs?: number): Promise<NativeWalrusQuote>;
   floats(): Promise<NativeWalrusFloats>;
-  upload(bytes: Uint8Array, fileName: string, log?: (line: string) => void): Promise<WalrusReceipt>;
+  upload(bytes: Uint8Array, fileName: string, log?: (line: string) => void, epochs?: number): Promise<WalrusReceipt>;
   /** Epoch number and timing, read from the chain. */
   timing(): Promise<EpochTiming>;
   /** The blob object behind an id, and whether this key owns it. */
@@ -151,10 +152,10 @@ export function nativeWalrusUploader(o: { suiSecretKey: string; epochs?: number;
       return { wal: nineDec(walFrost), sui: nineDec(suiMist), walFrost, suiMist };
     },
 
-    async quote(size) {
-      const [cost, state] = await Promise.all([client.walrus.storageCost(Math.max(size, 1), epochs), client.walrus.systemState()]);
+    async quote(size, n = epochs) {
+      const [cost, state] = await Promise.all([client.walrus.storageCost(Math.max(size, 1), n), client.walrus.systemState()]);
       const currentEpoch = Number(state.committee?.epoch ?? 0);
-      return { amountWal: nineDec(cost.totalCost), amountFrost: cost.totalCost, epochs, currentEpoch, endEpoch: currentEpoch + epochs, raw: { storageCost: cost.storageCost.toString(), writeCost: cost.writeCost.toString(), totalCost: cost.totalCost.toString() } };
+      return { amountWal: nineDec(cost.totalCost), amountFrost: cost.totalCost, epochs: n, currentEpoch, endEpoch: currentEpoch + n, raw: { storageCost: cost.storageCost.toString(), writeCost: cost.writeCost.toString(), totalCost: cost.totalCost.toString() } };
     },
 
     async timing() {
@@ -235,13 +236,13 @@ export function nativeWalrusUploader(o: { suiSecretKey: string; epochs?: number;
       };
     },
 
-    async upload(bytes, fileName, log = () => {}) {
+    async upload(bytes, fileName, log = () => {}, n = epochs) {
       const sha = sha256Hex(bytes);
       const t0 = Date.now();
       const { blobId, blobObject } = await client.walrus.writeBlob({
         blob: bytes,
         deletable: false,
-        epochs,
+        epochs: n,
         signer: keypair,
         attributes: { name: fileName.slice(0, 200), sha256: sha },
         onStep: (step) => log(`walrus-native ${fileName}: ${step.step} (${Date.now() - t0} ms)`),
@@ -273,7 +274,7 @@ export function nativeWalrusUploader(o: { suiSecretKey: string; epochs?: number;
         id: blobId,
         sha256: sha,
         size: bytes.length,
-        retention: `P${epochs * EPOCH_DAYS}D`,
+        retention: `P${n * EPOCH_DAYS}D`,
         provider: 'walrus-native',
         proof: {
           blobId,

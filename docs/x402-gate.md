@@ -116,6 +116,38 @@ the ~1.56 MB packet cap both bind). Proving it live costs about 0.6 USDC for a
 4 MiB object through the shim key, over the default cap, so the cap is raised
 for the proof.
 
+## Choices at the door (2026-09-09, backlog 8; BUILT as written, 0.16.0)
+
+What a caller may choose, and why only this. Two knobs exist in the legs
+themselves: which networks carry the object, and how many epochs Walrus keeps
+it (1..53, native writer only; Lighthouse sells exactly a year). Arweave is
+permanent, Pinata's pin is a year, Filecoin is paid per epoch out of the
+broker's deposit with no per-object term. So `networks` and `walrus-epochs`
+are the whole surface, and a fifth network is out of scope by decision.
+
+Price follows in two ways. Networks: `estimate` drops the rows of a network
+not chosen (its leg and its quote door), so the TOON bill and the door price
+shrink to what is bought; the finish (relay copy, manifest, name) always
+stays. Duration: the mesh prices a route on payload bytes (a schedule, ADR
+0065), not on a job parameter, so the broker's walrus route stays flat and
+the gate adds a surcharge at its own door: the walrus leg's units once more
+per 26 epochs past the default, pro rata per epoch, rounded up
+(`walrusDurationSurcharge`). Fewer epochs buy no discount: a write's fixed
+costs (Sui gas, the relay tip, the route) are most of a short one. The
+broker's stance on the flat route matches its extend door, which already
+sells 1..53 epochs for one flat price; reprice both if WAL climbs.
+
+Mechanics. `choices.ts` is lib-free (the shim bundles it): `parseChoices`
+validates, `skipFor` maps to the lib's skip (a new `arweaveObject` key keeps
+the object off Arweave while the manifest, page and name stay anchored),
+`choiceHeaders` / `choiceQuery` carry them. The broker's `/walrus` and its
+quote take `epochs`; given, `chooseWalrus` goes native (or answers not
+deliverable when the broker only has Lighthouse). `partKnown` and the
+multipart "held" checks now run over the chosen networks, so a resumed put
+with a narrower choice is still answered at the floor. A hash already
+archived is handed back whatever is chosen: choices shape a new archive.
+Blossom uploads stay on the defaults (no BUD carries such a field).
+
 ## Why a shim
 
 Claude's own MCP client cannot sign x402 payments. So either a local process

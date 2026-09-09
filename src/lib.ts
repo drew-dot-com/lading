@@ -140,6 +140,13 @@ const timesDecimal = (v: string, n: number) => {
   return `${u / 10n ** 18n}.${(u % 10n ** 18n).toString().padStart(18, '0')}`.replace(/(\.\d*?[1-9])0+$|\.0+$/, '$1');
 };
 /** What a walrus quote says the write costs downstream, in the float's asset: `amount`/`asset` when the door sent them, else the Lighthouse USDC. */
+/** Drop the rows of networks not chosen (a leg and its quote door share the network's name); the finish rows always stay. */
+const onlyNetworks = (networks: readonly Network[], rows: QuoteRow[]) =>
+  rows.filter((r) => {
+    const net = r.leg.replace(/-quote$/, '');
+    return !(NETWORKS as readonly string[]).includes(net) || networks.includes(net as Network);
+  });
+
 const walrusNeed = (q: WalrusQuote, n: number) => {
   const asset = q.downstream.asset ?? 'USDC';
   const amount = q.downstream.amount ?? q.downstream.amountUsdc;
@@ -200,7 +207,14 @@ export interface PutOptions {
   partBytes?: number;
   /** Quote each broker leg before paying it (default true). */
   quote?: boolean;
-  skip?: Partial<Record<'arweave' | 'walrus' | 'filecoin' | 'ipfs' | 'relay' | 'name', boolean>>;
+  /**
+   * Legs to leave out. `arweave` keeps everything off Arweave (no manifest,
+   * page or name either); `arweaveObject` keeps only the object's bytes off it,
+   * the bill of lading still anchored there (what a door's network choice means).
+   */
+  skip?: Partial<Record<'arweave' | 'arweaveObject' | 'walrus' | 'filecoin' | 'ipfs' | 'relay' | 'name', boolean>>;
+  /** Walrus storage period in two-week epochs, 1..53; unset = the broker's default (26). Set, the native writer takes the leg. */
+  walrusEpochs?: number;
   /** Recorded on the manifest when the put came through a door other than the CLI. */
   via?: ManifestContent['via'];
   /** Archive again even when this home already holds a manifest for the same bytes (default false: the saved record is returned, nothing re-bought). */
@@ -243,6 +257,7 @@ export interface PartPutOptions {
   mime?: string;
   quote?: boolean;
   skip?: PutOptions['skip'];
+  walrusEpochs?: number;
 }
 
 export interface PartResult {
@@ -588,8 +603,8 @@ export class Lading {
   }
 
   /** Ask the walrus quote door whether an object of this size would go through right now. 1,000 units, against 40,000 for the leg. */
-  quoteWalrus(size: number, name: string): Promise<Paid<WalrusQuote>> {
-    const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'walrus', phase: 'quote', size: String(size), name } });
+  quoteWalrus(size: number, name: string, epochs?: number): Promise<Paid<WalrusQuote>> {
+    const ev = buildJobEvent({ kind: LEG_KIND, params: { op: 'walrus', phase: 'quote', size: String(size), name, ...(epochs ? { epochs: String(epochs) } : {}) } });
     return this.job<WalrusQuote>(this.opts.routes.walrusQuote, ev as never, 60_000);
   }
 
@@ -632,9 +647,9 @@ export class Lading {
   private manifestGuess = (n: number) => 1200 + 4 * 400 + (n > 1 ? 4 * n * 400 : 0);
 
   /** The bill for one slice of `size` bytes on the four networks, each quote door asked once: what the gate charges per `POST /v1/parts`. Free. */
-  async estimatePart(size: number): Promise<Estimate> {
+  async estimatePart(size: number, networks: readonly Network[] = NETWORKS): Promise<Estimate> {
     const R = this.opts.routes;
-    const rows: QuoteRow[] = [
+    const rows: QuoteRow[] = onlyNetworks(networks, [
       { leg: 'arweave', route: R.ario, price: await this.charge(R.ario, this.eventBytes({}, size)), note: 'schedule on the payload' },
       { leg: 'walrus-quote', route: R.walrusQuote, price: await this.charge(R.walrusQuote, 0), note: 'quote door' },
       { leg: 'walrus', route: R.walrus, price: await this.charge(R.walrus, 0), note: 'flat' },
@@ -642,7 +657,7 @@ export class Lading {
       { leg: 'filecoin', route: R.filecoin, price: await this.charge(R.filecoin, 0), note: 'flat' },
       { leg: 'ipfs-quote', route: R.ipfsQuote, price: await this.charge(R.ipfsQuote, 0), note: 'quote door' },
       { leg: 'ipfs', route: R.ipfs, price: await this.charge(R.ipfs, 0), note: 'flat' },
-    ];
+    ]);
     const unpriced = [...new Set(rows.filter((r) => r.price === null).map((r) => r.route))];
     return { size, parts: 1, rows, total: rows.reduce((a, r) => a + (r.price ?? 0n), 0n), unpriced };
   }
@@ -666,7 +681,7 @@ export class Lading {
    * This is what the gate charges against, so it is deliberately the ceiling
    * (a leg that is skipped at run time only makes the real bill smaller).
    */
-  async estimate(size: number, partBytes = DEFAULT_PART_BYTES): Promise<Estimate> {
+  async estimate(size: number, partBytes = DEFAULT_PART_BYTES, networks: readonly Network[] = NETWORKS): Promise<Estimate> {
     const R = this.opts.routes;
     const parts = planParts(size, partBytes);
     const n = parts.length;
@@ -686,7 +701,7 @@ export class Lading {
     };
     const quote = async (route: string) => this.charge(route, 0);
     const partsNote = n > 1 ? ` × ${n} parts` : '';
-    const rows: QuoteRow[] = [
+    const rows: QuoteRow[] = onlyNetworks(networks, [
       { leg: 'arweave', route: R.ario, price: await perPart(R.ario), note: `schedule on the payload${partsNote}` },
       { leg: 'walrus-quote', route: R.walrusQuote, price: await quote(R.walrusQuote), note: 'quote door' },
       { leg: 'walrus', route: R.walrus, price: await flat(R.walrus), note: `flat${partsNote}` },
@@ -698,7 +713,7 @@ export class Lading {
       { leg: 'manifest', route: R.ario, price: await this.charge(R.ario, this.manifestGuess(n)), note: 'manifest on Arweave, estimate' },
       { leg: 'name-quote', route: R.nameQuote, price: await quote(R.nameQuote), note: 'quote door' },
       { leg: 'name', route: R.name, price: await this.charge(R.name, 0), note: 'flat' },
-    ];
+    ]);
     for (const r of rows) if (r.price === null) unpriced.push(r.route);
     const total = rows.reduce((a, r) => a + (r.price ?? 0n), 0n);
     return { size, parts: n, rows, total, unpriced: [...new Set(unpriced)] };
@@ -707,7 +722,7 @@ export class Lading {
   // ---- legs ----
 
   /** The job that buys one part on one network, and how its outcome prints. */
-  private legSender(network: Network, o: { name: string; mime?: string }): { send: (part: Part, name: string) => Promise<PartOutcome>; line: (out: PartOutcome) => string } {
+  private legSender(network: Network, o: { name: string; mime?: string; walrusEpochs?: number }): { send: (part: Part, name: string) => Promise<PartOutcome>; line: (out: PartOutcome) => string } {
     const R = this.opts.routes;
     const blobEvent = (kind: number, params: Record<string, string>, part: Part, extra: string[][] = []) =>
       buildJobEvent({ kind, params, tags: [['i', Buffer.from(part.bytes).toString('base64'), 'blob'], ...extra] });
@@ -727,7 +742,7 @@ export class Lading {
     if (network === 'walrus')
       return {
         send: async (part, pname) => {
-          const r = await this.job<WalrusReceipt>(R.walrus, blobEvent(LEG_KIND, { op: 'walrus', name: pname || o.name }, part) as never, 240_000);
+          const r = await this.job<WalrusReceipt>(R.walrus, blobEvent(LEG_KIND, { op: 'walrus', name: pname || o.name, ...(o.walrusEpochs ? { epochs: String(o.walrusEpochs) } : {}) }, part) as never, 240_000);
           return { id: r.receipt.id, sha256: r.receipt.sha256, proof: r.receipt.proof, retention: r.receipt.retention, provider: r.receipt.provider, route: r.route, price: r.price };
         },
         line: (out) => `${out.id}  readback=${out.proof?.readback}`,
@@ -758,11 +773,11 @@ export class Lading {
    * whole object's part count, for the log tag and the part names. Nothing is
    * sealed here; sealLeg does that once every part of the object is in.
    */
-  private async buyParts(o: { network: Network; sha: string; count: number; parts: Part[]; prog: Progress; paid: PaidRow[]; t0: number; baseName: string; mime?: string }): Promise<void> {
+  private async buyParts(o: { network: Network; sha: string; count: number; parts: Part[]; prog: Progress; paid: PaidRow[]; t0: number; baseName: string; mime?: string; walrusEpochs?: number }): Promise<void> {
     const { network, prog, count } = o;
     if (prog.legs[network]) return;
     const have = (prog.parts[network] ??= []);
-    const { send, line } = this.legSender(network, { name: o.baseName, mime: o.mime });
+    const { send, line } = this.legSender(network, { name: o.baseName, mime: o.mime, walrusEpochs: o.walrusEpochs });
     for (const part of o.parts) {
       const tag = count === 1 ? network.padEnd(8) : `${network}#${part.index + 1}/${count}`.padEnd(8);
       const prior = have.find((r) => r.index === part.index);
@@ -849,18 +864,18 @@ export class Lading {
    * with several parts the float must cover them all. A refused Walrus quote
    * throws (nothing paid); a refused Filecoin or IPFS quote skips that network.
    */
-  private async runLegs(o: { sha: string; size: number; count: number; parts: Part[]; prog: Progress; paid: PaidRow[]; t0: number; name: string; mime?: string; skip: NonNullable<PutOptions['skip']>; quote: boolean }): Promise<void> {
+  private async runLegs(o: { sha: string; size: number; count: number; parts: Part[]; prog: Progress; paid: PaidRow[]; t0: number; name: string; mime?: string; skip: NonNullable<PutOptions['skip']>; quote: boolean; walrusEpochs?: number }): Promise<void> {
     const { prog, paid, t0, skip } = o;
     const largest = Math.max(...o.parts.map((x) => x.size));
     const left = (network: Network) => o.parts.filter((p) => !prog.parts[network]?.some((r) => r.index === p.index)).length;
-    const common = { sha: o.sha, count: o.count, parts: o.parts, prog, paid, t0, baseName: o.name, mime: o.mime };
+    const common = { sha: o.sha, count: o.count, parts: o.parts, prog, paid, t0, baseName: o.name, mime: o.mime, walrusEpochs: o.walrusEpochs };
 
-    if (!skip.arweave) await this.buyParts({ ...common, network: 'arweave' });
+    if (!skip.arweave && !skip.arweaveObject) await this.buyParts({ ...common, network: 'arweave' });
 
     if (!skip.walrus && !prog.legs.walrus) {
       const n = left('walrus');
       if (o.quote && n > 0) {
-        const q = await this.quoteWalrus(largest, o.name);
+        const q = await this.quoteWalrus(largest, o.name, o.walrusEpochs);
         paid.push({ leg: 'walrus-quote', route: q.route, price: q.price });
         const { asset, need, short } = walrusNeed(q.receipt, n);
         this.log(`walrus   quote ${fmtQuote(q.receipt)}${n > 1 ? `, ${n} parts need ${need} ${asset}` : ''}  (${Date.now() - t0} ms)`);
@@ -1049,7 +1064,7 @@ export class Lading {
       this.log(`resuming: ${Object.keys(prog.legs).join(',') || 'no'} legs and ${Object.entries(prog.parts).map(([k, v]) => `${k}=${v?.length ?? 0}`).join(' ') || 'no'} parts already bought`);
     }
     const t0 = Date.now();
-    await this.runLegs({ sha, size: bytes.length, count: n, parts, prog, paid, t0, name, mime: po.mime, skip, quote: doQuote });
+    await this.runLegs({ sha, size: bytes.length, count: n, parts, prog, paid, t0, name, mime: po.mime, skip, quote: doQuote, walrusEpochs: po.walrusEpochs });
     const { legs, incomplete } = this.sealAll({ sha, size: bytes.length, plan: parts, prog, skip });
     const gaps = Object.entries(incomplete);
     if (gaps.length) throw new Error(`parts missing after the legs ran: ${gaps.map(([k, v]) => `${k} ${v.join(',')}`).join('; ')}`);
@@ -1081,11 +1096,11 @@ export class Lading {
     const prog = this.loadProgress(o.sha256);
     const paid: PaidRow[] = [];
     const t0 = Date.now();
-    await this.runLegs({ sha: o.sha256, size: o.size, count: o.count, parts: [part], prog, paid, t0, name: o.name, mime: o.mime, skip: o.skip ?? {}, quote: o.quote !== false });
+    await this.runLegs({ sha: o.sha256, size: o.size, count: o.count, parts: [part], prog, paid, t0, name: o.name, mime: o.mime, skip: o.skip ?? {}, quote: o.quote !== false, walrusEpochs: o.walrusEpochs });
     const receipts: PartResult['receipts'] = {};
     const missing: Network[] = [];
     for (const network of NETWORKS) {
-      if (o.skip?.[network]) continue;
+      if (o.skip?.[network] || (network === 'arweave' && o.skip?.arweaveObject)) continue;
       const r = prog.parts[network]?.find((x) => x.index === o.index);
       if (r) receipts[network] = r;
       else missing.push(network);
@@ -1115,7 +1130,7 @@ export class Lading {
     if (!Object.keys(prog.legs).length && !Object.values(prog.parts).some((v) => v?.length)) throw new InputError(`no parts bought for ${sha}; send them to /v1/parts first`);
     const skip = o.skip ?? {};
     const { legs, incomplete } = this.sealAll({ sha, size: o.size, plan, prog, skip });
-    if (!skip.arweave && !legs.some((l) => l.network === 'arweave') && !incomplete.arweave) incomplete.arweave = plan.map((p) => p.index);
+    if (!skip.arweave && !skip.arweaveObject && !legs.some((l) => l.network === 'arweave') && !incomplete.arweave) incomplete.arweave = plan.map((p) => p.index);
     const gaps = Object.entries(incomplete);
     if (gaps.length) throw new PartsMissingError(sha, incomplete);
     await this.client();
@@ -1139,11 +1154,11 @@ export class Lading {
     return { sha256: sha, archived: !!prior, manifestTxId: prior?.manifestTxId, name: prior?.name?.name, networks, paidUnits: paidUnits.toString() };
   }
 
-  /** True when this slice is already bought on arweave and walrus, the two legs a finish requires: the gate answers such a part at the floor. */
-  partKnown(sha: string, index: number, partSha: string): boolean {
+  /** True when this slice is already bought on every network in `networks` (the caller's choice; arweave and walrus by default): the gate answers such a part at the floor. */
+  partKnown(sha: string, index: number, partSha: string, networks: readonly Network[] = ['arweave', 'walrus']): boolean {
     if (this.archived(sha)) return true;
     const prog = this.loadProgress(sha);
-    return (['arweave', 'walrus'] as const).every((n) => prog.legs[n] !== undefined || prog.parts[n]?.some((r) => r.index === index && r.sha256 === partSha));
+    return networks.every((n) => prog.legs[n] !== undefined || prog.parts[n]?.some((r) => r.index === index && r.sha256 === partSha));
   }
 
   /** Drop progress files older than `maxAgeMs` (objects whose parts were bought but never finished). Returns what was removed. */
@@ -1523,41 +1538,53 @@ export class Lading {
   }
 
   /** The whole bill before paying it: route prices from the edge, deliverability from the three quote doors. Costs three quotes. */
-  async quote(bytes: Uint8Array, o: { name: string; undername?: string; partBytes?: number }): Promise<QuoteResult> {
+  async quote(bytes: Uint8Array, o: { name: string; undername?: string; partBytes?: number; networks?: readonly Network[]; walrusEpochs?: number }): Promise<QuoteResult> {
     const R = this.opts.routes;
+    const nets = o.networks ?? NETWORKS;
     const sha = sha256(bytes);
     const undername = o.undername ?? undernameFor(sha);
     const parts = planParts(bytes.length, o.partBytes ?? DEFAULT_PART_BYTES);
     const n = parts.length;
     const largest = Math.max(...parts.map((q) => q.size));
-    const est = await this.estimate(bytes.length, o.partBytes ?? DEFAULT_PART_BYTES);
+    const est = await this.estimate(bytes.length, o.partBytes ?? DEFAULT_PART_BYTES, nets);
     const row = (leg: string) => est.rows.find((r) => r.leg === leg)!;
     const rows: QuoteRow[] = [];
-    rows.push(row('arweave'));
-    const wq = await this.quoteWalrus(largest, o.name);
-    const { asset: wAsset, need: wNeed, short: wShort } = walrusNeed(wq.receipt, n);
-    const wGo = wq.receipt.deliverable && !wShort;
-    rows.push({ leg: 'walrus-quote', route: wq.route, price: wq.price, note: fmtQuote(wq.receipt) + (n > 1 ? `, ${n} parts need ${wNeed} ${wAsset}${wShort ? ' (SHORT)' : ''}` : '') });
-    rows.push({ leg: 'walrus', route: R.walrus, price: wGo ? row('walrus').price : 0n, note: wGo ? row('walrus').note : 'would not be paid' });
-    const fq = await this.quoteFilecoin(largest, o.name);
-    const fNeed = timesMicro(fq.receipt.downstream.addPieceFeeUsdfc, n);
-    const fShort = fq.receipt.deliverable && n > 1 && micro(fq.receipt.float.available) < micro(fNeed);
-    const fGo = fq.receipt.deliverable && !fShort;
-    rows.push({ leg: 'filecoin-quote', route: fq.route, price: fq.price, note: fmtQuote(fq.receipt) + (n > 1 ? `, ${n} parts need ${fNeed} USDFC in fees${fShort ? ' (SHORT)' : ''}` : '') });
-    rows.push({ leg: 'filecoin', route: R.filecoin, price: fGo ? row('filecoin').price : 0n, note: fGo ? row('filecoin').note : 'would be skipped' });
-    const iq = await this.quoteIpfs(largest, o.name);
-    const iNeed = timesMicro(iq.receipt.downstream.amountUsdc, n);
-    const iShort = iq.receipt.deliverable && n > 1 && micro(iq.receipt.float.balance) < micro(iNeed);
-    const iGo = iq.receipt.deliverable && !iShort;
-    rows.push({ leg: 'ipfs-quote', route: iq.route, price: iq.price, note: fmtQuote(iq.receipt) + (n > 1 ? `, ${n} parts need ${iNeed} USDC${iShort ? ' (SHORT)' : ''}` : '') });
-    rows.push({ leg: 'ipfs', route: R.ipfs, price: iGo ? row('ipfs').price : 0n, note: iGo ? row('ipfs').note : 'would be skipped' });
+    let quotesPaid = 0n;
+    if (nets.includes('arweave')) rows.push(row('arweave'));
+    if (nets.includes('walrus')) {
+      const wq = await this.quoteWalrus(largest, o.name, o.walrusEpochs);
+      quotesPaid += wq.price ?? 0n;
+      const { asset: wAsset, need: wNeed, short: wShort } = walrusNeed(wq.receipt, n);
+      const wGo = wq.receipt.deliverable && !wShort;
+      rows.push({ leg: 'walrus-quote', route: wq.route, price: wq.price, note: fmtQuote(wq.receipt) + (n > 1 ? `, ${n} parts need ${wNeed} ${wAsset}${wShort ? ' (SHORT)' : ''}` : '') });
+      rows.push({ leg: 'walrus', route: R.walrus, price: wGo ? row('walrus').price : 0n, note: wGo ? row('walrus').note : 'would not be paid' });
+    }
+    if (nets.includes('filecoin')) {
+      const fq = await this.quoteFilecoin(largest, o.name);
+      quotesPaid += fq.price ?? 0n;
+      const fNeed = timesMicro(fq.receipt.downstream.addPieceFeeUsdfc, n);
+      const fShort = fq.receipt.deliverable && n > 1 && micro(fq.receipt.float.available) < micro(fNeed);
+      const fGo = fq.receipt.deliverable && !fShort;
+      rows.push({ leg: 'filecoin-quote', route: fq.route, price: fq.price, note: fmtQuote(fq.receipt) + (n > 1 ? `, ${n} parts need ${fNeed} USDFC in fees${fShort ? ' (SHORT)' : ''}` : '') });
+      rows.push({ leg: 'filecoin', route: R.filecoin, price: fGo ? row('filecoin').price : 0n, note: fGo ? row('filecoin').note : 'would be skipped' });
+    }
+    if (nets.includes('ipfs')) {
+      const iq = await this.quoteIpfs(largest, o.name);
+      quotesPaid += iq.price ?? 0n;
+      const iNeed = timesMicro(iq.receipt.downstream.amountUsdc, n);
+      const iShort = iq.receipt.deliverable && n > 1 && micro(iq.receipt.float.balance) < micro(iNeed);
+      const iGo = iq.receipt.deliverable && !iShort;
+      rows.push({ leg: 'ipfs-quote', route: iq.route, price: iq.price, note: fmtQuote(iq.receipt) + (n > 1 ? `, ${n} parts need ${iNeed} USDC${iShort ? ' (SHORT)' : ''}` : '') });
+      rows.push({ leg: 'ipfs', route: R.ipfs, price: iGo ? row('ipfs').price : 0n, note: iGo ? row('ipfs').note : 'would be skipped' });
+    }
     rows.push(row('relay'));
     rows.push(row('manifest'));
     const nq = await this.quoteName(undername);
+    quotesPaid += nq.price ?? 0n;
     rows.push({ leg: 'name-quote', route: nq.route, price: nq.price, note: fmtQuote(nq.receipt) });
     rows.push({ leg: 'name', route: R.name, price: nq.receipt.deliverable ? row('name').price : 0n, note: nq.receipt.deliverable ? 'flat' : 'would be skipped' });
     const total = rows.reduce((a, r) => a + (r.price ?? 0n), 0n);
-    return { sha256: sha, size: bytes.length, parts: n, largestPart: largest, rows, total, quotesPaid: (wq.price ?? 0n) + (fq.price ?? 0n) + (iq.price ?? 0n) + (nq.price ?? 0n) };
+    return { sha256: sha, size: bytes.length, parts: n, largestPart: largest, rows, total, quotesPaid };
   }
 }
 
