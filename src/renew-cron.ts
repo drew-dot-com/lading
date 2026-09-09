@@ -7,7 +7,10 @@
  * through the extend doors (quote, then `epochs` more), Lighthouse records
  * through the renew doors (quote, then a year). Every purchase goes through
  * `renew`, so the saved file gets the new date the same way a hand renewal
- * does. What the run found and bought is one report; the gate keeps the last
+ * does. A record the caller bought short on purpose (a period under the
+ * broker's default year, chosen at the door) is left alone: the timer keeps
+ * year-long records alive, it does not turn 28 days into a year. What the run
+ * found and bought is one report; the gate keeps the last
  * one on disk, publishes it as a float row (`renewals`: not ok when a due
  * record is still unrenewed, so refuel's probe raises it like an empty key)
  * and pushes it to ntfy when something needs a human. The CLI runs the same
@@ -41,6 +44,8 @@ export interface RenewRunReport {
   skipped: Array<{ handle: string; label: string; reason: string }>;
   /** Due records whose renewal threw: money may have moved, the record is still due. */
   failed: Array<{ handle: string; label: string; error: string }>;
+  /** Due records left alone because their period was chosen short at write time (under the default year). Not a problem. */
+  leftShort?: Array<{ handle: string; label: string; chosenDays: number }>;
   /** Base units paid over the run, as a decimal string. */
   total: string;
   /** Days left on the soonest record after the run, when any record carries a date. */
@@ -49,6 +54,9 @@ export interface RenewRunReport {
   /** The date each record carried after the live pass (and any purchase), by handle: what the saved files may not hold yet. */
   dates?: Record<string, { expiresAt: number; endEpoch?: number }>;
 }
+
+/** A record bought for fewer days than this was chosen short: the timer does not renew it. The broker's default Walrus period is 26 epochs = 364 days. */
+export const DEFAULT_PERIOD_DAYS = 364;
 
 export interface RenewDueOptions {
   /** Records within this many days of running out are renewed. */
@@ -99,6 +107,12 @@ export async function renewDue(lading: Renewer, o: RenewDueOptions): Promise<Ren
   const after = new Map(rows.map((r) => [r.handle, r] as const));
   for (const r of due) {
     const l = label(r);
+    if (r.chosenDays !== undefined && r.chosenDays < DEFAULT_PERIOD_DAYS && r.renewals === 0) {
+      // Bought short on purpose and never renewed by hand: the caller's choice stands.
+      (report.leftShort ??= []).push({ handle: r.handle, label: l, chosenDays: r.chosenDays });
+      log(`renew-due: ${l} ${r.handle} left alone: bought for ${r.chosenDays} days by choice`);
+      continue;
+    }
     try {
       const res = await run(() => lading.renew(r.handle, { epochs: o.epochs }));
       total += res.total;
@@ -116,7 +130,9 @@ export async function renewDue(lading: Renewer, o: RenewDueOptions): Promise<Ren
       log(`renew-due: ${l} ${r.handle} FAILED: ${(e as Error).message}`);
     }
   }
-  const dated = [...after.values()].filter((r) => !Number.isNaN(r.daysLeft)).sort((a, b) => a.daysLeft - b.daysLeft);
+  // The soonest record the timer is responsible for: one left short by choice does not count.
+  const short = new Set((report.leftShort ?? []).map((x) => x.handle));
+  const dated = [...after.values()].filter((r) => !Number.isNaN(r.daysLeft) && !short.has(r.handle)).sort((a, b) => a.daysLeft - b.daysLeft);
   if (dated.length) {
     report.soonestDays = dated[0].daysLeft;
     report.soonestHandle = dated[0].handle;
@@ -124,7 +140,7 @@ export async function renewDue(lading: Renewer, o: RenewDueOptions): Promise<Ren
   report.dates = Object.fromEntries(dated.map((r) => [r.handle, { expiresAt: r.expiresAt, ...(r.endEpoch !== undefined ? { endEpoch: r.endEpoch } : {}) }]));
   report.total = total.toString();
   report.ms = now() - t0;
-  log(`renew-due: done in ${report.ms} ms, bought ${report.bought.length}, skipped ${report.skipped.length}, failed ${report.failed.length}, paid ${report.total} units, soonest ${report.soonestDays ?? '?'} days`);
+  log(`renew-due: done in ${report.ms} ms, bought ${report.bought.length}, skipped ${report.skipped.length}, failed ${report.failed.length}${report.leftShort?.length ? `, left short by choice ${report.leftShort.length}` : ''}, paid ${report.total} units, soonest ${report.soonestDays ?? '?'} days`);
   return report;
 }
 

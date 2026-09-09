@@ -31,7 +31,15 @@ export interface RenewalRow {
   /** NaN when no date is known (a native record from before expiresAt went on the receipt; `--live` fills it in). */
   daysLeft: number;
   name?: string;
+  /** The period bought at write time, in days, from the leg's `retention` (P28D = 28): what the caller chose. Unset for an older or unparsed receipt. */
+  chosenDays?: number;
 }
+
+/** Days in an ISO-8601 `PnD` retention, or undefined for anything else. */
+export const retentionDays = (retention: string | undefined): number | undefined => {
+  const m = /^P(\d+)D$/.exec(retention ?? '');
+  return m ? Number(m[1]) : undefined;
+};
 
 /** A renewal the payer bought, as appended to the saved manifest file. Lighthouse rows carry `lighthouseId`, native rows `objectId` + epochs. */
 export interface SavedRenewal {
@@ -99,6 +107,7 @@ export function walrusRecords(saved: SavedPut, nowMs = Date.now()): RenewalRow[]
         renewals,
         daysLeft: expiresAt > 0 ? daysLeft(expiresAt, nowMs) : Number.NaN,
         name: saved.name?.name,
+        ...(retentionDays(leg.retention) !== undefined ? { chosenDays: retentionDays(leg.retention) } : {}),
       });
     }
   }

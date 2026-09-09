@@ -384,7 +384,10 @@ The gate keeps its own records alive on a timer (0.15). Once a day
 one that runs out within `LADING_RENEW_WITHIN_DAYS` (30; 0 turns the timer
 off): native records get `LADING_RENEW_EPOCHS` more (unset = the door's 26),
 Lighthouse ones a year, every purchase quoted first and recorded in the
-saved file like a hand renewal. One put at a time still holds: a renewal
+saved file like a hand renewal. A record bought short by choice at the door
+(a Walrus period under the default year, never renewed by hand) is left
+alone: the timer keeps year-long records alive, it does not turn 28 days
+into a year. One put at a time still holds: a renewal
 waits behind any put on the gate's channel. The last run is kept at
 `LADING_HOME/renew-cron.json`, served free at `GET /v1/renewals` with every
 record's saved date, and judged as the `renewals` float row (balance = days

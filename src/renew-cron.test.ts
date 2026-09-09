@@ -102,6 +102,28 @@ test('when the live pass fails the run uses the saved dates and says so', async 
   assert.ok(!runOk(rep));
 });
 
+test('a record bought short by choice is left alone; once renewed by hand it is kept like any other', async () => {
+  const calls: string[] = [];
+  const rows = [row({ handle: '0x' + 'a'.repeat(64), daysLeft: 10, chosenDays: 28 }), row({ handle: '0x' + 'b'.repeat(64), daysLeft: 10, chosenDays: 28, renewals: 1 }), row({ handle: '0x' + 'c'.repeat(64), daysLeft: 10, chosenDays: 364 })];
+  const r: Renewer = {
+    async renewals(q) {
+      return { rows, due: rows.filter((x) => x.daysLeft <= (q.within ?? 60)), within: q.within ?? 60 };
+    },
+    async renew(ref) {
+      calls.push(ref);
+      return { rows: [{ handle: ref, expiresAt: NOW + 374 * DAY, endEpoch: 70 }], bought: 1, total: 41_000n };
+    },
+  };
+  const rep = await renewDue(r, { within: 30, now: () => NOW });
+  assert.deepEqual(calls, ['0x' + 'b'.repeat(64), '0x' + 'c'.repeat(64)]);
+  assert.deepEqual(rep.leftShort, [{ handle: '0x' + 'a'.repeat(64), label: 'abababababab native', chosenDays: 28 }]);
+  assert.equal(rep.bought.length, 2);
+  assert.ok(runOk(rep));
+  // the short record does not set the soonest date: the two renewed ones do
+  assert.equal(rep.soonestDays, 374);
+  assert.equal(notification(rep)?.priority, 'low');
+});
+
 test('nothing due is a quiet run', async () => {
   const { r, calls } = payer();
   const rep = await renewDue(r, { within: 5, now: () => NOW });
