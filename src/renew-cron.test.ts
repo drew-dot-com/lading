@@ -53,6 +53,10 @@ test('a run dates every record live, renews what is due through renew, and repor
   assert.equal(rep.soonestHandle, '11111111-2222-3333-4444-555555555555');
   assert.ok(runOk(rep));
   assert.ok(lines.some((l) => l.includes('2 due within 30 days')));
+  // the live pass dated the undated record and the purchases moved two dates
+  assert.equal(Object.keys(rep.dates ?? {}).length, 3);
+  assert.deepEqual(rep.dates?.['0x' + '2'.repeat(64)], { expiresAt: NOW + 376 * DAY, endEpoch: 91 });
+  assert.deepEqual(rep.dates?.['11111111-2222-3333-4444-555555555555'], { expiresAt: NOW + 300 * DAY });
 });
 
 test('epochs pass through to every native renewal', async () => {

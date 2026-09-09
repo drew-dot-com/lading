@@ -46,6 +46,8 @@ export interface RenewRunReport {
   /** Days left on the soonest record after the run, when any record carries a date. */
   soonestDays: number | null;
   soonestHandle?: string;
+  /** The date each record carried after the live pass (and any purchase), by handle: what the saved files may not hold yet. */
+  dates?: Record<string, { expiresAt: number; endEpoch?: number }>;
 }
 
 export interface RenewDueOptions {
@@ -119,6 +121,7 @@ export async function renewDue(lading: Renewer, o: RenewDueOptions): Promise<Ren
     report.soonestDays = dated[0].daysLeft;
     report.soonestHandle = dated[0].handle;
   }
+  report.dates = Object.fromEntries(dated.map((r) => [r.handle, { expiresAt: r.expiresAt, ...(r.endEpoch !== undefined ? { endEpoch: r.endEpoch } : {}) }]));
   report.total = total.toString();
   report.ms = now() - t0;
   log(`renew-due: done in ${report.ms} ms, bought ${report.bought.length}, skipped ${report.skipped.length}, failed ${report.failed.length}, paid ${report.total} units, soonest ${report.soonestDays ?? '?'} days`);

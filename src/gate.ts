@@ -527,12 +527,17 @@ app.get('/v1/floats', async (_req, res, next) => {
 
 app.get('/v1/renewals', async (_req, res, next) => {
   try {
-    // Saved dates only: the live pass pays quote doors and belongs to the timer.
+    // Saved dates, overlaid with what the timer's last live pass read: the live pass pays quote doors and belongs to the timer.
     const { rows } = await lading.renewals({ within: RENEW_WITHIN_DAYS || 30, live: false });
+    const live = lastRenewRun?.dates ?? {};
     res.json({
       timer: RENEW_WITHIN_DAYS > 0 ? { within: RENEW_WITHIN_DAYS, everyHours: RENEW_EVERY_MS / 3_600_000, epochs: RENEW_EPOCHS ?? null, running: !!renewRunning } : null,
       lastRun: lastRenewRun ?? null,
-      records: rows.map((r) => ({ sha256: r.sha256, part: r.part, parts: r.parts, provider: r.provider, handle: r.handle, blobId: r.blobId, expiresAt: r.expiresAt || null, endEpoch: r.endEpoch ?? null, daysLeft: Number.isNaN(r.daysLeft) ? null : r.daysLeft, renewals: r.renewals, name: r.name ?? null })),
+      records: rows.map((r) => {
+        const d = live[r.handle];
+        const expiresAt = d?.expiresAt || r.expiresAt || 0;
+        return { sha256: r.sha256, part: r.part, parts: r.parts, provider: r.provider, handle: r.handle, blobId: r.blobId, expiresAt: expiresAt || null, endEpoch: d?.endEpoch ?? r.endEpoch ?? null, daysLeft: expiresAt ? Math.floor((expiresAt - Date.now()) / 86_400_000) : null, datedBy: d ? 'live' : expiresAt ? 'saved' : null, renewals: r.renewals, name: r.name ?? null };
+      }),
     });
   } catch (e) {
     next(e);
