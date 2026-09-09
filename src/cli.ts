@@ -27,6 +27,8 @@
  *                           through the renew door for a Lighthouse record, --epochs
  *                           (default 26) through the extend door for a native one;
  *                           quote first; the saved file records the new date.
+ *   lading renew-due        renew every record due within --within days (default
+ *                           30) after dating them live; what the gate's timer runs.
  *   lading describe         what the node serves.
  *   lading mcp --gate <url> run the MCP shim over stdio: tools for Claude that
  *                           pay a hosted Lading gate per call with the Base key in
@@ -36,6 +38,7 @@ import { readFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { DEFAULT_PART_BYTES } from './parts.js';
 import { fmtDate } from './renewals.js';
+import { notification, renewDue } from './renew-cron.js';
 import { Lading, optionsFromEnv, partLabel } from './lib.js';
 import { installLongFetch } from './long-fetch.js';
 installLongFetch();
@@ -105,6 +108,17 @@ async function renew(ref: string) {
   console.log(`\nrenewed ${r.bought} of ${r.targets} records, paid ${r.total} base units`);
 }
 
+async function renewDueCmd() {
+  const within = Number(opt('within') ?? 30);
+  if (!Number.isInteger(within) || within < 0) throw new Error(`--within must be a whole number of days, got ${opt('within')}`);
+  const epochs = opt('epochs') === undefined ? undefined : Number(opt('epochs'));
+  if (epochs !== undefined && (!Number.isInteger(epochs) || epochs < 1 || epochs > 53)) throw new Error(`--epochs must be 1..53, got ${opt('epochs')}`);
+  const r = await renewDue(lading, { within, epochs, log: (l) => console.log(l) });
+  const n = notification(r);
+  console.log(n ? `\n${n.title}\n${n.body}` : `\nnothing due within ${within} days; soonest record runs out in ${r.soonestDays ?? '?'} days`);
+  process.exitCode = r.failed.length || r.skipped.length ? 1 : 0;
+}
+
 async function page(ref: string) {
   const shas = ref === 'all' ? lading.savedPuts().filter((p) => p.saved.manifestTxId).map((p) => p.sha) : [ref];
   if (shas.length === 0) throw new Error(`no saved puts under ${join(home, 'manifests')}`);
@@ -153,6 +167,7 @@ const run =
   : cmd === 'page' && arg ? page(arg)
   : cmd === 'renewals' ? renewals()
   : cmd === 'renew' && arg ? renew(arg)
+  : cmd === 'renew-due' ? renewDueCmd()
   : cmd === 'describe' ? describe()
   : cmd === 'mcp' ? mcp()
   : null;
@@ -165,6 +180,7 @@ if (!run) {
       '       lading page <sha256|all> [--no-quote] [--force]   (write the bill of lading page + path manifest, point the name at them; --force re-renders an existing page)\n' +
       '       lading renewals [--within days] [--live]\n' +
       '       lading renew <sha256|lighthouse-record-id|sui-object-id> [--no-quote] [--epochs n]   (Lighthouse records renew a year; native records extend by n epochs, default 26)\n' +
+      '       lading renew-due [--within days] [--epochs n]   (date every record live, renew what runs out within the window; default 30 days)\n' +
       '       lading describe\n' +
       '       lading mcp --gate <url> [--autokey]          (LADING_X402_KEY pays; LADING_MAX_USDC_PER_CALL caps a call, default 0.50)',
   );

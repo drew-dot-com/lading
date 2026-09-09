@@ -49,7 +49,7 @@ already paid, which is what the margin is for. The manifest a gate put
 produces is signed by the gate's key and records `via: {door: 'x402', payer}`.
 Doors: `GET /v1/describe`, `GET /v1/quote?size=N[&sha=]`,
 `GET /v1/manifest?sha=`, `POST /v1/put`, `GET /v1/renew/quote?id=`,
-`POST /v1/renew`, `GET /v1/verify?ref=`, `GET /v1/floats`,
+`POST /v1/renew`, `GET /v1/verify?ref=`, `GET /v1/floats`, `GET /v1/renewals`,
 `GET /v1/quote/parts?size=N`, `GET /v1/parts?sha=`, `POST /v1/parts`,
 `POST /v1/assemble`. Design notes: `docs/x402-gate.md`.
 
@@ -198,7 +198,8 @@ under `LADING_FILECOIN_LOW_FIL` of gas), and the name key (SOL, low under
 `LADING_NAME_LOW_SOL`, default 0.008). The gate adds its own TOON payer (USDC
 on Solana, low under one channel deposit; SOL under `LADING_GATE_LOW_SOL`) with
 the open channel's headroom, and publishes the whole list as `health` in
-`GET /v1/describe` and alone at `GET /v1/floats`; `/health` on both carries
+`GET /v1/describe` and alone at `GET /v1/floats`, plus a `renewals` row from
+its renewal timer; `/health` on both carries
 `floats: {ok, low}`. Each row says what to send where. Nothing here alerts:
 refuel (the operator's top-up timer) polls `/v1/floats` every half hour, fills
 the rows its treasuries can fill, and pushes the rest to the phone.
@@ -244,6 +245,7 @@ No Nostr client can pay x402, so uploads draw on credit per pubkey: anyone with 
 ```
 src/server.ts    the handler: POST /walrus, /filecoin, /name and their /quote doors, GET /describe, GET /health
 src/lib.ts       the client as a library: put, putPart, finish, quote, estimate, verify, name, renewals, renew, describe; the CLI and the gate both run this
+src/renew-cron.ts the renewal timer's one run: date every record live, renew what is due, report it as a float row and an ntfy push; the gate schedules it, the CLI runs it as renew-due
 src/cli.ts       the command line, a thin layer over lib.ts
 src/gate.ts      the hosted door: express + x402 (USDC on Base, PayAI facilitator), pays the TOON routes with its own key
 src/gate-price.ts what the door charges for a TOON bill: margin and floor, pure
@@ -349,6 +351,21 @@ date (writes since 0.14 carry the date in the receipt; older ones show `?`
 until `--live` asks the quote door), and `lading renew <sha256 | object id>
 [--epochs n]` extends every native record of a put through the extend doors,
 Lighthouse records through the renew doors, quoting each first.
+
+The gate keeps its own records alive on a timer (0.15). Once a day
+(`LADING_RENEW_EVERY_HOURS`, 24) it dates every record live and renews each
+one that runs out within `LADING_RENEW_WITHIN_DAYS` (30; 0 turns the timer
+off): native records get `LADING_RENEW_EPOCHS` more (unset = the door's 26),
+Lighthouse ones a year, every purchase quoted first and recorded in the
+saved file like a hand renewal. One put at a time still holds: a renewal
+waits behind any put on the gate's channel. The last run is kept at
+`LADING_HOME/renew-cron.json`, served free at `GET /v1/renewals` with every
+record's saved date, and judged as the `renewals` float row (balance = days
+left on the soonest record, low = the window; not ok when a due record was
+not renewed, so refuel raises it like an empty key). With `LADING_NTFY_URL`
+set the gate also pushes a note when it bought something (low priority) or
+when a human is needed (high). `lading renew-due [--within d] [--epochs n]`
+runs the same routine from the CLI for the payer's own records.
 
 Filecoin Onchain Cloud is pay-per-epoch out of a USDFC deposit in Filecoin
 Pay, with one data set per copy per provider (two copies by default). The

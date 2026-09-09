@@ -25,6 +25,11 @@
  *   GET  /v1/renew/quote?id=      the door price for one more year on a Lighthouse record; free
  *   POST /v1/renew                JSON {lighthouseId}; x402, flat
  *   GET  /v1/verify?ref=          re-fetch every leg of a manifest and compare sha256; free
+ *   GET  /v1/renewals             the gate's own Walrus records with their paid-through dates (saved, free)
+ *                                 and the last run of the renewal timer, which renews any record due within
+ *                                 LADING_RENEW_WITHIN_DAYS (30; 0 = off) every LADING_RENEW_EVERY_HOURS (24)
+ *                                 through the renew/extend doors, reports as the `renewals` float row, and
+ *                                 pushes to LADING_NTFY_URL when something was bought or needs a human
  *   GET  /v1/credit?pubkey=       a Nostr pubkey's upload credit; free
  *   POST /v1/credit               x-pubkey, x-usdc; x402 priced at x-usdc: credit for that pubkey's Blossom uploads
  *   Blossom (docs/blossom.md), at the root: HEAD/PUT /upload, PUT /mirror, GET/HEAD /<sha256>[.ext], DELETE
@@ -57,6 +62,7 @@ import { installLongFetch } from './long-fetch.js';
 import { BlossomError, CreditLedger, blossomErrorHandler, blossomRouter, npubOf, type BlobRecord } from './blossom.js';
 import { parseManifest } from './manifest.js';
 import { readFirst } from './read.js';
+import { notification, pushNtfy, readLastRun, renewDue, renewalsRow, writeLastRun, type RenewRunReport } from './renew-cron.js';
 import { join } from 'node:path';
 installLongFetch();
 const PORT = Number(process.env.PORT ?? 3601);
@@ -77,6 +83,12 @@ const GATE_LOW_USDC = process.env.LADING_GATE_LOW_USDC ?? microToDecimal(BigInt(
 const GATE_LOW_SOL = process.env.LADING_GATE_LOW_SOL ?? '0.01';
 /** Progress files for objects whose parts were bought but never assembled are dropped after this long. */
 const PROGRESS_MAX_AGE_MS = Number(process.env.LADING_PROGRESS_MAX_AGE_DAYS ?? 7) * 86_400_000;
+/** The renewal timer: records due within this many days are renewed; 0 turns it off. */
+const RENEW_WITHIN_DAYS = Number(process.env.LADING_RENEW_WITHIN_DAYS ?? 30);
+const RENEW_EVERY_MS = Number(process.env.LADING_RENEW_EVERY_HOURS ?? 24) * 3_600_000;
+const RENEW_EPOCHS = process.env.LADING_RENEW_EPOCHS ? Number(process.env.LADING_RENEW_EPOCHS) : undefined;
+const RENEW_BOOT_DELAY_MS = Number(process.env.LADING_RENEW_BOOT_DELAY_S ?? 60) * 1000;
+const NTFY_URL = process.env.LADING_NTFY_URL || undefined;
 
 if (!FREE && !PAY_TO) {
   console.error('gate: set LADING_GATE_PAYTO (Base address for revenue) or LADING_EVM_PRIVATE_KEY, or GATE_FREE=1 for a free door');
@@ -170,7 +182,35 @@ async function health(): Promise<FloatsReport> {
     payerFloats().catch((e: Error) => [{ name: 'gate-payer', role: 'the gate\'s TOON payer', chain: 'solana', asset: '?', address: '?', balance: '?', low: '?', ok: false, fund: `read failed: ${e.message.slice(0, 120)}` }] as FloatRow[]),
     brokerFloats(),
   ]);
-  return report([...mine, ...theirs]);
+  return report([...mine, ...theirs, ...(RENEW_WITHIN_DAYS > 0 ? [renewalsRow(lastRenewRun, { within: RENEW_WITHIN_DAYS, everyMs: RENEW_EVERY_MS, home: lading.opts.home })] : [])]);
+}
+
+// ---- the renewal timer ----
+
+const RENEW_RUN_PATH = join(lading.opts.home, 'renew-cron.json');
+let lastRenewRun: RenewRunReport | undefined = readLastRun(RENEW_RUN_PATH);
+let renewRunning: Promise<RenewRunReport> | undefined;
+
+/** One run of the renewal timer (also what an operator calls by hand); a run already going is joined, not doubled. */
+function renewNow(): Promise<RenewRunReport> {
+  if (renewRunning) return renewRunning;
+  renewRunning = (async () => {
+    try {
+      const r = await renewDue(lading, { within: RENEW_WITHIN_DAYS, epochs: RENEW_EPOCHS, log, run: serialize });
+      lastRenewRun = r;
+      try {
+        writeLastRun(RENEW_RUN_PATH, r);
+      } catch (e) {
+        log(`renew-due: could not save the report: ${(e as Error).message}`);
+      }
+      const n = notification(r);
+      if (n) await pushNtfy(NTFY_URL, n, log);
+      return r;
+    } finally {
+      renewRunning = undefined;
+    }
+  })();
+  return renewRunning;
 }
 
 const partBytesOf = (raw: unknown) => {
@@ -485,6 +525,20 @@ app.get('/v1/floats', async (_req, res, next) => {
   }
 });
 
+app.get('/v1/renewals', async (_req, res, next) => {
+  try {
+    // Saved dates only: the live pass pays quote doors and belongs to the timer.
+    const { rows } = await lading.renewals({ within: RENEW_WITHIN_DAYS || 30, live: false });
+    res.json({
+      timer: RENEW_WITHIN_DAYS > 0 ? { within: RENEW_WITHIN_DAYS, everyHours: RENEW_EVERY_MS / 3_600_000, epochs: RENEW_EPOCHS ?? null, running: !!renewRunning } : null,
+      lastRun: lastRenewRun ?? null,
+      records: rows.map((r) => ({ sha256: r.sha256, part: r.part, parts: r.parts, provider: r.provider, handle: r.handle, blobId: r.blobId, expiresAt: r.expiresAt || null, endEpoch: r.endEpoch ?? null, daysLeft: Number.isNaN(r.daysLeft) ? null : r.daysLeft, renewals: r.renewals, name: r.name ?? null })),
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
 app.get('/v1/describe', async (_req, res, next) => {
   try {
     const [routes, h] = await Promise.all([lading.describe(), health()]);
@@ -500,7 +554,7 @@ app.get('/v1/describe', async (_req, res, next) => {
       health: h,
       routes: routes.map((r) => ({ key: r.key, route: r.route, units: r.price?.toString() ?? null })),
       install: `claude mcp add lading -e LADING_X402_KEY=0x… -- npx -y lading mcp --gate ${PUBLIC_URL}`,
-      endpoints: ['GET /v1/quote?size=N[&sha=]', 'GET /v1/manifest?sha=', 'POST /v1/put', 'GET /v1/quote/parts?size=N[&sha=]', 'GET /v1/parts?sha=', 'POST /v1/parts', 'POST /v1/assemble', 'GET /v1/renew/quote?id=', 'POST /v1/renew', 'GET /v1/verify?ref=', 'GET /v1/floats'],
+      endpoints: ['GET /v1/quote?size=N[&sha=]', 'GET /v1/manifest?sha=', 'POST /v1/put', 'GET /v1/quote/parts?size=N[&sha=]', 'GET /v1/parts?sha=', 'POST /v1/parts', 'POST /v1/assemble', 'GET /v1/renew/quote?id=', 'POST /v1/renew', 'GET /v1/verify?ref=', 'GET /v1/floats', 'GET /v1/renewals'],
       multipart: `Objects over ${MAX_BODY_BYTES} bytes go as parts of ${DEFAULT_PART_BYTES} bytes: one paid POST /v1/parts per slice (short request, small payment, settles on its own 2xx), then one paid POST /v1/assemble for the manifest and name. A slice already bought is answered at the floor; nothing is held in escrow.`,
       partBytes: DEFAULT_PART_BYTES,
       idempotent: 'POST /v1/put with x-sha256 set to a hash this gate already archived answers from the saved bill of lading at the floor price and buys no leg; GET /v1/manifest?sha= reads it free.',
@@ -794,6 +848,15 @@ const sweep = () => {
 };
 sweep();
 setInterval(sweep, 86_400_000).unref();
+
+if (RENEW_WITHIN_DAYS > 0) {
+  const tick = () => renewNow().catch((e: Error) => log(`renew-due failed: ${e.message}`));
+  setTimeout(tick, RENEW_BOOT_DELAY_MS).unref();
+  setInterval(tick, RENEW_EVERY_MS).unref();
+  log(`renewal timer: records due within ${RENEW_WITHIN_DAYS} days, every ${RENEW_EVERY_MS / 3_600_000} h, first run in ${RENEW_BOOT_DELAY_MS / 1000} s, ntfy ${NTFY_URL ? 'on' : 'off'}${lastRenewRun ? `, last run ${new Date(lastRenewRun.at).toISOString()}` : ''}`);
+} else {
+  log('renewal timer off (LADING_RENEW_WITHIN_DAYS=0)');
+}
 
 const server = app.listen(PORT, () => {
   log(`lading gate ${VERSION} on :${PORT}${FREE ? ' FREE (no x402)' : ` x402 ${NETWORK} payTo=${PAY_TO} facilitator=${FACILITATOR}`} edge=${lading.opts.edge} margin=${pricing.margin} floor=${pricing.floorUsdc} maxBody=${MAX_BODY_BYTES}`);

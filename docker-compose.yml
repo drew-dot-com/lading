@@ -60,6 +60,10 @@ services:
       LADING_CHANNEL_DEPOSIT: ${LADING_GATE_CHANNEL_DEPOSIT:-2000000}
       LADING_NOSTR_KEY: ${LADING_GATE_NOSTR_KEY:-}             # hex; unset = generated once under /data/gate
       LADING_HOME: /data/gate                                  # channel store, saved manifests, progress files, nostr key
+      LADING_RENEW_WITHIN_DAYS: ${LADING_RENEW_WITHIN_DAYS:-30}  # the renewal timer: renew the gate's own Walrus records due within this many days; 0 = off
+      LADING_RENEW_EVERY_HOURS: ${LADING_RENEW_EVERY_HOURS:-24}
+      LADING_RENEW_EPOCHS: ${LADING_RENEW_EPOCHS:-}                # epochs bought per native extension; unset = the door's default (26, a year)
+      LADING_NTFY_URL: ${LADING_NTFY_URL:-}                    # https://ntfy.sh/<topic>; the timer pushes what it bought and what needs a human; unset = log only
       LADING_BROKER_URL: http://lading:3600                    # its float rows ride along under health in /v1/describe (refuel polls that)
       LADING_ARNS_GATEWAY: ${LADING_ARNS_GATEWAY:-permagate.io}
       LADING_READ_GATEWAYS: ${LADING_READ_GATEWAYS:-permagate.io,arweave.net,ardrive.net}
