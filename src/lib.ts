@@ -1235,7 +1235,9 @@ export class Lading {
     const ids = await this.publishPage(onArweave, saved.manifestTxId, paid);
     saved.pageTxId = ids.pageTxId;
     saved.pathsTxId = ids.pathsTxId;
-    writeFileSync(this.manifestPath(sha), JSON.stringify({ ...saved, paid: [...saved.paid, ...paid.map((p) => ({ ...p, price: p.price?.toString() }))] }, null, 2));
+    // The record in memory carries the page rows too, so a name bought next in the same call lists them on the bill.
+    saved.paid = [...saved.paid, ...paid.map((p) => ({ ...p, price: p.price?.toString() }))] as SavedPut['paid'];
+    writeFileSync(this.manifestPath(sha), JSON.stringify(saved, null, 2));
     return ids;
   }
 
