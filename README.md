@@ -55,7 +55,8 @@ Doors: `GET /v1/describe`, `GET /v1/quote?size=N[&sha=]`,
 `GET /v1/manifest?sha=`, `POST /v1/put`, `GET /v1/renew/quote?id=`,
 `POST /v1/renew`, `GET /v1/verify?ref=`, `GET /v1/floats`, `GET /v1/renewals`,
 `GET /v1/quote/parts?size=N`, `GET /v1/parts?sha=`, `POST /v1/parts`,
-`POST /v1/assemble`. Design notes: `docs/x402-gate.md`.
+`POST /v1/assemble`, `GET /v1/stats`, `GET /v1/canary`. Design notes:
+`docs/x402-gate.md`.
 
 
 ## Claude Desktop extension
@@ -414,6 +415,35 @@ not renewed, so refuel raises it like an empty key). With `LADING_NTFY_URL`
 set the gate also pushes a note when it bought something (low priority) or
 when a human is needed (high). `lading renew-due [--within d] [--epochs n]`
 runs the same routine from the CLI for the payer's own records.
+
+## The canary and the stats door
+
+The gate walks the path it sells on the hour whether or not a caller shows
+up. Every `LADING_CANARY_EVERY_MINUTES` (60; 0 = off) it puts a small new
+object (its own timestamp and sequence, about 200 bytes) through the same
+`put` the paid doors use, on `LADING_CANARY_NETWORKS` (`arweave` by default:
+the cheapest leg and the one every bill of lading anchors to), paid over its
+own channel like any job, and reads the previous run's manifest back through
+verify. So every tick is one write and one read of durable data through the
+edge, the store and the read gateways, and whichever of them stopped
+answering shows up here first. The last report is kept at
+`LADING_HOME/canary-last.json`, served at `GET /v1/canary` with the last 48
+runs, judged as the `canary` float row (not ok when the last run failed or
+the timer went quiet, so refuel raises it), and pushed to `LADING_NTFY_URL`
+on a failure and on the first success after one. The canary is the
+operator's own traffic and is counted as such, never as a caller.
+
+`GET /v1/stats` says what went through this gate, free: every paid TOON job
+(put, part, assemble, renew, a Blossom upload, the renewal timer, the canary)
+is one line in `LADING_HOME/traffic.jsonl`, written when the job answers, and
+the door sums them per window (1h, 24h, 7d, 30d) into jobs, units, USDC,
+bytes, by door and by kind, with `thirdParty` counting only the doors a
+stranger can pay (x402, blossom) apart from the operator's own (canary,
+renewals). A gate that ran before the log existed seeds it once from its
+saved manifests, dated by each manifest's signature. The channel's nonce
+rides along: it is the number of claims this payer has ever signed. The
+numbers describe one gate, one payer, one channel; off-chain claims are what
+moved, the chain sees only settlements.
 
 Filecoin Onchain Cloud is pay-per-epoch out of a USDFC deposit in Filecoin
 Pay, with one data set per copy per provider (two copies by default). The

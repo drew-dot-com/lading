@@ -33,6 +33,12 @@
  *                                 LADING_RENEW_WITHIN_DAYS (30; 0 = off) every LADING_RENEW_EVERY_HOURS (24)
  *                                 through the renew/extend doors, reports as the `renewals` float row, and
  *                                 pushes to LADING_NTFY_URL when something was bought or needs a human
+ *   GET  /v1/stats                what went through this gate: paid TOON jobs per window (1h, 24h, 7d, 30d),
+ *                                 units and USDC, by door and kind, third-party jobs apart from the operator's
+ *                                 own (canary, renewals), the last jobs; free
+ *   GET  /v1/canary               the canary timer: every LADING_CANARY_EVERY_MINUTES (60; 0 = off) the gate
+ *                                 puts a small new object on LADING_CANARY_NETWORKS (arweave) through its own
+ *                                 channel and reads the previous one back; the last report and the last runs
  *   GET  /v1/credit?pubkey=       a Nostr pubkey's upload credit; free
  *   POST /v1/credit               x-pubkey, x-usdc; x402 priced at x-usdc: credit for that pubkey's Blossom uploads
  *   Blossom (docs/blossom.md), at the root: HEAD/PUT /upload, PUT /mirror, GET/HEAD /<sha256>[.ext], DELETE
@@ -67,6 +73,9 @@ import { BlossomError, CreditLedger, blossomErrorHandler, blossomRouter, npubOf,
 import { parseManifest } from './manifest.js';
 import { readFirst } from './read.js';
 import { notification, pushNtfy, readLastRun, renewDue, renewalsRow, writeLastRun, type RenewRunReport } from './renew-cron.js';
+import { canaryNotification, canaryRow, readLastCanary, runCanary, writeLastCanary, type CanaryReport } from './canary.js';
+import { TrafficLog, entryFromSaved, type JobKind } from './traffic.js';
+import type { Network } from './choices.js';
 import { join } from 'node:path';
 installLongFetch();
 const PORT = Number(process.env.PORT ?? 3601);
@@ -93,6 +102,10 @@ const RENEW_EVERY_MS = Number(process.env.LADING_RENEW_EVERY_HOURS ?? 24) * 3_60
 const RENEW_EPOCHS = process.env.LADING_RENEW_EPOCHS ? Number(process.env.LADING_RENEW_EPOCHS) : undefined;
 const RENEW_BOOT_DELAY_MS = Number(process.env.LADING_RENEW_BOOT_DELAY_S ?? 60) * 1000;
 const NTFY_URL = process.env.LADING_NTFY_URL || undefined;
+/** The canary: the gate's own put every so many minutes; 0 turns it off. */
+const CANARY_EVERY_MS = Number(process.env.LADING_CANARY_EVERY_MINUTES ?? 60) * 60_000;
+const CANARY_NETWORKS: Network[] = parseChoices({ networks: process.env.LADING_CANARY_NETWORKS || 'arweave' }).networks;
+const CANARY_BOOT_DELAY_MS = Number(process.env.LADING_CANARY_BOOT_DELAY_S ?? 120) * 1000;
 
 if (!FREE && !PAY_TO) {
   console.error('gate: set LADING_GATE_PAYTO (Base address for revenue) or LADING_EVM_PRIVATE_KEY, or GATE_FREE=1 for a free door');
@@ -186,7 +199,47 @@ async function health(): Promise<FloatsReport> {
     payerFloats().catch((e: Error) => [{ name: 'gate-payer', role: 'the gate\'s TOON payer', chain: 'solana', asset: '?', address: '?', balance: '?', low: '?', ok: false, fund: `read failed: ${e.message.slice(0, 120)}` }] as FloatRow[]),
     brokerFloats(),
   ]);
-  return report([...mine, ...theirs, ...(RENEW_WITHIN_DAYS > 0 ? [renewalsRow(lastRenewRun, { within: RENEW_WITHIN_DAYS, everyMs: RENEW_EVERY_MS, home: lading.opts.home })] : [])]);
+  return report([
+    ...mine,
+    ...theirs,
+    ...(RENEW_WITHIN_DAYS > 0 ? [renewalsRow(lastRenewRun, { within: RENEW_WITHIN_DAYS, everyMs: RENEW_EVERY_MS, home: lading.opts.home })] : []),
+    ...(CANARY_EVERY_MS > 0 ? [canaryRow(lastCanary, { everyMs: CANARY_EVERY_MS, networks: CANARY_NETWORKS, home: lading.opts.home })] : []),
+  ]);
+}
+
+// ---- the traffic log ----
+
+const traffic = new TrafficLog(join(lading.opts.home, 'traffic.jsonl'));
+if (traffic.empty) {
+  const seeded = traffic.seed(lading.savedPuts().map((p) => entryFromSaved(p.sha, p.saved)));
+  log(`traffic log started at ${traffic.path} with ${seeded} saved record(s)`);
+}
+
+/** Run one paid job and log it as traffic whatever happens; the error is rethrown after. */
+async function tracked<T extends { sha256?: string; size?: number; legs?: Array<{ network: string }>; manifestTxId?: string; name?: { name: string }; total: bigint; reused?: boolean }>(kind: JobKind, door: string, meta: { payer?: string; sha?: string; size?: number }, fn: () => Promise<T>): Promise<T> {
+  const t0 = Date.now();
+  try {
+    const r = await fn();
+    traffic.record({
+      at: Date.now(),
+      door,
+      kind,
+      ok: true,
+      units: (r.reused ? 0n : r.total).toString(),
+      ms: Date.now() - t0,
+      ...(r.sha256 ?? meta.sha ? { sha: r.sha256 ?? meta.sha } : {}),
+      ...(r.size ?? meta.size ? { size: r.size ?? meta.size } : {}),
+      ...(r.legs ? { legs: r.legs.map((l) => l.network) } : {}),
+      ...(r.manifestTxId ? { manifestTxId: r.manifestTxId } : {}),
+      ...(r.name?.name ? { name: r.name.name } : {}),
+      ...(meta.payer ? { payer: meta.payer } : {}),
+      ...(r.reused ? { reused: true } : {}),
+    });
+    return r;
+  } catch (e) {
+    traffic.record({ at: Date.now(), door, kind, ok: false, units: '0', ms: Date.now() - t0, ...(meta.sha ? { sha: meta.sha } : {}), ...(meta.size ? { size: meta.size } : {}), ...(meta.payer ? { payer: meta.payer } : {}), error: (e as Error).message.slice(0, 200) });
+    throw e;
+  }
 }
 
 // ---- the renewal timer ----
@@ -202,6 +255,8 @@ function renewNow(): Promise<RenewRunReport> {
     try {
       const r = await renewDue(lading, { within: RENEW_WITHIN_DAYS, epochs: RENEW_EPOCHS, log, run: serialize });
       lastRenewRun = r;
+      // The live pass pays quote doors and every purchase pays the renew doors: one traffic line per run that paid anything.
+      if (BigInt(r.total) > 0n || r.bought.length || r.failed.length) traffic.record({ at: Date.now(), door: 'renewals', kind: 'renew', ok: r.failed.length === 0, units: r.total, ms: r.ms, ...(r.failed.length ? { error: r.failed.map((f) => f.error.slice(0, 60)).join('; ').slice(0, 200) } : {}) });
       try {
         writeLastRun(RENEW_RUN_PATH, r);
       } catch (e) {
@@ -215,6 +270,52 @@ function renewNow(): Promise<RenewRunReport> {
     }
   })();
   return renewRunning;
+}
+
+// ---- the canary ----
+
+const CANARY_RUN_PATH = join(lading.opts.home, 'canary-last.json');
+let lastCanary: CanaryReport | undefined = readLastCanary(CANARY_RUN_PATH);
+let canaryRunning: Promise<CanaryReport> | undefined;
+
+/** One run of the canary (also what an operator calls by hand); a run already going is joined, not doubled. */
+function canaryNow(): Promise<CanaryReport> {
+  if (canaryRunning) return canaryRunning;
+  canaryRunning = (async () => {
+    const previous = lastCanary;
+    try {
+      const r = await runCanary(lading, {
+        seq: (previous?.seq ?? 0) + 1,
+        networks: CANARY_NETWORKS,
+        gate: PUBLIC_URL,
+        previous,
+        log,
+        run: <T,>(fn: () => Promise<T>) => serialize(fn),
+      });
+      lastCanary = r;
+      traffic.record({
+        at: Date.now(),
+        door: 'canary',
+        kind: 'canary',
+        ok: r.ok,
+        units: r.put?.units ?? '0',
+        ms: r.ms,
+        ...(r.put ? { sha: r.put.sha256, size: r.put.size, legs: r.put.legs, ...(r.put.manifestTxId ? { manifestTxId: r.put.manifestTxId } : {}) } : {}),
+        ...(r.error ? { error: r.error } : {}),
+      });
+      try {
+        writeLastCanary(CANARY_RUN_PATH, r);
+      } catch (e) {
+        log(`canary: could not save the report: ${(e as Error).message}`);
+      }
+      const n = canaryNotification(r, previous);
+      if (n) await pushNtfy(NTFY_URL, n, log);
+      return r;
+    } finally {
+      canaryRunning = undefined;
+    }
+  })();
+  return canaryRunning;
 }
 
 const partBytesOf = (raw: unknown) => {
@@ -406,7 +507,7 @@ app.disable('x-powered-by');
 
 // The bill of lading page lives under an ArNS name on another origin and asks
 // the free read doors from the browser; nothing paid or stateful is exposed.
-const CORS_FREE_GETS = new Set(['/v1/verify', '/v1/manifest', '/v1/describe', '/v1/quote', '/health']);
+const CORS_FREE_GETS = new Set(['/v1/verify', '/v1/manifest', '/v1/describe', '/v1/quote', '/health', '/v1/stats', '/v1/canary', '/v1/floats']);
 app.use((req, res, next) => {
   if (!CORS_FREE_GETS.has(req.path)) return next();
   res.set('Access-Control-Allow-Origin', '*');
@@ -574,6 +675,38 @@ app.get('/v1/renewals', async (_req, res, next) => {
   }
 });
 
+/** What went through this gate, free: paid TOON jobs per window, by door and kind, third-party apart from the operator's own. */
+app.get('/v1/stats', async (_req, res, next) => {
+  try {
+    const s = traffic.stats();
+    res.json({
+      gate: PUBLIC_URL,
+      edge: lading.opts.edge,
+      ...s,
+      channel: await channelHeadroom(),
+      canary: CANARY_EVERY_MS > 0 ? { everyMinutes: CANARY_EVERY_MS / 60_000, networks: CANARY_NETWORKS, lastRun: lastCanary ? new Date(lastCanary.at).toISOString() : null, lastOk: lastCanary?.ok ?? null } : null,
+      note: 'One gate, one payer, one channel to the edge: every job here is a TOON job this gate paid over ILP. `door` says who paid the gate for it; thirdParty counts only the doors a stranger can pay (x402, blossom). The canary and the renewal timer are the operator\'s own traffic, counted apart. Off-chain claims are what moved; the chain sees only settlements.',
+    });
+  } catch (e) {
+    next(e);
+  }
+});
+
+app.get('/v1/canary', (_req, res) => {
+  const runs = traffic
+    .entries()
+    .filter((e) => e.door === 'canary')
+    .slice(-48)
+    .reverse()
+    .map((e) => ({ at: new Date(e.at).toISOString(), ok: e.ok, units: e.units, ms: e.ms ?? null, sha256: e.sha ?? null, manifestTxId: e.manifestTxId ?? null, legs: e.legs ?? [], error: e.error ?? null }));
+  res.json({
+    timer: CANARY_EVERY_MS > 0 ? { everyMinutes: CANARY_EVERY_MS / 60_000, networks: CANARY_NETWORKS, running: !!canaryRunning } : null,
+    lastRun: lastCanary ?? null,
+    runs,
+    what: 'The gate puts a small new object through its own channel on a timer and reads the previous one back through verify: a probe of the edge, the store and the read gateways, and a heartbeat. Its jobs are the operator\'s own, never counted as third-party traffic.',
+  });
+});
+
 app.get('/v1/describe', async (_req, res, next) => {
   try {
     const [routes, h] = await Promise.all([lading.describe(), health()]);
@@ -589,7 +722,9 @@ app.get('/v1/describe', async (_req, res, next) => {
       health: h,
       routes: routes.map((r) => ({ key: r.key, route: r.route, units: r.price?.toString() ?? null })),
       install: `claude mcp add lading -e LADING_X402_KEY=0x… -- npx -y lading mcp --gate ${PUBLIC_URL}`,
-      endpoints: ['GET /v1/quote?size=N[&sha=]', 'GET /v1/manifest?sha=', 'POST /v1/put', 'GET /v1/quote/parts?size=N[&sha=]', 'GET /v1/parts?sha=', 'POST /v1/parts', 'POST /v1/assemble', 'GET /v1/renew/quote?id=', 'POST /v1/renew', 'GET /v1/verify?ref=', 'GET /v1/floats', 'GET /v1/renewals'],
+      endpoints: ['GET /v1/quote?size=N[&sha=]', 'GET /v1/manifest?sha=', 'POST /v1/put', 'GET /v1/quote/parts?size=N[&sha=]', 'GET /v1/parts?sha=', 'POST /v1/parts', 'POST /v1/assemble', 'GET /v1/renew/quote?id=', 'POST /v1/renew', 'GET /v1/verify?ref=', 'GET /v1/floats', 'GET /v1/renewals', 'GET /v1/stats', 'GET /v1/canary'],
+      stats: `${PUBLIC_URL}/v1/stats`,
+      canary: CANARY_EVERY_MS > 0 ? { everyMinutes: CANARY_EVERY_MS / 60_000, networks: CANARY_NETWORKS, lastRun: lastCanary ? new Date(lastCanary.at).toISOString() : null, lastOk: lastCanary?.ok ?? null, doc: `${PUBLIC_URL}/v1/canary` } : null,
       multipart: `Objects over ${MAX_BODY_BYTES} bytes go as parts of ${DEFAULT_PART_BYTES} bytes: one paid POST /v1/parts per slice (short request, small payment, settles on its own 2xx), then one paid POST /v1/assemble for the manifest and name. A slice already bought is answered at the floor; nothing is held in escrow.`,
       partBytes: DEFAULT_PART_BYTES,
       choices: describeChoices(),
@@ -698,15 +833,17 @@ app.post('/v1/put', express.raw({ type: () => true, limit: MAX_BODY_BYTES }), as
     }
     const quoted = await quotePut(bytes.length, partBytes, declared, choices);
     log(`put ${sha.slice(0, 12)} ${bytes.length} B "${name}" payer=${payer ?? (FREE ? 'free' : '?')} price=${quoted.price.usdc} USDC toon=${quoted.toon.units} networks=${choices.networks.join('+')}${choices.walrusEpochs ? ` walrus-epochs=${choices.walrusEpochs}` : ''}${choices.arns ? ' arns' : ''}${prior ? ' (already archived: reuse)' : ''}`);
-    const r = await serialize(() =>
-      lading.put(bytes, {
-        name,
-        mime: mime === 'application/octet-stream' ? undefined : mime,
-        partBytes,
-        skip: skipFor(choices),
-        walrusEpochs: choices.walrusEpochs,
-        via: { door: 'x402', network: NETWORK, ...(payer ? { payer } : {}) },
-      }),
+    const r = await tracked('put', FREE ? 'free' : 'x402', { payer, sha, size: bytes.length }, () =>
+      serialize(() =>
+        lading.put(bytes, {
+          name,
+          mime: mime === 'application/octet-stream' ? undefined : mime,
+          partBytes,
+          skip: skipFor(choices),
+          walrusEpochs: choices.walrusEpochs,
+          via: { door: 'x402', network: NETWORK, ...(payer ? { payer } : {}) },
+        }),
+      ),
     );
     log(`put ${sha.slice(0, 12)} ${r.reused ? 'reused' : 'done'}: ${r.legs.map((l) => l.network).join('+')} manifest=${r.manifestTxId ?? '-'} name=${r.name?.name ?? '-'} paid=${r.reused ? 0 : r.total}`);
     return res.json(
@@ -744,7 +881,7 @@ app.post('/v1/parts', express.raw({ type: () => true, limit: MAX_BODY_BYTES }), 
     const known = !!declared && lading.partKnown(sha, index, declared, choices.networks);
     const quoted = await quotePart(bytes.length, known, choices);
     log(`part ${sha.slice(0, 12)} ${index + 1}/${count} ${bytes.length} B "${name}" payer=${payer ?? (FREE ? 'free' : '?')} price=${quoted.price.usdc} USDC networks=${choices.networks.join('+')}${choices.walrusEpochs ? ` walrus-epochs=${choices.walrusEpochs}` : ''}${choices.arns ? ' arns' : ''}${known ? ' (already bought: reuse)' : ''}`);
-    const r = await serialize(() => lading.putPart(bytes, { sha256: sha, size, index, count, partBytes, partSha256: partSha, name, mime: mime === 'application/octet-stream' ? undefined : mime, skip: skipFor(choices), walrusEpochs: choices.walrusEpochs }));
+    const r = await tracked('part', FREE ? 'free' : 'x402', { payer, sha, size: bytes.length }, () => serialize(() => lading.putPart(bytes, { sha256: sha, size, index, count, partBytes, partSha256: partSha, name, mime: mime === 'application/octet-stream' ? undefined : mime, skip: skipFor(choices), walrusEpochs: choices.walrusEpochs })));
     log(`part ${sha.slice(0, 12)} ${index + 1}/${count} done: ${Object.keys(r.receipts).join('+') || 'nothing'}${r.missing.length ? ` missing ${r.missing.join(',')}` : ''} paid=${r.total}${r.archived ? ' (object already archived)' : ''}`);
     return res.json({
       sha256: r.sha256,
@@ -786,7 +923,7 @@ app.post('/v1/assemble', express.json({ limit: '16kb' }), async (req, res, next)
     const payer = payerOf(req);
     const quoted = await quoteFinish(count, sha, choices);
     log(`assemble ${sha.slice(0, 12)} ${size} B in ${count} parts "${name}" payer=${payer ?? (FREE ? 'free' : '?')} price=${quoted.price.usdc} USDC${skipList.length ? ` skip=${skipList.join(',')}` : ''}`);
-    const r = await serialize(() => lading.finish({ sha256: sha, size, count, partBytes, name, mime, skip, via: { door: 'x402', network: NETWORK, ...(payer ? { payer } : {}) } }));
+    const r = await tracked('assemble', FREE ? 'free' : 'x402', { payer, sha, size }, () => serialize(() => lading.finish({ sha256: sha, size, count, partBytes, name, mime, skip, via: { door: 'x402', network: NETWORK, ...(payer ? { payer } : {}) } })));
     log(`assemble ${sha.slice(0, 12)} ${r.reused ? 'reused' : 'done'}: ${r.legs.map((l) => l.network).join('+')} manifest=${r.manifestTxId ?? '-'} name=${r.name?.name ?? '-'} paid=${r.reused ? 0 : r.total}`);
     return res.json(putBody(r, { price: quoted.price, via: r.reused ? parseVia(r) : { door: 'x402', network: NETWORK, payer: payer ?? null } }));
   } catch (e) {
@@ -801,7 +938,7 @@ app.post('/v1/renew', express.json({ limit: '4kb' }), async (req, res, next) => 
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) throw new HttpError(400, 'lighthouseId must be a Lighthouse record id');
     const payer = payerOf(req);
     log(`renew ${id} payer=${payer ?? (FREE ? 'free' : '?')}`);
-    const r = await serialize(() => lading.renew(id));
+    const r = await tracked('renew', FREE ? 'free' : 'x402', { payer }, () => serialize(() => lading.renew(id)));
     const row = r.rows[0];
     if (!row || row.skipped) throw new HttpError(409, `not renewable right now: ${row?.skipped ?? 'no record'}`);
     log(`renew ${id} done: ${row.previousExpiresAt} -> ${row.expiresAt} paid=${r.total}`);
@@ -864,7 +1001,7 @@ app.use(
       const r = lading.archived(sha);
       return r ? blobRecord(r) : undefined;
     },
-    put: async (bytes, o) => blobRecord(await serialize(() => lading.put(bytes, { name: o.name, mime: o.mime, partBytes: DEFAULT_PART_BYTES, via: { door: 'blossom', network: 'nostr', payer: o.pubkey } }))),
+    put: async (bytes, o) => blobRecord(await tracked('put', 'blossom', { payer: o.pubkey, size: bytes.length }, () => serialize(() => lading.put(bytes, { name: o.name, mime: o.mime, partBytes: DEFAULT_PART_BYTES, via: { door: 'blossom', network: 'nostr', payer: o.pubkey } })))),
     readUrls: (leg) => lading.readUrlsFor(leg.network, leg.id, leg.proof),
     readFirst: (urls) => readFirst(urls),
     sha256,
@@ -900,6 +1037,15 @@ if (RENEW_WITHIN_DAYS > 0) {
   log(`renewal timer: records due within ${RENEW_WITHIN_DAYS} days, every ${RENEW_EVERY_MS / 3_600_000} h, first run in ${RENEW_BOOT_DELAY_MS / 1000} s, ntfy ${NTFY_URL ? 'on' : 'off'}${lastRenewRun ? `, last run ${new Date(lastRenewRun.at).toISOString()}` : ''}`);
 } else {
   log('renewal timer off (LADING_RENEW_WITHIN_DAYS=0)');
+}
+
+if (CANARY_EVERY_MS > 0) {
+  const tick = () => canaryNow().catch((e: Error) => log(`canary failed: ${e.message}`));
+  setTimeout(tick, CANARY_BOOT_DELAY_MS).unref();
+  setInterval(tick, CANARY_EVERY_MS).unref();
+  log(`canary: a put on ${CANARY_NETWORKS.join('+')} every ${CANARY_EVERY_MS / 60_000} min, first in ${CANARY_BOOT_DELAY_MS / 1000} s${lastCanary ? `, last run #${lastCanary.seq} ${new Date(lastCanary.at).toISOString()} ${lastCanary.ok ? 'ok' : 'FAILED'}` : ''}`);
+} else {
+  log('canary off (LADING_CANARY_EVERY_MINUTES=0)');
 }
 
 const server = app.listen(PORT, () => {

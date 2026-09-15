@@ -63,7 +63,9 @@ services:
       LADING_RENEW_WITHIN_DAYS: ${LADING_RENEW_WITHIN_DAYS:-30}  # the renewal timer: renew the gate's own Walrus records due within this many days; 0 = off
       LADING_RENEW_EVERY_HOURS: ${LADING_RENEW_EVERY_HOURS:-24}
       LADING_RENEW_EPOCHS: ${LADING_RENEW_EPOCHS:-}                # epochs bought per native extension; unset = the door's default (26, a year)
-      LADING_NTFY_URL: ${LADING_NTFY_URL:-}                    # https://ntfy.sh/<topic>; the timer pushes what it bought and what needs a human; unset = log only
+      LADING_NTFY_URL: ${LADING_NTFY_URL:-}                    # https://ntfy.sh/<topic>; the timers push what they bought and what needs a human; unset = log only
+      LADING_CANARY_EVERY_MINUTES: ${LADING_CANARY_EVERY_MINUTES:-60}  # the canary: the gate's own ~200 B put through its channel on this cadence, and a read of the one before; 0 = off
+      LADING_CANARY_NETWORKS: ${LADING_CANARY_NETWORKS:-arweave}       # networks the canary object goes on (arweave alone is the cheapest leg)
       LADING_BROKER_URL: http://lading:3600                    # its float rows ride along under health in /v1/describe (refuel polls that)
       LADING_ARNS_GATEWAY: ${LADING_ARNS_GATEWAY:-permagate.io}
       LADING_READ_GATEWAYS: ${LADING_READ_GATEWAYS:-permagate.io,arweave.net,ardrive.net}
