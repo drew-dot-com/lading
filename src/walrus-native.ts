@@ -143,6 +143,12 @@ export function nativeWalrusUploader(o: { suiSecretKey: string; epochs?: number;
 
   const balance = async (coinType: string) => BigInt((await client.getBalance({ owner: address, coinType })).balance.balance);
 
+  // The SDK caches the Walrus system object (storage and write prices, epoch) for the life of the
+  // client. Prices move at an epoch boundary, so a long-lived broker priced a write from a stale
+  // state, split too little WAL off the coin and the contract aborted in balance::split (seen
+  // 2026-09-16 after 7 days up). Every priced read starts from the chain.
+  const fresh = () => client.walrus.reset();
+
   return {
     address,
     epochs,
@@ -153,12 +159,14 @@ export function nativeWalrusUploader(o: { suiSecretKey: string; epochs?: number;
     },
 
     async quote(size, n = epochs) {
+      fresh();
       const [cost, state] = await Promise.all([client.walrus.storageCost(Math.max(size, 1), n), client.walrus.systemState()]);
       const currentEpoch = Number(state.committee?.epoch ?? 0);
       return { amountWal: nineDec(cost.totalCost), amountFrost: cost.totalCost, epochs: n, currentEpoch, endEpoch: currentEpoch + n, raw: { storageCost: cost.storageCost.toString(), writeCost: cost.writeCost.toString(), totalCost: cost.totalCost.toString() } };
     },
 
     async timing() {
+      fresh();
       const st = await client.walrus.stakingState();
       const epochDurationMs = Number(st.epoch_duration);
       const firstEpochStartMs = Number(st.first_epoch_start);
@@ -198,6 +206,7 @@ export function nativeWalrusUploader(o: { suiSecretKey: string; epochs?: number;
     },
 
     async extendQuote(objectId, n = epochs) {
+      fresh();
       const [state, timing] = await Promise.all([this.blobState(objectId), this.timing()]);
       // Extending pays storage only, on the encoded size the object already occupies; the SDK prices from the unencoded size the same way.
       const cost = state.found ? (await client.walrus.storageCost(Math.max(state.size ?? 1, 1), n)).storageCost : 0n;
@@ -205,6 +214,7 @@ export function nativeWalrusUploader(o: { suiSecretKey: string; epochs?: number;
     },
 
     async extend(objectId, n = epochs) {
+      fresh();
       const q = await this.extendQuote(objectId, n);
       if (!q.state.found) throw new Error(`no blob object ${objectId} on Sui`);
       if (!q.state.owned) throw new Error(`blob object ${objectId} is not owned by ${address}`);
@@ -237,6 +247,7 @@ export function nativeWalrusUploader(o: { suiSecretKey: string; epochs?: number;
     },
 
     async upload(bytes, fileName, log = () => {}, n = epochs) {
+      fresh();
       const sha = sha256Hex(bytes);
       const t0 = Date.now();
       const { blobId, blobObject } = await client.walrus.writeBlob({
