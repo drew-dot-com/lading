@@ -12,12 +12,13 @@ each leg hands back the network's own identifier and proof. Every copy is
 then listed in a signed manifest that lives on Arweave. Ask for it, and the
 manifest also gets a public page under an ArNS name.
 
-Status: v0.17.0, Arweave, Walrus, Filecoin and IPFS legs, relay copy, a quote
+Status: v0.18.0, Arweave, Walrus, Filecoin and IPFS legs, relay copy, a quote
 door in front of each broker leg, objects over one packet travelling as
-parts, Walrus renewals, network, duration and naming choices at the door
-(the page and the ArNS name are opt-in since 0.17), and a hosted x402 gate
-with an MCP shim so Claude can archive through it. Runs against Drew's
-mainnet node today.
+parts, Walrus renewals on demand and on a daily timer, network, duration and
+naming choices at the door (the page and the ArNS name are opt-in since
+0.17), a hosted x402 gate with an MCP shim so Claude can archive through it,
+and an hourly canary put plus a stats door that shows what the gate is
+actually doing. Runs against Drew's mainnet node today.
 
 ## Use it from Claude
 
