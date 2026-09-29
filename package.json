@@ -30,7 +30,7 @@
     "@mysten/sui": "^2.29.0",
     "@mysten/walrus": "^1.2.23",
     "@solana/kit": "^2.1.0",
-    "@toon-protocol/client": "^3.1.1",
+    "@toon-protocol/client": "^4.1.0",
     "@x402/core": "^2.25.0",
     "@x402/evm": "^2.3.0",
     "@x402/express": "^2.25.0",

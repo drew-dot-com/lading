@@ -242,7 +242,7 @@ both Lighthouse and Pinata (low under `LADING_WALRUS_LOW_USDC`, default 1), the 
 (USDFC, not ok under `LADING_FILECOIN_LOW_RUNWAY_DAYS` days, default 30, or
 under `LADING_FILECOIN_LOW_FIL` of gas), and the name key (SOL, low under
 `LADING_NAME_LOW_SOL`, default 0.008). The gate adds its own TOON payer (USDC
-on Solana, low under one channel deposit; SOL under `LADING_GATE_LOW_SOL`) with
+on Solana, low under one channel deposit; SOL for its own channel exits, under `LADING_GATE_LOW_SOL`) with
 the open channel's headroom, and publishes the whole list as `health` in
 `GET /v1/describe` and alone at `GET /v1/floats`, plus a `renewals` row from
 its renewal timer; `/health` on both carries
@@ -277,8 +277,27 @@ half-way resumes where it stopped instead of paying twice; the file is
 removed once the manifest is on Arweave.
 
 A chunked put that has to open a channel locks `LADING_CHANNEL_DEPOSIT`
-base units (default 2,000,000, 2 USDC) rather than the client's 100,000
-default, since one such put runs to several hundred thousand units.
+base units (default 2,000,000, 2 USDC, or the edge's `minDeposit` when that
+is higher) rather than the client's 100,000 default, since one such put runs
+to several hundred thousand units.
+
+### The payment channel (client 4.x)
+
+Lading pays the edge from an x402 `batch-settlement` channel on Solana
+(`@toon-protocol/client` 4.x, connector ADR 0075). The first paid job opens
+it: the client signs the payment-channels `open` and the edge's
+`sponsorEndpoint` submits it, so the payer needs USDC for the deposit and no
+SOL. Every paid packet carries a voucher naming the running total; there is
+no nonce. A job the channel cannot cover opens a fresh sponsored channel, and
+the old one stays in the store until it is closed and settled (SOL for those
+two transactions only).
+
+The store is `LADING_CHANNEL_STORE`, default `<LADING_HOME>/channels-x402.json`
+plus its sibling `channels-x402.peers.json` (every channel's full config). On
+the gate that is `/data/gate/channels-x402.json` on the `lading_gate_data`
+volume. Never delete it while a channel is live: without the config the
+deposit cannot be taken back. A client 3.x `channel-store.json` beside it is
+never read; the gate logs that it is there at start.
 
 ## Blossom: any Nostr client as a front end
 
@@ -441,10 +460,10 @@ the door sums them per window (1h, 24h, 7d, 30d) into jobs, units, USDC,
 bytes, by door and by kind, with `thirdParty` counting only the doors a
 stranger can pay (x402, blossom) apart from the operator's own (canary,
 renewals). A gate that ran before the log existed seeds it once from its
-saved manifests, dated by each manifest's signature. The channel's nonce
-rides along: it is the number of claims this payer has ever signed. The
-numbers describe one gate, one payer, one channel; off-chain claims are what
-moved, the chain sees only settlements.
+saved manifests, dated by each manifest's signature. The open channel rides
+along: its deposit, what the vouchers signed on it add up to, and what is
+left. The numbers describe one gate, one payer, one channel at a time;
+off-chain vouchers are what moved, the chain sees only settlements.
 
 Filecoin Onchain Cloud is pay-per-epoch out of a USDFC deposit in Filecoin
 Pay, with one data set per copy per provider (two copies by default). The
@@ -526,9 +545,11 @@ Client, anywhere:
 SOLANA_KEYPAIR=~/.config/solana/id.json npx tsx src/cli.ts put ./file.bin
 ```
 
-Env: `TOON_EDGE`, `LADING_ROUTE_*`, `LADING_CHANNEL_STORE` (the claim
-watermark, keep it), `LADING_NOSTR_KEY` (payer identity, else generated into
-`~/.lading/nostr.key`).
+Env: `TOON_EDGE`, `LADING_ROUTE_*`, `LADING_CHANNEL_STORE` (the x402
+channel store, default `~/.lading/channels-x402.json`; keep it),
+`LADING_NOSTR_KEY` (payer identity, else generated into
+`~/.lading/nostr.key`). The payer's Solana key needs USDC for a channel
+deposit; the edge sponsors the open.
 
 ## Constraints
 

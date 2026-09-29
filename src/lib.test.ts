@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, utimesSync } from 'node:fs';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -165,6 +167,57 @@ test('estimate keeps only the chosen networks (a leg and its quote door go toget
     assert.equal(part.total, 41_000n);
     assert.deepEqual(one.unpriced, []);
   } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('client 4.x starts on a fresh x402 store and leaves a 3.x toon-channel store alone', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'lading-test-'));
+  // What a 3.x gate left under LADING_HOME: a toon-channel watermark with a nonce, and its binding.
+  const legacy = JSON.stringify({ ['0x' + 'ab'.repeat(32)]: { nonce: 73, cumulativeAmount: '1234567' } });
+  const legacyPeers = JSON.stringify({ 'g.drew|solana': { channelId: '0x' + 'ab'.repeat(32), context: { chainType: 'solana', chainId: 0, tokenNetworkAddress: 'x' }, depositTotal: '2000000' } });
+  writeFileSync(join(home, 'channel-store.json'), legacy);
+  writeFileSync(join(home, 'channel-store.peers.json'), legacyPeers);
+  // A stand-in edge that answers GET /ilp with a mainnet Solana batch-settlement offer and nothing else.
+  const server = createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/ilp') {
+      res.setHeader('content-type', 'application/json');
+      res.end(
+        JSON.stringify({
+          ilpAddresses: ['g.drew'],
+          batchSettlements: [
+            {
+              network: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp',
+              asset: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+              payTo: '11111111111111111111111111111111',
+              feePayer: '11111111111111111111111111111111',
+              withdrawDelay: 86_400,
+              tokenProgram: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+              minDeposit: '1000000',
+              sponsorEndpoint: '/ilp/batch-settlement/solana/open',
+            },
+          ],
+        }),
+      );
+      return;
+    }
+    res.statusCode = 404;
+    res.end();
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  const { port } = server.address() as AddressInfo;
+  const lines: string[] = [];
+  const o = optionsFromEnv({ home, edge: `http://127.0.0.1:${port}`, solanaSecret: new Uint8Array(randomBytes(64)), solanaRpc: 'http://127.0.0.1:9', nostrKey: randomBytes(32).toString('hex'), log: (s) => lines.push(s) });
+  const l = new Lading(o);
+  try {
+    assert.equal(o.channelStore, join(home, 'channels-x402.json'));
+    assert.equal(await l.channelState(), undefined);
+    assert.ok(lines.some((s) => s.includes('channel-store.json') && s.includes('3.x')));
+    assert.equal(readFileSync(join(home, 'channel-store.json'), 'utf8'), legacy);
+    assert.equal(readFileSync(join(home, 'channel-store.peers.json'), 'utf8'), legacyPeers);
+  } finally {
+    await l.close();
+    server.close();
     rmSync(home, { recursive: true, force: true });
   }
 });

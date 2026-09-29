@@ -13,7 +13,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, readdirSync
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
-import { ToonClient, buildJobEvent, sendJob, chargeFor } from '@toon-protocol/client';
+import { ToonClient, buildJobEvent, sendJob, chargeFor, type ToonClientConfig } from '@toon-protocol/client';
 import { getPublicKey, type Event as NostrEvent } from 'nostr-tools/pure';
 import { LEG_KIND, type FilecoinReceipt, type IpfsReceipt, type LegReceipt, type NameReceipt, type PartReceipt, type WalrusExtendReceipt, type WalrusReceipt, type WalrusRenewReceipt } from './kinds.js';
 import { assembleParts, DEFAULT_PART_BYTES, partName, planParts, splitParts, type Part, type PartPlan } from './parts.js';
@@ -43,7 +43,7 @@ export interface Routes {
 }
 
 export interface LadingOptions {
-  /** The edge connector the payer opens its channel with. */
+  /** The edge connector the payer opens its x402 channel with. */
   edge: string;
   routes: Routes;
   /** AR.IO gateway used to resolve ArNS names and to print read URLs. */
@@ -63,6 +63,7 @@ export interface LadingOptions {
   /** The payer's 64-byte secret directly (SOLANA_KEYPAIR_JSON in the environment), for a container that mounts no file. */
   solanaSecret?: Uint8Array;
   solanaRpc: string;
+  /** The client's x402 channel store (`<home>/channels-x402.json` plus its `.peers.json` sibling). Never delete it while a channel is live. */
   channelStore: string;
   /** Collateral locked when a channel has to be opened, base units. */
   channelDeposit: bigint;
@@ -110,7 +111,8 @@ export function optionsFromEnv(overrides: Partial<LadingOptions> = {}): LadingOp
     solanaKeypair: env('SOLANA_KEYPAIR', join(homedir(), '.config/solana/id.json')),
     solanaSecret: process.env.SOLANA_KEYPAIR_JSON ? Uint8Array.from(JSON.parse(process.env.SOLANA_KEYPAIR_JSON) as number[]) : undefined,
     solanaRpc: env('SOLANA_RPC', 'https://api.mainnet-beta.solana.com'),
-    channelStore: env('LADING_CHANNEL_STORE', join(home, 'channel-store.json')),
+    // A new name for client 4.x: a 3.x `channel-store.json` beside it is never read (see warnLegacyStore).
+    channelStore: env('LADING_CHANNEL_STORE', join(home, 'channels-x402.json')),
     channelDeposit: BigInt(env('LADING_CHANNEL_DEPOSIT', '2000000')),
     nostrKey: process.env.LADING_NOSTR_KEY,
     gateUrl: env('LADING_GATE_URL', 'https://lading.167-233-221-236.sslip.io').replace(/\/+$/, '') || undefined,
@@ -155,22 +157,17 @@ const walrusNeed = (q: WalrusQuote, n: number) => {
 
 export type Paid<T> = { receipt: T; route: string; price: bigint | null };
 
-/** What the payer's channel with the edge holds, in base units. */
+/**
+ * What the payer's x402 channel with the edge holds, in base units: what is
+ * deposited, what the vouchers signed on it add up to (each voucher names the
+ * running total; there is no nonce), and what is left.
+ */
 export interface ChannelState {
   channelId: string;
-  nonce: number;
   spent: bigint;
   deposit: bigint;
   available: bigint;
 }
-/** The slice of the client's `channel` facade Lading uses. */
-type FacadeState = { channelId: string; nonce: number; spent: bigint; depositTotal: bigint; available: bigint };
-type ChannelFacade = { state(o?: { onChain?: boolean }): Promise<FacadeState>; deposit(amount: bigint): Promise<FacadeState> };
-/** Units kept free above a job's own price, so a route whose terms moved a little between the quote and the claim still clears. */
-const HEADROOM_MARGIN = 5_000n;
-/** Tries for a claim the edge refuses against a deposit figure a top-up just raised, and the pause between them. */
-const UNDERCOLLATERAL_RETRIES = 4;
-const UNDERCOLLATERAL_PAUSE_MS = 5_000;
 export type Network = 'arweave' | 'walrus' | 'filecoin' | 'ipfs';
 /** Every storage network a put buys, in the order the legs run. Arweave and Walrus are required for a finish; Filecoin and IPFS are skipped when their quote refuses. */
 export const NETWORKS = ['arweave', 'walrus', 'filecoin', 'ipfs'] as const;
@@ -389,6 +386,7 @@ export class Lading {
 
   constructor(opts: LadingOptions) {
     this.opts = opts;
+    this.warnLegacyStore();
   }
 
   private log(line: string) {
@@ -415,72 +413,62 @@ export class Lading {
   client(): Promise<ToonClient> {
     if (!this.c) {
       mkdirSync(this.opts.home, { recursive: true });
-      this.c = ToonClient.create({
+      const config: ToonClientConfig = {
         connector: this.opts.edge,
         solanaSecretKey: this.opts.solanaSecret ?? Uint8Array.from(JSON.parse(readFileSync(this.opts.solanaKeypair, 'utf8')) as number[]),
         evmPrivateKey: ('0x' + randomBytes(32).toString('hex')) as `0x${string}`,
         chain: 'solana',
         rpcUrl: this.opts.solanaRpc,
         transport: 'http',
+        // The x402 channel store: the watermark file and its `.peers.json`
+        // sibling (every channel's full config). Losing it strands a live
+        // channel's deposit; see LADING_CHANNEL_STORE.
         channelStore: this.opts.channelStore,
+        // The first paid job opens the channel, and a job the channel cannot
+        // cover opens a fresh one: on Solana the connector sponsors the open
+        // (no SOL), and the deposit comes out of the payer's USDC.
         autoOpenChannel: true,
-        // Collateral locked when a channel has to be opened (base units). The
-        // client's own default is 100,000, one small put; a chunked put runs to
-        // several hundred thousand, so start with 2 USDC. Unspent deposit comes
-        // back when the channel settles.
+        // What each channel opens with (base units). The client's own default
+        // is 100,000, one small put; a chunked put runs to several hundred
+        // thousand, so start with 2 USDC. Unspent deposit comes back when the
+        // channel is closed and settled.
         deposit: this.opts.channelDeposit,
-      } as never) as Promise<ToonClient>;
+        // Base only, and this payer pays on Solana: name no facilitator rather
+        // than fall back to the devnet one.
+        facilitatorUrl: '',
+      };
+      this.c = ToonClient.create(config);
     }
     return this.c;
+  }
+
+  /** A 3.x store (`toon-channel` claims) at the old default path: never read, but it holds what the old channel needs to be closed. */
+  private warnLegacyStore() {
+    const legacy = join(this.opts.home, 'channel-store.json');
+    if (legacy !== this.opts.channelStore && existsSync(legacy)) {
+      this.log(`channel  ${legacy} is a client 3.x toon-channel store; client 4.x ignores it and keeps its x402 channels in ${this.opts.channelStore}`);
+    }
   }
 
   async close() {
     if (!this.c) return;
     const c = await this.c;
-    await (c as { close?: () => Promise<void> }).close?.();
+    await c.close();
     this.c = undefined;
   }
 
-  /** The open channel's deposit as last read on chain, so headroom needs no chain round trip per job. */
-  private depositKnown?: bigint;
-
   /**
-   * The payer's channel with the edge as the client tracks it: what is
-   * deposited (read on chain once, then after each top-up), what the claims
-   * so far add up to, and what is left. `undefined` when no channel is open
-   * yet (the first paid job opens one with the configured deposit).
+   * The payer's x402 channel with the edge as the client records it: what is
+   * deposited, what the vouchers so far add up to, and what is left.
+   * `undefined` when no channel is open yet (the first paid job opens one with
+   * the configured deposit). No chain read: the client keeps the deposit it
+   * made, and replaces a channel the next job cannot fit in by itself.
    */
   async channelState(): Promise<ChannelState | undefined> {
     const c = await this.client();
-    const ch = (c as unknown as { channel?: ChannelFacade }).channel;
-    if (!ch) return undefined;
-    let s: FacadeState;
-    try {
-      s = await ch.state(this.depositKnown === undefined ? { onChain: true } : {});
-    } catch {
-      return undefined;
-    }
-    if (this.depositKnown === undefined) this.depositKnown = s.depositTotal;
-    const deposit = this.depositKnown;
-    return { channelId: s.channelId, nonce: s.nonce, spent: s.spent, deposit, available: deposit > s.spent ? deposit - s.spent : 0n };
-  }
-
-  /**
-   * A claim past the counterparty's deposit is refused by the edge ("could
-   * never be redeemed"), and the client tops a channel up only when it opens
-   * one. So before each job: if what is left of the deposit cannot cover it,
-   * add another deposit's worth (monotonic on chain, one transaction) rather
-   * than close, settle and reopen, which trips connector#1283 on Solana.
-   */
-  private async ensureHeadroom(need: bigint): Promise<void> {
-    const s = await this.channelState();
-    if (!s || s.available >= need) return;
-    const add = this.opts.channelDeposit > need ? this.opts.channelDeposit : need;
-    this.log(`channel  ${s.channelId.slice(0, 8)}… has ${s.available} units left and the next job needs ${need}: depositing ${add} more`);
-    const c = await this.client();
-    const r = await (c as unknown as { channel: ChannelFacade }).channel.deposit(add);
-    this.depositKnown = r.depositTotal;
-    this.log(`channel  ✓ deposit now ${r.depositTotal} units, ${r.available} left`);
+    const s = await c.channel.current();
+    if (!s) return undefined;
+    return { channelId: s.channel.channelId, spent: s.signed, deposit: s.depositTotal, available: s.depositTotal > s.signed ? s.depositTotal - s.signed : 0n };
   }
 
   // ---- files under home ----
@@ -589,20 +577,9 @@ export class Lading {
   private async job<T>(route: string, event: NostrEvent, timeoutMs = 180_000): Promise<Paid<T>> {
     const c = await this.client();
     const price = await this.charge(route, Buffer.byteLength(JSON.stringify({ event })));
-    await this.ensureHeadroom((price ?? 0n) + HEADROOM_MARGIN);
-    // The edge compares a claim against the deposit it last read and re-reads
-    // the chain on a breach, but not more than once every couple of seconds
-    // (connector claim_gate.rs `min_reattempt_interval`, default 2 s): a claim
-    // sent right after a top-up can be refused against the old figure. Such a
-    // refusal moves no watermark, so the same claim is good again shortly.
-    for (let attempt = 1; ; attempt++) {
-      const answer = await sendJob<T>({ client: c as never, destination: route, timeoutMs }, event as never);
-      if (answer.accepted) return { receipt: answer.receipt, route, price };
-      const stale = answer.code === 'F03' && /deposited on chain/.test(answer.message ?? '');
-      if (!stale || attempt >= UNDERCOLLATERAL_RETRIES) throw new Error(`${route}: ${answer.code} ${answer.message}`);
-      this.log(`channel  edge still holds the old deposit figure (${answer.message?.match(/more than the (\d+)/)?.[1] ?? '?'}); retrying in ${UNDERCOLLATERAL_PAUSE_MS / 1000} s (${attempt}/${UNDERCOLLATERAL_RETRIES})`);
-      await new Promise((r) => setTimeout(r, UNDERCOLLATERAL_PAUSE_MS));
-    }
+    const answer = await sendJob<T>({ client: c as never, destination: route, timeoutMs }, event as never);
+    if (answer.accepted) return { receipt: answer.receipt, route, price };
+    throw new Error(`${route}: ${answer.code} ${answer.message}`);
   }
 
   /** Ask the walrus quote door whether an object of this size would go through right now. 1,000 units, against 40,000 for the leg. */

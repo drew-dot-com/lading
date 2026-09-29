@@ -91,7 +91,7 @@ const PUBLIC_URL = process.env.LADING_GATE_URL ?? `http://127.0.0.1:${PORT}`;
 const pricing = pricingFromEnv();
 /** The broker whose float rows this gate republishes under `health`; unset = only the gate's own payer is reported. */
 const BROKER_URL = process.env.LADING_BROKER_URL;
-/** The payer must hold a channel deposit's worth of USDC so the client can open the next channel, and enough SOL for its rent and fees. */
+/** The payer must hold a channel deposit's worth of USDC so the client can open the next channel (the edge sponsors the open), and enough SOL to leave a channel (close, settle). */
 const GATE_LOW_USDC = process.env.LADING_GATE_LOW_USDC ?? microToDecimal(BigInt(process.env.LADING_CHANNEL_DEPOSIT ?? '2000000'));
 const GATE_LOW_SOL = process.env.LADING_GATE_LOW_SOL ?? '0.01';
 /** Progress files for objects whose parts were bought but never assembled are dropped after this long. */
@@ -115,7 +115,7 @@ if (!FREE && !PAY_TO) {
 const log = (...a: unknown[]) => console.log(new Date().toISOString(), 'gate', ...a);
 const lading = new Lading(optionsFromEnv({ log: (line) => log(line) }));
 
-/** One TOON job at a time: the payer's channel is a single nonce stream, and two puts of the same bytes would share a progress file. */
+/** One TOON job at a time: each voucher on the payer's channel names the running total, so two in flight would race it, and two puts of the same bytes would share a progress file. */
 let chain: Promise<unknown> = Promise.resolve();
 function serialize<T>(fn: () => Promise<T>): Promise<T> {
   const p = chain.then(fn, fn);
@@ -138,15 +138,15 @@ const payerAddress = () =>
   }));
 
 /**
- * The open channel as the client tracks it, deposit read on chain: headroom is
- * what is left before the next job has to top the deposit up (lib does that
- * by itself, one deposit's worth at a time, from this payer's USDC).
+ * The open x402 channel as the client records it: headroom is what is left
+ * before a job no longer fits, and the client then opens a fresh channel by
+ * itself (sponsored by the edge, one deposit's worth of this payer's USDC).
  */
 async function channelHeadroom(): Promise<Record<string, string | number | null>> {
   try {
     const s = await lading.channelState();
     if (!s) return { channel: null };
-    return { channel: s.channelId, nonce: s.nonce, usedUnits: s.spent.toString(), depositUnits: s.deposit.toString(), headroomUnits: s.available.toString() };
+    return { channel: s.channelId, usedUnits: s.spent.toString(), depositUnits: s.deposit.toString(), headroomUnits: s.available.toString() };
   } catch (e) {
     return { channel: `unreadable: ${(e as Error).message.slice(0, 80)}` };
   }
@@ -159,7 +159,7 @@ const payerFloats = cached(30_000, async (): Promise<FloatRow[]> => {
   return [
     judge({
       name: 'gate-payer-usdc',
-      role: 'the gate\'s TOON payer: USDC locked as each channel deposit, spent per leg as off-chain claims',
+      role: 'the gate\'s TOON payer: USDC locked as each channel deposit, spent per leg as off-chain vouchers',
       chain: 'solana',
       asset: 'USDC',
       address: owner,
@@ -170,7 +170,7 @@ const payerFloats = cached(30_000, async (): Promise<FloatRow[]> => {
     }),
     judge({
       name: 'gate-payer-sol',
-      role: 'rent and fees for the gate payer\'s channel opens and settlements',
+      role: 'fees for the gate payer\'s own channel exits (close, settle); opens are sponsored by the edge',
       chain: 'solana',
       asset: 'SOL',
       address: owner,
@@ -685,7 +685,7 @@ app.get('/v1/stats', async (_req, res, next) => {
       ...s,
       channel: await channelHeadroom(),
       canary: CANARY_EVERY_MS > 0 ? { everyMinutes: CANARY_EVERY_MS / 60_000, networks: CANARY_NETWORKS, lastRun: lastCanary ? new Date(lastCanary.at).toISOString() : null, lastOk: lastCanary?.ok ?? null } : null,
-      note: 'One gate, one payer, one channel to the edge: every job here is a TOON job this gate paid over ILP. `door` says who paid the gate for it; thirdParty counts only the doors a stranger can pay (x402, blossom). The canary and the renewal timer are the operator\'s own traffic, counted apart. Off-chain claims are what moved; the chain sees only settlements.',
+      note: 'One gate, one payer, one channel to the edge: every job here is a TOON job this gate paid over ILP. `door` says who paid the gate for it; thirdParty counts only the doors a stranger can pay (x402, blossom). The canary and the renewal timer are the operator\'s own traffic, counted apart. Off-chain vouchers are what moved; the chain sees only settlements.',
     });
   } catch (e) {
     next(e);
