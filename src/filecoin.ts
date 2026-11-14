@@ -24,6 +24,7 @@ import { createHash } from 'node:crypto';
 import { Synapse, TOKENS, calibration, mainnet, formatUnits, type FilecoinChain, type UploadResult } from '@filoz/synapse-sdk';
 import { epochsToDays } from '@filoz/synapse-core/utils';
 import { MIN_SIZE } from '@filoz/synapse-core/piece';
+import { ServiceAlreadyTerminatedError } from '@filoz/synapse-core/errors';
 import { privateKeyToAccount } from 'viem/accounts';
 import type { FilecoinReceipt } from './kinds.js';
 
@@ -55,6 +56,33 @@ export interface FilecoinUploader {
 
 const sha256Hex = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** The SDK's refusal to price or upload into a data set whose provider has ended the service (pdpEndEpoch set). */
+export function isTerminatedDataSet(e: unknown): boolean {
+  for (let cur = e, depth = 0; cur != null && depth < 5; cur = (cur as { cause?: unknown }).cause, depth++) {
+    if (ServiceAlreadyTerminatedError.is(cur) || (cur as { name?: unknown }).name === 'ServiceAlreadyTerminatedError') return true;
+  }
+  return false;
+}
+
+/**
+ * The Synapse client caches its storage contexts for the life of the process,
+ * so when a provider terminates one of our data sets the cache keeps pointing
+ * at it and every quote and upload throws (2026-11-13: provider 7 ended data
+ * set 1575 under a 3-week-old broker). A fresh client skips terminated sets,
+ * so on that one error drop the client and run once more. The SDK raises it
+ * while pricing, before any bytes are stored, so the retry buys nothing twice.
+ */
+export async function retryOnTerminatedDataSet<T>(run: () => Promise<T>, reset: () => void): Promise<T> {
+  try {
+    return await run();
+  } catch (e) {
+    if (!isTerminatedDataSet(e)) throw e;
+    console.log(`filecoin: cached data set is terminated, rebuilding the Synapse client: ${(e as Error).message}`);
+    reset();
+    return await run();
+  }
+}
 
 export function filecoinChain(name: string | undefined): FilecoinChain {
   if (!name || name === 'mainnet') return mainnet;
@@ -95,7 +123,11 @@ export function synapseUploader(opts: {
 }): FilecoinUploader {
   const account = privateKeyToAccount(opts.privateKey);
   const copies = opts.copies ?? 2;
-  const synapse = Synapse.create({ account, chain: opts.chain, source: opts.source ?? 'lading' });
+  const fresh = () => Synapse.create({ account, chain: opts.chain, source: opts.source ?? 'lading' });
+  let synapse = fresh();
+  const reset = () => {
+    synapse = fresh();
+  };
 
   return {
     chain: opts.chain,
@@ -106,11 +138,15 @@ export function synapseUploader(opts: {
       // Priced at the packet cap, not the object: one conservative answer that
       // holds for every object this door accepts, so it can be cached.
       const pieceSize = BigInt(Math.max(size, FILECOIN_MIN_BYTES, opts.maxBytes));
-      const [prep, summary, fil] = await Promise.all([
-        synapse.storage.prepare({ pieceSizes: Array.from({ length: copies }, () => pieceSize) }),
-        synapse.payments.accountSummary(),
-        synapse.payments.walletBalance({ token: TOKENS.FIL }),
-      ]);
+      const [prep, summary, fil] = await retryOnTerminatedDataSet(
+        () =>
+          Promise.all([
+            synapse.storage.prepare({ pieceSizes: Array.from({ length: copies }, () => pieceSize) }),
+            synapse.payments.accountSummary(),
+            synapse.payments.walletBalance({ token: TOKENS.FIL }),
+          ]),
+        reset,
+      );
       const c = prep.costs;
       return {
         ready: c.ready,
@@ -128,15 +164,22 @@ export function synapseUploader(opts: {
       const sha = sha256Hex(bytes);
       if (bytes.length < FILECOIN_MIN_BYTES) throw new Error(`object is ${bytes.length} bytes; Filecoin pieces start at ${FILECOIN_MIN_BYTES}`);
       let txHash: string | undefined;
-      const result: UploadResult = await synapse.storage.upload(bytes, {
-        copies,
-        pieceMetadata: { filename: fileName.slice(0, 120), sha256: sha },
-        callbacks: {
-          onPiecesAdded: (tx) => {
-            txHash ??= tx;
-          },
-        },
-      });
+      const result: UploadResult = await retryOnTerminatedDataSet(
+        () =>
+          synapse.storage.upload(bytes, {
+            copies,
+            pieceMetadata: { filename: fileName.slice(0, 120), sha256: sha },
+            callbacks: {
+              onPiecesAdded: (tx) => {
+                txHash ??= tx;
+              },
+            },
+          }),
+        reset,
+      );
+      // A copy that failed on a terminated set does not throw (the other copy
+      // landed); drop the cache so the next object gets a live second set.
+      if (result.failedAttempts.some((f) => /already terminated/i.test(f.error))) reset();
       if (result.copies.length === 0) throw new Error(`no copy committed: ${result.failedAttempts.map((f) => `${f.providerId}:${f.error}`).join('; ')}`);
       const primary = result.copies.find((c) => c.role === 'primary') ?? result.copies[0]!;
       const check = await readBackPiece(primary.retrievalUrl, sha);
