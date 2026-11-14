@@ -12,7 +12,7 @@ each leg hands back the network's own identifier and proof. Every copy is
 then listed in a signed manifest that lives on Arweave. Ask for it, and the
 manifest also gets a public page under an ArNS name.
 
-Status: v0.18.0, Arweave, Walrus, Filecoin and IPFS legs, relay copy, a quote
+Status: v0.19.0, Arweave, Walrus, Filecoin and IPFS legs, relay copy, a quote
 door in front of each broker leg, objects over one packet travelling as
 parts, Walrus renewals on demand and on a daily timer, network, duration and
 naming choices at the door (the page and the ArNS name are opt-in since
